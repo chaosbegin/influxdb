@@ -7,6 +7,8 @@ pub mod object_store;
 pub mod resource;
 pub mod serialize;
 pub mod snapshot;
+pub mod shard;
+pub mod replication;
 
 pub use error::CatalogError;
 pub(crate) type Result<T, E = CatalogError> = std::result::Result<T, E>;

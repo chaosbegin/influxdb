@@ -92,10 +92,11 @@ mod tests {
     use crate::{
         Field, FieldData, Row, TableChunk, TableChunks, WalFileSequenceNumber, WalOp, WriteBatch,
     };
+    use influxdb3_catalog::shard::ShardId; // Import ShardId
     use influxdb3_id::{ColumnId, DbId, SerdeVecMap, TableId};
 
     #[test]
-    fn test_serialize_deserialize() {
+    fn test_serialize_deserialize_basic() {
         let chunk = TableChunk {
             rows: vec![Row {
                 time: 1,
@@ -132,6 +133,7 @@ mod tests {
                 table_chunks,
                 min_time_ns: 0,
                 max_time_ns: 10,
+                shard_id: None, // Test with None shard_id
             })],
             snapshot: None,
         };
@@ -140,5 +142,55 @@ mod tests {
         let deserialized = verify_file_type_and_deserialize(Bytes::from(bytes)).unwrap();
 
         assert_eq!(contents, deserialized);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_with_shard_id() {
+        let chunk = TableChunk {
+            rows: vec![Row {
+                time: 1,
+                fields: vec![Field {
+                    id: ColumnId::from(0),
+                    value: FieldData::Integer(10),
+                }],
+            }],
+        };
+        let mut table_chunks_map = SerdeVecMap::new();
+        table_chunks_map.insert(
+            TableId::from(1),
+            TableChunks {
+                min_time: 1,
+                max_time: 1,
+                chunk_time_to_chunk: [(1, chunk)].iter().cloned().collect(),
+            },
+        );
+
+        let contents_with_shard = WalContents {
+            persist_timestamp_ms: 20,
+            min_timestamp_ns: 1,
+            max_timestamp_ns: 1,
+            wal_file_number: WalFileSequenceNumber::new(2),
+            ops: vec![WalOp::Write(WriteBatch {
+                catalog_sequence: 1,
+                database_id: DbId::from(1),
+                database_name: "bar_db".into(),
+                table_chunks: table_chunks_map,
+                min_time_ns: 1,
+                max_time_ns: 1,
+                shard_id: Some(ShardId::new(42)), // Test with Some ShardId
+            })],
+            snapshot: None,
+        };
+
+        let bytes = serialize_to_file_bytes(&contents_with_shard).unwrap();
+        let deserialized_with_shard = verify_file_type_and_deserialize(Bytes::from(bytes)).unwrap();
+
+        assert_eq!(contents_with_shard, deserialized_with_shard);
+        match &deserialized_with_shard.ops[0] {
+            WalOp::Write(wb) => {
+                assert_eq!(wb.shard_id, Some(ShardId::new(42)));
+            }
+            _ => panic!("Expected WalOp::Write"),
+        }
     }
 }

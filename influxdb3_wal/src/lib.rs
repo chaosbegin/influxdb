@@ -13,6 +13,7 @@ use data_types::Timestamp;
 use hashbrown::HashMap;
 use indexmap::IndexMap;
 use influxdb_line_protocol::FieldValue;
+use influxdb3_catalog::shard::ShardId; // Added for ShardId
 use influxdb3_id::{ColumnId, DbId, SerdeVecMap, TableId};
 use influxdb3_shutdown::ShutdownToken;
 use iox_time::Time;
@@ -273,6 +274,7 @@ pub struct WriteBatch {
     pub table_chunks: SerdeVecMap<TableId, TableChunks>,
     pub min_time_ns: i64,
     pub max_time_ns: i64,
+    pub shard_id: Option<ShardId>, // Added for sharding
 }
 
 impl WriteBatch {
@@ -281,6 +283,7 @@ impl WriteBatch {
         database_id: DbId,
         database_name: Arc<str>,
         table_chunks: IndexMap<TableId, TableChunks>,
+        shard_id: Option<ShardId>, // Added for sharding
     ) -> Self {
         // find the min and max times across the table chunks
         let (min_time_ns, max_time_ns) = table_chunks.values().fold(
@@ -300,6 +303,7 @@ impl WriteBatch {
             table_chunks: table_chunks.into(),
             min_time_ns,
             max_time_ns,
+            shard_id, // Added for sharding
         }
     }
 

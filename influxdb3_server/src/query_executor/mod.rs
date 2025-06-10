@@ -62,6 +62,7 @@ pub struct QueryExecutorImpl {
     telemetry_store: Arc<TelemetryStore>,
     sys_events_store: Arc<SysEventStore>,
     started_with_auth: bool,
+    current_node_id: Arc<str>, // Added for node identification
 }
 
 /// Arguments for [`QueryExecutorImpl::new`]
@@ -77,6 +78,7 @@ pub struct CreateQueryExecutorArgs {
     pub telemetry_store: Arc<TelemetryStore>,
     pub sys_events_store: Arc<SysEventStore>,
     pub started_with_auth: bool,
+    pub current_node_id: Arc<str>, // Added for node identification
 }
 
 impl QueryExecutorImpl {
@@ -92,6 +94,7 @@ impl QueryExecutorImpl {
             sys_events_store,
             started_with_auth,
             time_provider,
+            current_node_id, // Destructure new field
         }: CreateQueryExecutorArgs,
     ) -> Self {
         let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
@@ -111,6 +114,7 @@ impl QueryExecutorImpl {
             telemetry_store,
             sys_events_store,
             started_with_auth,
+            current_node_id, // Store new field
         }
     }
 }
@@ -140,6 +144,8 @@ impl QueryExecutor for QueryExecutorImpl {
             span_ctx,
             external_span_ctx,
             Arc::clone(&self.telemetry_store),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.current_node_id),
         )
         .await
     }
@@ -163,6 +169,8 @@ impl QueryExecutor for QueryExecutorImpl {
             span_ctx,
             external_span_ctx,
             Arc::clone(&self.telemetry_store),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.current_node_id),
         )
         .await
     }
@@ -263,6 +271,8 @@ async fn query_database_sql(
     span_ctx: Option<SpanContext>,
     external_span_ctx: Option<RequestLogContext>,
     telemetry_store: Arc<TelemetryStore>,
+    catalog: Arc<Catalog>, // Added
+    current_node_id: Arc<str>, // Added
 ) -> Result<SendableRecordBatchStream, QueryExecutorError> {
     let params = params.unwrap_or_default();
 
@@ -277,7 +287,7 @@ async fn query_database_sql(
 
     // NOTE - we use the default query configuration on the IOxSessionContext here:
     let ctx = db.new_query_context(span_ctx, Default::default());
-    let planner = Planner::new(&ctx);
+    let planner = Planner::new(&ctx, catalog, current_node_id); // Pass to Planner
     let query = query.to_string();
 
     // Perform query planning on a separate threadpool than the IO runtime that is servicing
@@ -320,6 +330,8 @@ async fn query_database_influxql(
     span_ctx: Option<SpanContext>,
     external_span_ctx: Option<RequestLogContext>,
     telemetry_store: Arc<TelemetryStore>,
+    catalog: Arc<Catalog>, // Added
+    current_node_id: Arc<str>, // Added
 ) -> Result<SendableRecordBatchStream, QueryExecutorError> {
     let params = params.unwrap_or_default();
     let token = db.record_query(
@@ -332,7 +344,7 @@ async fn query_database_influxql(
     );
 
     let ctx = db.new_query_context(span_ctx, Default::default());
-    let planner = Planner::new(&ctx);
+    let planner = Planner::new(&ctx, catalog, current_node_id); // Pass to Planner
     let plan = ctx
         .run(async move { planner.influxql(statement, params).await })
         .await;
@@ -745,8 +757,31 @@ impl TableProvider for QueryTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        // --- Sharding Awareness Point ---
+        if !self.table_def.shards.is_empty() {
+            debug!(
+                database_name = %self.db_schema.name,
+                table_name = %self.table_def.table_name,
+                num_shards = %self.table_def.shards.len(),
+                "QueryTable::scan: Table is sharded. Distributed planning would be required."
+            );
+            // Conceptual:
+            // 1. If planner has already decided this scan is for a *specific local shard*:
+            //    - The `filters` might include predicates to target only that shard's data (e.g., specific time range or partition key values).
+            //    - Proceed with local data access via self.chunks() but ensure it only gets data for that shard.
+            //      This would require `self.chunks()` or `WriteBuffer::get_table_chunks` to become shard-aware.
+            // 2. If this `scan` is part of a higher-level distributed plan node being constructed by Planner:
+            //    - This `TableProvider::scan` might return a specialized `ExecutionPlan` (e.g., `DistributedScanPlaceholderExec`)
+            //      that the Planner understands and replaces/expands.
+            //    - Or, the Planner directly constructs sub-plans for local/remote shards without calling this `scan` in the same way.
+            // For this subtask, we'll log and proceed with local scan, as full distributed plan generation is out of scope.
+        }
+        // --- End Sharding Awareness Point ---
+
         let filters = filters.to_vec();
         debug!(
+            database_name = %self.db_schema.name, // Added for context
+            table_name = %self.table_def.table_name,    // Added for context
             ?projection,
             ?filters,
             ?limit,
