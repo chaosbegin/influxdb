@@ -45,6 +45,8 @@ pub use update::HardDeletionTime;
 pub use update::{CatalogUpdate, DatabaseCatalogTransaction, Prompt};
 
 use crate::channel::{CatalogSubscriptions, CatalogUpdateReceiver};
+use crate::replication::ReplicationInfo;
+use crate::shard::{ShardDefinition, ShardId};
 use crate::log::{
     ClearRetentionPeriodLog, CreateAdminTokenDetails, CreateDatabaseLog, DatabaseBatch,
     DatabaseCatalogOp, NodeBatch, NodeCatalogOp, NodeMode, RegenerateAdminTokenDetails,
@@ -308,6 +310,148 @@ impl Catalog {
 
     fn default_hard_delete_duration(&self) -> Duration {
         self.args.default_hard_delete_duration
+    }
+
+    // --- Sharding and Replication Methods ---
+
+    pub async fn create_shard(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        shard_definition: ShardDefinition,
+    ) -> Result<()> {
+        let (db_id, table_id) = self.get_db_and_table_ids(db_name, table_name)?;
+
+        self.catalog_update_with_retry(|| {
+            // Ensure table still exists and db still exists before proceeding
+            let db_schema = self.db_schema_by_id(&db_id).ok_or_else(|| CatalogError::DatabaseNotFound(db_name.to_string()))?;
+            let table_arc = db_schema.table_definition_by_id(&table_id)
+                .ok_or_else(|| CatalogError::TableNotFound { db_name: Arc::from(db_name), table_name: Arc::from(table_name) })?;
+
+
+            Ok(CatalogBatch::Database(DatabaseBatch {
+                time_ns: self.time_provider.now().timestamp_nanos(),
+                database_id: db_id,
+                database_name: db_schema.name(),
+                ops: vec![DatabaseCatalogOp::CreateShard(CreateShardLog {
+                    db_id,
+                    table_id,
+                    table_name: table_arc.table_name.clone(),
+                    shard_definition: shard_definition.clone(),
+                })],
+            }))
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_shard_nodes(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        shard_id: ShardId,
+        new_node_ids: Vec<NodeId>,
+    ) -> Result<()> {
+        let (db_id, table_id) = self.get_db_and_table_ids(db_name, table_name)?;
+
+        self.catalog_update_with_retry(|| {
+            let db_schema = self.db_schema_by_id(&db_id).ok_or_else(|| CatalogError::DatabaseNotFound(db_name.to_string()))?;
+            let table_arc = db_schema.table_definition_by_id(&table_id)
+                .ok_or_else(|| CatalogError::TableNotFound { db_name: Arc::from(db_name), table_name: Arc::from(table_name) })?;
+
+            if !table_arc.shards.contains_id(&shard_id) {
+                return Err(CatalogError::ShardNotFound { shard_id, table_id });
+            }
+
+            Ok(CatalogBatch::Database(DatabaseBatch {
+                time_ns: self.time_provider.now().timestamp_nanos(),
+                database_id: db_id,
+                database_name: db_schema.name(),
+                ops: vec![DatabaseCatalogOp::UpdateShard(UpdateShardLog {
+                    db_id,
+                    table_id,
+                    table_name: table_arc.table_name.clone(),
+                    shard_id,
+                    new_node_ids: Some(new_node_ids.clone()),
+                })],
+            }))
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_shard(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        shard_id: ShardId,
+    ) -> Result<()> {
+        let (db_id, table_id) = self.get_db_and_table_ids(db_name, table_name)?;
+
+        self.catalog_update_with_retry(|| {
+            let db_schema = self.db_schema_by_id(&db_id).ok_or_else(|| CatalogError::DatabaseNotFound(db_name.to_string()))?;
+            let table_arc = db_schema.table_definition_by_id(&table_id)
+                .ok_or_else(|| CatalogError::TableNotFound { db_name: Arc::from(db_name), table_name: Arc::from(table_name) })?;
+
+            if !table_arc.shards.contains_id(&shard_id) {
+                return Err(CatalogError::ShardNotFound { shard_id, table_id });
+            }
+
+            Ok(CatalogBatch::Database(DatabaseBatch {
+                time_ns: self.time_provider.now().timestamp_nanos(),
+                database_id: db_id,
+                database_name: db_schema.name(),
+                ops: vec![DatabaseCatalogOp::DeleteShard(DeleteShardLog {
+                    db_id,
+                    table_id,
+                    table_name: table_arc.table_name.clone(),
+                    shard_id,
+                })],
+            }))
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_replication(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        replication_info: ReplicationInfo,
+    ) -> Result<()> {
+        let (db_id, table_id) = self.get_db_and_table_ids(db_name, table_name)?;
+
+        self.catalog_update_with_retry(|| {
+            let db_schema = self.db_schema_by_id(&db_id).ok_or_else(|| CatalogError::DatabaseNotFound(db_name.to_string()))?;
+            let table_arc = db_schema.table_definition_by_id(&table_id)
+                .ok_or_else(|| CatalogError::TableNotFound { db_name: Arc::from(db_name), table_name: Arc::from(table_name) })?;
+
+            Ok(CatalogBatch::Database(DatabaseBatch {
+                time_ns: self.time_provider.now().timestamp_nanos(),
+                database_id: db_id,
+                database_name: db_schema.name(),
+                ops: vec![DatabaseCatalogOp::SetReplication(SetReplicationLog {
+                    db_id,
+                    table_id,
+                    table_name: table_arc.table_name.clone(),
+                    replication_info: replication_info.clone(),
+                })],
+            }))
+        })
+        .await?;
+        Ok(())
+    }
+
+    // Helper to get db and table IDs
+    fn get_db_and_table_ids(&self, db_name: &str, table_name: &str) -> Result<(DbId, TableId)> {
+        let db_id = self
+            .db_name_to_id(db_name)
+            .ok_or_else(|| CatalogError::DatabaseNotFound(db_name.to_string()))?;
+        let table_id = self
+            .db_schema_by_id(&db_id)
+            .and_then(|db| db.table_name_to_id(table_name))
+            .ok_or_else(|| CatalogError::TableNotFound { db_name: Arc::from(db_name), table_name: Arc::from(table_name) })?;
+        Ok((db_id, table_id))
     }
 
     pub fn object_store_prefix(&self) -> Arc<str> {
@@ -1480,6 +1624,12 @@ impl UpdateDatabaseSchema for DatabaseCatalogOp {
             }
             DatabaseCatalogOp::SetRetentionPeriod(update) => update.update_schema(schema),
             DatabaseCatalogOp::ClearRetentionPeriod(update) => update.update_schema(schema),
+            DatabaseCatalogOp::CreateShard(create_shard) => create_shard.update_schema(schema),
+            DatabaseCatalogOp::UpdateShard(update_shard) => update_shard.update_schema(schema),
+            DatabaseCatalogOp::DeleteShard(delete_shard) => delete_shard.update_schema(schema),
+            DatabaseCatalogOp::SetReplication(set_replication) => {
+                set_replication.update_schema(schema)
+            }
         }
     }
 }
@@ -1734,12 +1884,16 @@ pub struct TableDefinition {
     pub deleted: bool,
     /// The time when the table is scheduled to be hard deleted.
     pub hard_delete_time: Option<Time>,
+    /// Information about how data in this table is sharded.
+    pub shards: Repository<ShardId, ShardDefinition>,
+    /// Information about how data in this table is replicated.
+    pub replication_info: Option<ReplicationInfo>,
 }
 
 impl TableDefinition {
     /// Create new empty `TableDefinition`
     pub fn new_empty(table_id: TableId, table_name: Arc<str>) -> Self {
-        Self::new(table_id, table_name, vec![], vec![])
+        Self::new(table_id, table_name, vec![], vec![], None)
             .expect("empty table should create without error")
     }
 
@@ -1751,6 +1905,7 @@ impl TableDefinition {
         table_name: Arc<str>,
         columns: Vec<(ColumnId, Arc<str>, InfluxColumnType)>,
         series_key: Vec<ColumnId>,
+        replication_info: Option<ReplicationInfo>,
     ) -> Result<Self> {
         // Use a BTree to ensure that the columns are ordered:
         let mut ordered_columns = BTreeMap::new();
@@ -1806,6 +1961,8 @@ impl TableDefinition {
             distinct_caches: Repository::new(),
             deleted: false,
             hard_delete_time: None,
+            shards: Repository::new(),
+            replication_info,
         })
     }
 
@@ -1828,11 +1985,13 @@ impl TableDefinition {
                 field_def.data_type.into(),
             ));
         }
+        // TODO: Replication info should be part of CreateTableLog or a subsequent operation
         Self::new(
             table_definition.table_id,
             Arc::clone(&table_definition.table_name),
             columns,
             table_definition.key.clone(),
+            None,
         )
         .expect("tables defined from ops should not exceed column limits")
     }
@@ -2150,6 +2309,106 @@ impl TableUpdate for DeleteLastCacheLog {
         Ok(table)
     }
 }
+
+impl TableUpdate for CreateShardLog {
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn table_name(&self) -> Arc<str> {
+        Arc::clone(&self.table_name)
+    }
+
+    fn update_table<'a>(
+        &self,
+        mut table: Cow<'a, TableDefinition>,
+    ) -> Result<Cow<'a, TableDefinition>> {
+        let shard_def = self.shard_definition.clone();
+        if table.shards.contains_id(&shard_def.id) {
+            return Err(CatalogError::ShardAlreadyExists {
+                shard_id: shard_def.id,
+                table_id: self.table_id,
+            });
+        }
+        table.to_mut().shards.insert(shard_def.id, Arc::new(shard_def))?;
+        Ok(table)
+    }
+}
+
+impl TableUpdate for UpdateShardLog {
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn table_name(&self) -> Arc<str> {
+        Arc::clone(&self.table_name)
+    }
+
+    fn update_table<'a>(
+        &self,
+        mut table: Cow<'a, TableDefinition>,
+    ) -> Result<Cow<'a, TableDefinition>> {
+        let mut_table = table.to_mut();
+        let existing_shard = mut_table.shards.get_by_id(&self.shard_id).ok_or_else(|| {
+            CatalogError::ShardNotFound {
+                shard_id: self.shard_id,
+                table_id: self.table_id,
+            }
+        })?;
+
+        let mut updated_shard_def = Arc::try_unwrap(existing_shard).unwrap_or_else(|arc| (*arc).clone());
+
+        if let Some(new_node_ids) = &self.new_node_ids {
+            updated_shard_def.node_ids = new_node_ids.clone();
+        }
+        // Add other updatable fields here
+
+        mut_table.shards.update(self.shard_id, Arc::new(updated_shard_def))?;
+        Ok(table)
+    }
+}
+
+impl TableUpdate for DeleteShardLog {
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn table_name(&self) -> Arc<str> {
+        Arc::clone(&self.table_name)
+    }
+
+    fn update_table<'a>(
+        &self,
+        mut table: Cow<'a, TableDefinition>,
+    ) -> Result<Cow<'a, TableDefinition>> {
+        if !table.shards.contains_id(&self.shard_id) {
+            // Deleting a non-existent shard can be a no-op or an error.
+            // For now, let's make it a no-op to be idempotent.
+            return Ok(table);
+        }
+        table.to_mut().shards.remove(&self.shard_id);
+        Ok(table)
+    }
+}
+
+impl TableUpdate for SetReplicationLog {
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn table_name(&self) -> Arc<str> {
+        Arc::from("") // Placeholder
+    }
+
+    fn update_table<'a>(
+        &self,
+        mut table: Cow<'a, TableDefinition>,
+    ) -> Result<Cow<'a, TableDefinition>> {
+        table.to_mut().replication_info = Some(self.replication_info.clone());
+        Ok(table)
+    }
+}
+
 
 /// Definition of a column in the catalog
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -3173,5 +3432,441 @@ mod tests {
             err.unwrap_err().to_string(),
             "Update to schema would exceed number of tag columns per table limit of 250 columns"
         );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn catalog_serialization_with_sharding_and_replication() {
+        use crate::{
+            log::FieldDataType,
+            replication::{ReplicationFactor, ReplicationInfo},
+            shard::{ShardDefinition, ShardId, ShardTimeRange},
+            serialize::{serialize_catalog_file, verify_and_deserialize_catalog_checkpoint_file},
+        };
+        use influxdb3_id::NodeId; // Ensure NodeId is imported if not already
+
+        let catalog = Catalog::new_in_memory("sample-host-id-sharding").await.unwrap();
+        catalog.create_database("test_db_sharding").await.unwrap();
+        catalog
+            .create_table(
+                "test_db_sharding",
+                "test_table_sharding",
+                &["tag_sharding"],
+                &[("field_sharding", FieldDataType::String)],
+            )
+            .await
+            .unwrap();
+
+        // Add a shard
+        let shard_def = ShardDefinition::new(
+            ShardId::new(1), // ShardId for this shard
+            ShardTimeRange {
+                start_time: 0,
+                end_time: 1000,
+            },
+            vec![NodeId::new(10), NodeId::new(20)], // Example NodeIds
+        );
+        catalog
+            .create_shard("test_db_sharding", "test_table_sharding", shard_def)
+            .await
+            .unwrap();
+
+        // Set replication info
+        let rep_info = ReplicationInfo::new(ReplicationFactor::new(2).unwrap());
+        catalog
+            .set_replication("test_db_sharding", "test_table_sharding", rep_info)
+            .await
+            .unwrap();
+
+        insta::allow_duplicates! {
+            insta::with_settings!({
+                sort_maps => true,
+                description => "catalog serialization with sharding and replication"
+            }, {
+                let snapshot = catalog.snapshot();
+                // Note: The exact paths in the snapshot will depend on the ID generation.
+                // For DatabaseSchema, it's likely the first non-internal DB will have ID 1.
+                // For TableDefinition, if it's the first table in that DB, it will have ID 0.
+                // For ShardDefinition, if it's the first shard, it will have ID 0 or 1 depending on initialization.
+                // Adjust the ".databases.repo.1.tables.repo.0.shards.repo.X" path accordingly.
+                // If ShardId starts from 0, then it would be shards.repo.0.id. If it starts from 1, then shards.repo.1.id.
+                // Based on current ShardId::new(1) in test, it will be repo.1
+                insta::assert_json_snapshot!(snapshot, {
+                    ".catalog_uuid" => "[uuid]",
+                    ".databases.repo.1.tables.repo.0.shards.repo.1.id.0" => insta::dynamic_redaction( |value, _path| {
+                        // Assuming ShardId(1) will be serialized as {"0":1} if it's a tuple struct, or just 1.
+                        // If ShardId is just `u64`, then ".databases.repo.1.tables.repo.0.shards.repo.1.id"
+                        // For ShardId(u64) -> it becomes `shards.repo.1.id = 1`
+                        // If ShardId is a struct ShardId(u64), serde might serialize it as {"0": 1} or just the value
+                        // depending on derive attributes. Assuming it's just the value for simplicity here.
+                        assert_eq!(value.as_u64().unwrap(), 1);
+                        "[shard_id]"
+                    }),
+                    ".databases.repo.1.tables.repo.0.replication_info.replication_factor.0" => insta::dynamic_redaction( |value, _path| {
+                        assert_eq!(value.as_u64().unwrap(), 2);
+                        "[replication_factor]"
+                    })
+                });
+
+                // Serialize/deserialize to ensure roundtrip
+                let serialized = serialize_catalog_file(&snapshot).unwrap();
+                let snapshot_deserialized = verify_and_deserialize_catalog_checkpoint_file(serialized).unwrap();
+                insta::assert_json_snapshot!(snapshot_deserialized, {
+                    ".catalog_uuid" => "[uuid]",
+                    ".databases.repo.1.tables.repo.0.shards.repo.1.id.0" => "[shard_id]", // Using dynamic redaction placeholder
+                    ".databases.repo.1.tables.repo.0.replication_info.replication_factor.0" => "[replication_factor]"
+                });
+
+                catalog.update_from_snapshot(snapshot_deserialized);
+                assert_eq!(catalog.db_name_to_id("test_db_sharding"), Some(DbId::from(1))); // Internal DB is 0
+                let db_schema = catalog.db_schema("test_db_sharding").unwrap();
+                let table_def = db_schema.table_definition("test_table_sharding").unwrap();
+                assert_eq!(table_def.shards.len(), 1);
+                assert!(table_def.replication_info.is_some());
+                assert_eq!(table_def.replication_info.as_ref().unwrap().replication_factor.get(), 2);
+                // Assuming ShardId(1) was used for creation.
+                assert_eq!(table_def.shards.get_by_id(&ShardId::new(1)).unwrap().id.get(), 1);
+            });
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_create_shard_success_and_already_exists() {
+        use crate::{
+            log::FieldDataType,
+            shard::{ShardDefinition, ShardId, ShardTimeRange},
+        };
+        use influxdb3_id::NodeId;
+
+        let catalog = Catalog::new_in_memory("test_create_shard_host").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        catalog
+            .create_table(
+                "test_db",
+                "test_table",
+                &["tag"],
+                &[("field", FieldDataType::String)],
+            )
+            .await
+            .unwrap();
+
+        let shard_def = ShardDefinition::new(
+            ShardId::new(1),
+            ShardTimeRange { start_time: 0, end_time: 100 },
+            vec![NodeId::new(1)],
+        );
+
+        // Create shard successfully
+        assert!(catalog
+            .create_shard("test_db", "test_table", shard_def.clone())
+            .await
+            .is_ok());
+
+        let db_schema = catalog.db_schema("test_db").unwrap();
+        let table_def = db_schema.table_definition("test_table").unwrap();
+        assert_eq!(table_def.shards.len(), 1);
+        assert_eq!(table_def.shards.get_by_id(&ShardId::new(1)).unwrap().id.get(), 1);
+
+        // Attempt to create the same shard again
+        let result = catalog
+            .create_shard("test_db", "test_table", shard_def)
+            .await;
+        assert!(matches!(result, Err(CatalogError::ShardAlreadyExists { .. })));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_create_shard_db_not_found() {
+        use crate::shard::{ShardDefinition, ShardId, ShardTimeRange};
+        use influxdb3_id::NodeId;
+
+        let catalog = Catalog::new_in_memory("test_create_shard_db_not_found_host")
+            .await
+            .unwrap();
+        // Don't create database "non_existent_db"
+
+        let shard_def = ShardDefinition::new(
+            ShardId::new(1),
+            ShardTimeRange { start_time: 0, end_time: 100 },
+            vec![NodeId::new(1)],
+        );
+
+        let result = catalog
+            .create_shard("non_existent_db", "test_table", shard_def)
+            .await;
+        assert!(matches!(result, Err(CatalogError::DatabaseNotFound(_))));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_create_shard_table_not_found() {
+        use crate::{
+            log::FieldDataType,
+            shard::{ShardDefinition, ShardId, ShardTimeRange},
+        };
+        use influxdb3_id::NodeId;
+
+        let catalog = Catalog::new_in_memory("test_create_shard_table_not_found_host")
+            .await
+            .unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        // Don't create table "non_existent_table"
+
+        let shard_def = ShardDefinition::new(
+            ShardId::new(1),
+            ShardTimeRange { start_time: 0, end_time: 100 },
+            vec![NodeId::new(1)],
+        );
+
+        let result = catalog
+            .create_shard("test_db", "non_existent_table", shard_def)
+            .await;
+        assert!(matches!(result, Err(CatalogError::TableNotFound { .. })));
+    }
+
+    // Tests for set_replication, update_shard_nodes, delete_shard would follow a similar pattern
+
+    #[test_log::test(tokio::test)]
+    async fn test_set_replication_success() {
+        use crate::{
+            log::FieldDataType,
+            replication::{ReplicationFactor, ReplicationInfo},
+        };
+
+        let catalog = Catalog::new_in_memory("test_set_replication_host").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        catalog
+            .create_table(
+                "test_db",
+                "test_table",
+                &["tag"],
+                &[("field", FieldDataType::String)],
+            )
+            .await
+            .unwrap();
+
+        let rep_info = ReplicationInfo::new(ReplicationFactor::new(3).unwrap());
+
+        assert!(catalog
+            .set_replication("test_db", "test_table", rep_info.clone())
+            .await
+            .is_ok());
+
+        let db_schema = catalog.db_schema("test_db").unwrap();
+        let table_def = db_schema.table_definition("test_table").unwrap();
+        assert!(table_def.replication_info.is_some());
+        assert_eq!(
+            table_def.replication_info.as_ref().unwrap().replication_factor.get(),
+            3
+        );
+
+        // Update existing replication info
+        let new_rep_info = ReplicationInfo::new(ReplicationFactor::new(2).unwrap());
+        assert!(catalog
+            .set_replication("test_db", "test_table", new_rep_info.clone())
+            .await
+            .is_ok());
+        let table_def_updated = db_schema.table_definition("test_table").unwrap();
+        assert_eq!(
+            table_def_updated.replication_info.as_ref().unwrap().replication_factor.get(),
+            2
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_set_replication_db_not_found() {
+        use crate::replication::{ReplicationFactor, ReplicationInfo};
+
+        let catalog = Catalog::new_in_memory("test_set_replication_db_not_found").await.unwrap();
+        let rep_info = ReplicationInfo::new(ReplicationFactor::new(1).unwrap());
+        let result = catalog
+            .set_replication("non_existent_db", "test_table", rep_info)
+            .await;
+        assert!(matches!(result, Err(CatalogError::DatabaseNotFound(_))));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_set_replication_table_not_found() {
+        use crate::replication::{ReplicationFactor, ReplicationInfo};
+
+        let catalog = Catalog::new_in_memory("test_set_replication_table_not_found").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        let rep_info = ReplicationInfo::new(ReplicationFactor::new(1).unwrap());
+        let result = catalog
+            .set_replication("test_db", "non_existent_table", rep_info)
+            .await;
+        assert!(matches!(result, Err(CatalogError::TableNotFound { .. })));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_update_shard_nodes_success() {
+        use crate::{
+            log::FieldDataType,
+            shard::{ShardDefinition, ShardId, ShardTimeRange},
+        };
+        use influxdb3_id::NodeId;
+
+        let catalog = Catalog::new_in_memory("test_update_shard_nodes_host").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        catalog
+            .create_table(
+                "test_db",
+                "test_table",
+                &["tag"],
+                &[("field", FieldDataType::String)],
+            )
+            .await
+            .unwrap();
+
+        let initial_nodes = vec![NodeId::new(1)];
+        let shard_def = ShardDefinition::new(
+            ShardId::new(1),
+            ShardTimeRange { start_time: 0, end_time: 100 },
+            initial_nodes,
+        );
+        catalog
+            .create_shard("test_db", "test_table", shard_def)
+            .await
+            .unwrap();
+
+        let updated_nodes = vec![NodeId::new(2), NodeId::new(3)];
+        assert!(catalog
+            .update_shard_nodes("test_db", "test_table", ShardId::new(1), updated_nodes.clone())
+            .await
+            .is_ok());
+
+        let db_schema = catalog.db_schema("test_db").unwrap();
+        let table_def = db_schema.table_definition("test_table").unwrap();
+        let updated_shard = table_def.shards.get_by_id(&ShardId::new(1)).unwrap();
+        assert_eq!(updated_shard.node_ids, updated_nodes);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_update_shard_nodes_shard_not_found() {
+        use crate::log::FieldDataType;
+        use influxdb3_id::NodeId;
+
+        let catalog = Catalog::new_in_memory("test_update_shard_nodes_not_found_host").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        catalog
+            .create_table(
+                "test_db",
+                "test_table",
+                &["tag"],
+                &[("field", FieldDataType::String)],
+            )
+            .await
+            .unwrap();
+        // Shard ShardId::new(99) is not created
+
+        let result = catalog
+            .update_shard_nodes("test_db", "test_table", ShardId::new(99), vec![NodeId::new(1)])
+            .await;
+        assert!(matches!(result, Err(CatalogError::ShardNotFound { .. })));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_update_shard_nodes_db_not_found() {
+        use influxdb3_id::NodeId;
+        let catalog = Catalog::new_in_memory("test_update_shard_db_not_found").await.unwrap();
+        let result = catalog
+            .update_shard_nodes("non_existent_db", "test_table", ShardId::new(1), vec![NodeId::new(1)])
+            .await;
+        assert!(matches!(result, Err(CatalogError::DatabaseNotFound(_))));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_update_shard_nodes_table_not_found() {
+        use influxdb3_id::NodeId;
+        let catalog = Catalog::new_in_memory("test_update_shard_table_not_found").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        let result = catalog
+            .update_shard_nodes("test_db", "non_existent_table", ShardId::new(1), vec![NodeId::new(1)])
+            .await;
+        assert!(matches!(result, Err(CatalogError::TableNotFound { .. })));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_delete_shard_success() {
+        use crate::{
+            log::FieldDataType,
+            shard::{ShardDefinition, ShardId, ShardTimeRange},
+        };
+        use influxdb3_id::NodeId;
+
+        let catalog = Catalog::new_in_memory("test_delete_shard_host").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        catalog
+            .create_table(
+                "test_db",
+                "test_table",
+                &["tag"],
+                &[("field", FieldDataType::String)],
+            )
+            .await
+            .unwrap();
+
+        let shard_def = ShardDefinition::new(
+            ShardId::new(1),
+            ShardTimeRange { start_time: 0, end_time: 100 },
+            vec![NodeId::new(1)],
+        );
+        catalog
+            .create_shard("test_db", "test_table", shard_def)
+            .await
+            .unwrap();
+
+        // Ensure shard exists
+        let db_schema = catalog.db_schema("test_db").unwrap();
+        let table_def = db_schema.table_definition("test_table").unwrap();
+        assert_eq!(table_def.shards.len(), 1);
+
+        // Delete shard
+        assert!(catalog
+            .delete_shard("test_db", "test_table", ShardId::new(1))
+            .await
+            .is_ok());
+
+        // Verify shard is deleted
+        let table_def_after_delete = db_schema.table_definition("test_table").unwrap();
+        assert_eq!(table_def_after_delete.shards.len(), 0);
+        assert!(table_def_after_delete.shards.get_by_id(&ShardId::new(1)).is_none());
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_delete_shard_not_found_is_error() { // Assuming we want error, not idempotent no-op based on current code
+        use crate::log::FieldDataType;
+        let catalog = Catalog::new_in_memory("test_delete_shard_not_found_host").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        catalog
+            .create_table(
+                "test_db",
+                "test_table",
+                &["tag"],
+                &[("field", FieldDataType::String)],
+            )
+            .await
+            .unwrap();
+
+        let result = catalog
+            .delete_shard("test_db", "test_table", ShardId::new(99)) // Shard 99 does not exist
+            .await;
+        assert!(matches!(result, Err(CatalogError::ShardNotFound { .. })));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_delete_shard_db_not_found() {
+        let catalog = Catalog::new_in_memory("test_delete_shard_db_not_found").await.unwrap();
+        let result = catalog
+            .delete_shard("non_existent_db", "test_table", ShardId::new(1))
+            .await;
+        assert!(matches!(result, Err(CatalogError::DatabaseNotFound(_))));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_delete_shard_table_not_found() {
+        let catalog = Catalog::new_in_memory("test_delete_shard_table_not_found").await.unwrap();
+        catalog.create_database("test_db").await.unwrap();
+        let result = catalog
+            .delete_shard("test_db", "non_existent_table", ShardId::new(1))
+            .await;
+        assert!(matches!(result, Err(CatalogError::TableNotFound { .. })));
     }
 }

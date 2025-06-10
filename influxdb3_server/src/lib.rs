@@ -17,12 +17,14 @@ mod grpc;
 mod http;
 pub mod query_executor;
 mod query_planner;
+pub mod replication_service; // Added module
 mod service;
 mod system_tables;
 
-use crate::grpc::make_flight_server;
+use crate::grpc::make_flight_server; // Still used to get the Flight service impl
 use crate::http::HttpApi;
 use crate::http::route_request;
+use crate::replication_service::{ReplicationServerImpl, ReplicationServiceServer}; // Added
 use authz::Authorizer;
 use hyper::server::conn::AddrIncoming;
 use hyper::server::conn::Http;
@@ -162,10 +164,28 @@ pub async fn serve(
         TRACE_GRPC_SERVER_NAME,
         trace_http::tower::ServiceProtocol::Grpc,
     );
-    let grpc_service = grpc_trace_layer.layer(make_flight_server(
+
+    // Create Flight service
+    let flight_service_impl = make_flight_server( // This returns FlightServer<impl Flight>
         Arc::clone(&server.http.query_executor),
         Some(server.authorizer()),
-    ));
+    );
+
+    // Create Replication service
+    // HttpApi has a write_buffer field, which is Arc<dyn WriteBuffer>
+    let replication_server_impl = ReplicationServerImpl::new(Arc::clone(&server.http.write_buffer));
+    let replication_grpc_service = ReplicationServiceServer::new(replication_server_impl);
+
+    // Combine gRPC services
+    // tonic::transport::Server can be built up with multiple services
+    // and then made into a MakeService or a Router which is a Service.
+    // The grpc_trace_layer expects a Service.
+    let combined_grpc_router = tonic::transport::Server::builder()
+        .add_service(flight_service_impl)
+        .add_service(replication_grpc_service)
+        .into_router();
+
+    let grpc_service = grpc_trace_layer.layer(combined_grpc_router);
 
     let http_metrics = RequestMetrics::new(
         Arc::clone(&server.common_state.metrics),
@@ -240,10 +260,20 @@ pub async fn serve(
             .with_graceful_shutdown(shutdown.cancelled())
             .await?;
     } else {
-        let grpc_service = grpc_trace_layer.layer(make_flight_server(
+        // Same logic for non-TLS
+        let flight_service_impl = make_flight_server(
             Arc::clone(&server.http.query_executor),
             Some(server.authorizer()),
-        ));
+        );
+        let replication_server_impl = ReplicationServerImpl::new(Arc::clone(&server.http.write_buffer));
+        let replication_grpc_service = ReplicationServiceServer::new(replication_server_impl);
+
+        let combined_grpc_router = tonic::transport::Server::builder()
+            .add_service(flight_service_impl)
+            .add_service(replication_grpc_service)
+            .into_router();
+
+        let grpc_service = grpc_trace_layer.layer(combined_grpc_router);
 
         let rest_service = hyper::service::make_service_fn(|_| {
             let http_server = Arc::clone(&server.http);

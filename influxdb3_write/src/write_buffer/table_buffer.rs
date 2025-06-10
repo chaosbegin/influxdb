@@ -20,6 +20,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::ChunkFilter;
+use influxdb3_catalog::shard::ShardId; // Added for ShardId
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -34,8 +35,10 @@ pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Default)]
 pub struct TableBuffer {
-    chunk_time_to_chunks: BTreeMap<i64, MutableTableChunk>,
-    snapshotting_chunks: Vec<SnapshotChunk>,
+    // Outer BTreeMap is keyed by chunk_time
+    // Inner BTreeMap is keyed by ShardId (Option to handle unshared or pre-existing data)
+    chunk_time_to_chunks: BTreeMap<i64, BTreeMap<Option<ShardId>, MutableTableChunk>>,
+    snapshotting_chunks: Vec<SnapshotChunk>, // SnapshotChunks might need to become shard-aware if files are per-shard
 }
 
 impl TableBuffer {
@@ -43,16 +46,14 @@ impl TableBuffer {
         Default::default()
     }
 
-    pub fn buffer_chunk(&mut self, chunk_time: i64, rows: &[Row]) {
-        let buffer_chunk = self
-            .chunk_time_to_chunks
-            .entry(chunk_time)
-            .or_insert_with(|| MutableTableChunk {
-                timestamp_min: i64::MAX,
-                timestamp_max: i64::MIN,
-                data: Default::default(),
-                row_count: 0,
-            });
+    pub fn buffer_chunk(&mut self, chunk_time: i64, shard_id: Option<ShardId>, rows: &[Row]) {
+        let shard_map = self.chunk_time_to_chunks.entry(chunk_time).or_default();
+        let buffer_chunk = shard_map.entry(shard_id).or_insert_with(|| MutableTableChunk {
+            timestamp_min: i64::MAX,
+            timestamp_max: i64::MIN,
+            data: Default::default(),
+            row_count: 0,
+        });
 
         buffer_chunk.add_rows(rows);
     }
@@ -70,57 +71,62 @@ impl TableBuffer {
         table_def: Arc<TableDefinition>,
         filter: &ChunkFilter<'_>,
     ) -> Result<HashMap<i64, (TimestampMinMax, Vec<RecordBatch>)>> {
-        let mut batches = HashMap::new();
-        let schema = table_def.schema.as_arrow();
+        let mut batches_by_chunk_time = HashMap::new();
+        let arrow_schema = table_def.schema.as_arrow();
+
+        // Process snapshotting_chunks (assuming they are not yet sharded internally for query path or are pre-aggregated)
+        // If SnapshotChunk becomes shard-aware, this part needs adjustment.
         for sc in self.snapshotting_chunks.iter().filter(|sc| {
             filter.test_time_stamp_min_max(sc.timestamp_min_max.min, sc.timestamp_min_max.max)
         }) {
-            let cols: std::result::Result<Vec<_>, _> = schema
+            let cols: std::result::Result<Vec<_>, _> = arrow_schema
                 .fields()
                 .iter()
                 .map(|f| {
-                    let col = sc
-                        .record_batch
+                    sc.record_batch
                         .column_by_name(f.name())
-                        .ok_or(Error::FieldNotFound(f.name().to_string()));
-                    col.cloned()
+                        .cloned()
+                        .ok_or_else(|| Error::FieldNotFound(f.name().to_string()))
                 })
                 .collect();
-            let cols = cols?;
-            let rb = RecordBatch::try_new(Arc::clone(&schema), cols)?;
-            let (ts, v) = batches
+            let rb = RecordBatch::try_new(Arc::clone(&arrow_schema), cols?)?;
+            let (ts_agg, batch_vec) = batches_by_chunk_time
                 .entry(sc.chunk_time)
                 .or_insert_with(|| (sc.timestamp_min_max, Vec::new()));
-            *ts = ts.union(&sc.timestamp_min_max);
-            v.push(rb);
+            *ts_agg = ts_agg.union(&sc.timestamp_min_max);
+            batch_vec.push(rb);
         }
-        for (t, c) in self
-            .chunk_time_to_chunks
-            .iter()
-            .filter(|(_, c)| filter.test_time_stamp_min_max(c.timestamp_min, c.timestamp_max))
-        {
-            let ts_min_max = TimestampMinMax::new(c.timestamp_min, c.timestamp_max);
-            let (ts, v) = batches
-                .entry(*t)
-                .or_insert_with(|| (ts_min_max, Vec::new()));
-            *ts = ts.union(&ts_min_max);
-            v.push(c.record_batch(Arc::clone(&table_def))?);
+
+        // Process chunk_time_to_chunks
+        for (chunk_time, shard_map) in &self.chunk_time_to_chunks {
+            for (_shard_id, mutable_chunk) in shard_map { // Iterate over shards
+                if !filter.test_time_stamp_min_max(mutable_chunk.timestamp_min, mutable_chunk.timestamp_max) {
+                    continue;
+                }
+                let ts_min_max = TimestampMinMax::new(mutable_chunk.timestamp_min, mutable_chunk.timestamp_max);
+                let (ts_agg, batch_vec) = batches_by_chunk_time
+                    .entry(*chunk_time)
+                    .or_insert_with(|| (ts_min_max, Vec::new())); // ts_min_max for this specific chunk
+
+                *ts_agg = ts_agg.union(&ts_min_max); // Aggregate TimestampMinMax for the whole chunk_time
+                batch_vec.push(mutable_chunk.record_batch(Arc::clone(&table_def))?);
+            }
         }
-        Ok(batches)
+        Ok(batches_by_chunk_time)
     }
 
     pub fn timestamp_min_max(&self) -> TimestampMinMax {
-        let (min, max) = if self.chunk_time_to_chunks.is_empty() {
-            (0, 0)
+        let mut overall_min_max = if self.chunk_time_to_chunks.is_empty() {
+            TimestampMinMax::new(0, 0) // Default for an entirely empty TableBuffer
         } else {
             self.chunk_time_to_chunks
                 .values()
-                .map(|c| (c.timestamp_min, c.timestamp_max))
-                .fold((i64::MAX, i64::MIN), |(a_min, b_min), (a_max, b_max)| {
-                    (a_min.min(b_min), a_max.max(b_max))
+                .flat_map(|shard_map| shard_map.values()) // Iterate through all MutableTableChunks in all shards
+                .map(|c| TimestampMinMax::new(c.timestamp_min, c.timestamp_max))
+                .fold(TimestampMinMax::new(i64::MAX, i64::MIN), |acc, ts_mm| {
+                    acc.union(&ts_mm)
                 })
         };
-        let mut timestamp_min_max = TimestampMinMax::new(min, max);
 
         for sc in &self.snapshotting_chunks {
             timestamp_min_max = timestamp_min_max.union(&sc.timestamp_min_max);
@@ -134,42 +140,54 @@ impl TableBuffer {
     pub fn computed_size(&self) -> usize {
         let mut size = size_of::<Self>();
 
-        for c in self.chunk_time_to_chunks.values() {
-            for builder in c.data.values() {
-                size += size_of::<ColumnId>() + size_of::<String>() + builder.size();
+        for shard_map in self.chunk_time_to_chunks.values() {
+            for chunk in shard_map.values() {
+                for builder in chunk.data.values() {
+                    size += size_of::<ColumnId>() + size_of::<String>() + builder.size();
+                }
             }
         }
-
         size
     }
 
+    // This snapshot logic now needs to consider merging data from multiple shards for a given chunk_time,
+    // or creating separate SnapshotChunks per shard if Parquet files are to be per-shard.
+    // For now, let's assume we merge them for a given chunk_time.
+    // This is a significant simplification and might need to be revisited for true per-shard file persistence.
     pub fn snapshot(
         &mut self,
         table_def: Arc<TableDefinition>,
         older_than_chunk_time: i64,
     ) -> Vec<SnapshotChunk> {
-        let keys_to_remove = self
-            .chunk_time_to_chunks
-            .keys()
-            .filter(|k| **k < older_than_chunk_time)
-            .copied()
-            .collect::<Vec<_>>();
-        self.snapshotting_chunks = keys_to_remove
-            .into_iter()
-            .map(|chunk_time| {
-                let chunk = self.chunk_time_to_chunks.remove(&chunk_time).unwrap();
-                let timestamp_min_max = chunk.timestamp_min_max();
-                let (schema, record_batch) = chunk.into_schema_record_batch(Arc::clone(&table_def));
+        let mut new_snapshotting_chunks = Vec::new();
+        let mut chunk_times_to_remove = Vec::new();
 
-                SnapshotChunk {
-                    chunk_time,
-                    timestamp_min_max,
-                    record_batch,
-                    schema,
+        for (chunk_time, shard_map) in &self.chunk_time_to_chunks {
+            if *chunk_time < older_than_chunk_time {
+                // This chunk_time is eligible for snapshotting.
+                // We'll collect all its shards.
+                for (shard_id, mutable_chunk) in shard_map {
+                    // Use clone_for_snapshotting to get data without consuming the live chunk
+                    let (schema, record_batch) = mutable_chunk.clone_for_snapshotting(Arc::clone(&table_def));
+                    let timestamp_min_max = mutable_chunk.timestamp_min_max();
+
+                    new_snapshotting_chunks.push(SnapshotChunk {
+                        chunk_time: *chunk_time,
+                        shard_id: *shard_id, // Store the shard_id
+                        timestamp_min_max,
+                        record_batch,
+                        schema,
+                    });
                 }
-            })
-            .collect::<Vec<_>>();
+                chunk_times_to_remove.push(*chunk_time);
+            }
+        }
 
+        for ct in chunk_times_to_remove {
+            self.chunk_time_to_chunks.remove(&ct);
+        }
+
+        self.snapshotting_chunks = new_snapshotting_chunks;
         self.snapshotting_chunks.clone()
     }
 
@@ -181,6 +199,7 @@ impl TableBuffer {
 #[derive(Debug, Clone)]
 pub struct SnapshotChunk {
     pub(crate) chunk_time: i64,
+    pub(crate) shard_id: Option<ShardId>, // Added for sharding
     pub(crate) timestamp_min_max: TimestampMinMax,
     pub(crate) record_batch: RecordBatch,
     pub(crate) schema: Schema,
@@ -189,25 +208,36 @@ pub struct SnapshotChunk {
 // Debug implementation for TableBuffer
 impl std::fmt::Debug for TableBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (min_time, max_time, row_count) = self
-            .chunk_time_to_chunks
-            .values()
-            .map(|c| (c.timestamp_min, c.timestamp_max, c.row_count))
-            .fold(
-                (i64::MAX, i64::MIN, 0),
-                |(a_min, a_max, a_count), (b_min, b_max, b_count)| {
-                    (a_min.min(b_min), a_max.max(b_max), a_count + b_count)
-                },
-            );
+        let mut total_row_count = 0;
+        let mut min_time_overall = i64::MAX;
+        let mut max_time_overall = i64::MIN;
+        let mut shard_count = 0;
+
+        for shard_map in self.chunk_time_to_chunks.values() {
+            for chunk in shard_map.values() {
+                total_row_count += chunk.row_count;
+                min_time_overall = min_time_overall.min(chunk.timestamp_min);
+                max_time_overall = max_time_overall.max(chunk.timestamp_max);
+                shard_count += 1;
+            }
+        }
+        if self.chunk_time_to_chunks.is_empty() && self.snapshotting_chunks.is_empty() { // Adjust for totally empty buffer
+            min_time_overall = 0;
+            max_time_overall = 0;
+        }
+        // Include snapshotting_chunks in debug output if desired, for now focusing on live buffer
         f.debug_struct("TableBuffer")
-            .field("chunk_count", &self.chunk_time_to_chunks.len())
-            .field("timestamp_min", &min_time)
-            .field("timestamp_max", &max_time)
-            .field("row_count", &row_count)
+            .field("chunk_time_count", &self.chunk_time_to_chunks.len()) // Number of distinct chunk times
+            .field("total_shard_chunks", &shard_count) // Total number of shard-specific mutable chunks
+            .field("timestamp_min_overall", &min_time_overall)
+            .field("timestamp_max_overall", &max_time_overall)
+            .field("total_row_count", &total_row_count)
+            .field("snapshotting_chunk_count", &self.snapshotting_chunks.len())
             .finish()
     }
 }
 
+#[derive(Clone)]
 struct MutableTableChunk {
     timestamp_min: i64,
     timestamp_max: i64,
@@ -364,6 +394,28 @@ impl MutableTableChunk {
 
         Ok(RecordBatch::try_new(schema, cols)?)
     }
+
+    // Clones data for snapshotting. A proper implementation might avoid full clone or use Arc<BuilderInner>.
+    // This is a simplified approach to allow progress.
+    fn clone_for_snapshotting(&self, table_def: Arc<TableDefinition>) -> (Schema, RecordBatch) {
+        // This method needs to effectively do what into_schema_record_batch does, but without consuming.
+        // It means we have to build new Arrow arrays from the current state of builders.
+        // This is non-trivial because builders might not support cheap cloning of their current state into a finished Array.
+        // The simplest way here is to call record_batch() and then try to derive schema from it,
+        // or clone builders if they support it (they don't directly in Arrow for finishing).
+        //
+        // For now, this will be similar to record_batch and then build a new schema.
+        // This is not ideal due to potential inconsistencies if schema evolution happens mid-way,
+        // but TableDefinition is passed.
+
+        let rb = self.record_batch(Arc::clone(&table_def)).expect("Failed to create RecordBatch for cloning");
+        // The schema should be derived from table_def to ensure consistency,
+        // or the schema used for rb creation should be directly usable.
+        // If rb.schema() is used, it must match table_def.schema.
+        let schema = table_def.schema.clone(); // Use the definitive schema from TableDefinition
+        (schema, rb)
+    }
+
 
     fn into_schema_record_batch(self, table_def: Arc<TableDefinition>) -> (Schema, RecordBatch) {
         let mut cols = Vec::with_capacity(self.data.len());

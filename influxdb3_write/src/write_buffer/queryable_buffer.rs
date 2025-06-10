@@ -203,8 +203,10 @@ impl QueryableBuffer {
                                 table_name.as_ref(),
                                 table_id.get(),
                                 chunk.chunk_time,
+                                chunk.shard_id, // Pass shard_id to ParquetFilePath
                                 snapshot_details.last_wal_sequence_number,
                             ),
+                            shard_id: chunk.shard_id, // Store shard_id in PersistJob
                             batch: chunk.record_batch,
                             schema: chunk.schema,
                             timestamp_min_max: chunk.timestamp_min_max,
@@ -498,7 +500,8 @@ impl BufferState {
         for (table_id, table_chunks) in &write_batch.table_chunks {
             let table_buffer = database_buffer.entry(*table_id).or_default();
             for (chunk_time, chunk) in &table_chunks.chunk_time_to_chunk {
-                table_buffer.buffer_chunk(*chunk_time, &chunk.rows);
+                // Pass shard_id to buffer_chunk
+                table_buffer.buffer_chunk(*chunk_time, write_batch.shard_id, &chunk.rows);
             }
         }
     }
@@ -519,6 +522,7 @@ struct PersistJob {
     database_id: DbId,
     table_id: TableId,
     table_name: Arc<str>,
+    shard_id: Option<ShardId>, // Added shard_id
     chunk_time: i64,
     path: ParquetFilePath,
     batch: RecordBatch,

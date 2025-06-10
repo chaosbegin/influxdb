@@ -749,6 +749,7 @@ pub async fn command(config: Config) -> Result<()> {
         query_file_limit: config.query_file_limit,
         shutdown: shutdown_manager.register(),
         wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
+        current_node_id: Arc::from(config.node_identifier_prefix.as_str()), // Added current_node_id
     })
     .await
     .map_err(|e| Error::WriteBufferInit(e.into()))?;
@@ -800,6 +801,7 @@ pub async fn command(config: Config) -> Result<()> {
         // convert to positive here so that we can avoid double negatives downstream
         started_with_auth: !config.without_auth,
         time_provider: Arc::clone(&time_provider) as _,
+        current_node_id: Arc::from(config.node_identifier_prefix.as_str()), // Added current_node_id
     }));
 
     let listener = TcpListener::bind(*config.http_bind_address)

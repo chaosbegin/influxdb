@@ -23,9 +23,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    CatalogError, Result,
     catalog::{CatalogSequenceNumber, RetentionPeriod},
-    serialize::VersionedFileType,
+    replication::{ReplicationFactor, ReplicationInfo},
+    shard::{ShardDefinition, ShardId, ShardTimeRange},
+    CatalogError, Result, serialize::VersionedFileType,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -186,6 +187,12 @@ pub enum DatabaseCatalogOp {
     // Retention period ops:
     SetRetentionPeriod(SetRetentionPeriodLog),
     ClearRetentionPeriod(ClearRetentionPeriodLog),
+    // Shard ops:
+    CreateShard(CreateShardLog),
+    UpdateShard(UpdateShardLog),
+    DeleteShard(DeleteShardLog),
+    // Replication ops:
+    SetReplication(SetReplicationLog),
 }
 
 impl DatabaseCatalogOp {
@@ -882,4 +889,42 @@ pub struct RegenerateAdminTokenDetails {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeleteTokenDetails {
     pub token_name: String,
+}
+
+// Shard-related log definitions
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateShardLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>, // Added for context and TableUpdate trait
+    pub shard_definition: ShardDefinition,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateShardLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>, // Added for context and TableUpdate trait
+    pub shard_id: ShardId,
+    pub new_node_ids: Option<Vec<NodeId>>,
+    // Add other updatable fields as necessary, e.g., changes to time_range if allowed
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeleteShardLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>, // Added for context and TableUpdate trait
+    pub shard_id: ShardId,
+}
+
+// Replication-related log definitions
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetReplicationLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>, // Added for context and TableUpdate trait
+    pub replication_info: ReplicationInfo,
 }

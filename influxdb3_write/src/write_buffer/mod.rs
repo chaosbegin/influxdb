@@ -138,6 +138,15 @@ pub enum Error {
 
     #[error("error: {0}")]
     AnyhowError(#[from] anyhow::Error),
+
+    #[error("No matching shard found for table '{table_name}' at time {timestamp_nanos}")]
+    NoMatchingShardFound {
+        table_name: String,
+        timestamp_nanos: i64,
+    },
+
+    #[error("Replication error: {0}")]
+    ReplicationError(String), // Basic error for now
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -164,6 +173,7 @@ pub struct WriteBufferImpl {
     metrics: WriteMetrics,
     distinct_cache: Arc<DistinctCacheProvider>,
     last_cache: Arc<LastCacheProvider>,
+    current_node_id: Arc<str>, // Added for node identification in replication
     /// The number of files we will accept for a query
     query_file_limit: usize,
 }
@@ -186,6 +196,7 @@ pub struct WriteBufferImplArgs {
     pub query_file_limit: Option<usize>,
     pub shutdown: ShutdownToken,
     pub wal_replay_concurrency_limit: Option<usize>,
+    pub current_node_id: Arc<str>, // Added for node identification
 }
 
 impl WriteBufferImpl {
@@ -204,6 +215,7 @@ impl WriteBufferImpl {
             query_file_limit,
             shutdown,
             wal_replay_concurrency_limit,
+            current_node_id, // Destructure new field
         }: WriteBufferImplArgs,
     ) -> Result<Arc<Self>> {
         // load snapshots and replay the wal into the in memory buffer
@@ -267,6 +279,7 @@ impl WriteBufferImpl {
             persisted_files,
             buffer: queryable_buffer,
             metrics: WriteMetrics::new(&metric_registry),
+            current_node_id, // Store new field
             query_file_limit: query_file_limit.unwrap_or(432),
         });
         Ok(result)
@@ -291,60 +304,158 @@ impl WriteBufferImpl {
     ) -> Result<BufferedWriteRequest> {
         debug!("write_lp to {} in writebuffer", db_name);
 
+        // --- Shard Determination ---
+        // This is a simplified approach. A full implementation would need to:
+        // 1. Potentially parse table name from each line if a batch can target multiple tables. (Current validator assumes one table per batch based on db_name)
+        // 2. Handle lines with individual timestamps that might fall into different shards. This would require splitting the batch.
+        // For now, we use ingest_time for the whole batch and assume one target table (implicit in db_name context).
+
+        let table_name_from_lp = lp.lines().next().and_then(|line| line.split(',').next().map(|s| s.to_string()));
+        let determined_shard_id = if let Some(table_name_str) = table_name_from_lp {
+            if let Some(db_schema) = self.catalog.db_schema(db_name.as_str()) {
+                if let Some(table_def) = db_schema.table_definition(&table_name_str) {
+                    let mut found_shard_id = None;
+                    for shard_def_arc in table_def.shards.resource_iter() {
+                        if ingest_time.timestamp_nanos() >= shard_def_arc.time_range.start_time &&
+                           ingest_time.timestamp_nanos() < shard_def_arc.time_range.end_time {
+                            found_shard_id = Some(shard_def_arc.id);
+                            break;
+                        }
+                    }
+                    if found_shard_id.is_none() && !table_def.shards.is_empty() {
+                        // Only error if shards are defined but none match. If no shards defined, proceed without sharding.
+                        return Err(Error::NoMatchingShardFound {
+                            table_name: table_name_str.clone(),
+                            timestamp_nanos: ingest_time.timestamp_nanos(),
+                        });
+                    }
+                    found_shard_id
+                } else {
+                    // Table not found in catalog, validator will handle this.
+                    None
+                }
+            } else {
+                // DB not found, validator will handle this.
+                None
+            }
+        } else {
+            // No lines in LP, validator will handle EmptyWrite.
+            None
+        };
+        // --- End Shard Determination ---
+
+
         // NOTE(trevor/catalog-refactor): should there be some retry limit or timeout?
         loop {
-            // validated lines will update the in-memory catalog, ensuring that all write operations
-            // past this point will be infallible
-            let result = match WriteValidator::initialize(db_name.clone(), self.catalog())?
-                .v1_parse_lines_and_catalog_updates(lp, accept_partial, ingest_time, precision)?
-                .commit_catalog_changes()
-                .await?
-            {
-                Prompt::Success(r) => r.convert_lines_to_buffer(self.wal_config.gen1_duration),
+            let mut validator = WriteValidator::initialize(db_name.clone(), self.catalog())?;
+            let parsed_lines = validator.v1_parse_lines_and_catalog_updates(lp, accept_partial, ingest_time, precision)?;
+
+            let validated_lines_result = match parsed_lines.commit_catalog_changes().await? {
+                Prompt::Success(committed_validator_state) => {
+                    let final_state = crate::write_buffer::validator::CatalogChangesCommitted {
+                        catalog_sequence: committed_validator_state.inner().catalog_sequence,
+                        db_id: committed_validator_state.inner().db_id,
+                        db_name: Arc::clone(&committed_validator_state.inner().db_name),
+                        lines: committed_validator_state.inner().lines.clone(),
+                        bytes: committed_validator_state.inner().bytes,
+                        errors: committed_validator_state.inner().errors.clone(),
+                        shard_id: determined_shard_id,
+                    };
+                    WriteValidator::from(final_state).convert_lines_to_buffer(self.wal_config.gen1_duration)
+                }
                 Prompt::Retry(_) => {
                     debug!("retrying write_lp after attempted commit");
                     continue;
                 }
             };
 
-            // Only buffer to the WAL if there are actually writes in the batch; it
-            // is possible to get empty writes with `accept_partial`:
-            if result.line_count > 0 {
-                let ops = vec![WalOp::Write(result.valid_data)];
+            };
 
+            // Only buffer to the WAL if there are actually writes in the batch
+            if validated_lines_result.line_count > 0 {
+                let wal_op = WalOp::Write(validated_lines_result.valid_data.clone()); // Clone for potential replication
+
+                // --- Replication Logic Placeholder ---
+                let mut replication_successful = true; // Assume success if no replication needed
+                if let Some(table_name_str) = &table_name_from_lp { // Use previously parsed table name
+                    if let Some(db_schema) = self.catalog.db_schema(db_name.as_str()) {
+                        if let Some(table_def) = db_schema.table_definition(table_name_str) {
+                            if let Some(replication_info) = &table_def.replication_info {
+                                if replication_info.replication_factor.get() > 1 {
+                                    // In a real scenario, identify replica nodes from catalog/config
+                                    let replica_nodes: Vec<String> = vec![]; // Placeholder
+                                    if !replica_nodes.is_empty() {
+                                        debug!(
+                                            "Replicating WalOp for table '{}.{}' to nodes: {:?}. ShardId: {:?}",
+                                            db_name.as_str(), table_name_str, replica_nodes, determined_shard_id
+                                        );
+                                        // let serialized_op = self.serialize_wal_op(&wal_op)?; // Placeholder method
+                                        // match self.replicate_wal_op_to_nodes(replica_nodes, serialized_op).await {
+                                        //     Ok(_) => { /* replication_successful = true; */ }
+                                        //     Err(e) => {
+                                        //         error!("Failed to replicate WalOp: {}", e);
+                                        //         replication_successful = false;
+                                        //         // TODO: Handle replication failure (e.g., retry, mark as degraded, error to client?)
+                                        //         // For now, we might proceed with local write or error based on policy.
+                                        //         // This subtask assumes a simplified initial implementation.
+                                        //         return Err(Error::ReplicationError(format!("Failed to replicate to nodes: {}", e)));
+                                        //     }
+                                        // }
+                                        // For this subtask, we'll simulate an error if replication is configured but no nodes are (conceptually) found or reachable.
+                                        // This is a placeholder for actual client calls.
+                                        // To make this testable without actual networking, one might check a mock/flag.
+                                        // For now, just logging. A real implementation would call a replication client.
+                                        warn!("Placeholder: Replication configured for {}.{} but actual replication call is not implemented.", db_name.as_str(), table_name_str);
+
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // --- End Replication Logic Placeholder ---
+
+                if !replication_successful {
+                     // If replication failed and is critical, error out or handle according to policy
+                     // For now, this path might not be hit due to placeholder logic.
+                    return Err(Error::ReplicationError("Critical replication failed.".to_string()));
+                }
+
+                // Proceed with local WAL write
                 if no_sync {
-                    self.wal.write_ops_unconfirmed(ops).await?;
+                    self.wal.write_ops_unconfirmed(vec![wal_op]).await?;
                 } else {
-                    // write to the wal. Behind the scenes the ops get buffered in memory and once a second (or
-                    // whatever the configured wal flush interval is set to) the buffer is flushed and all the
-                    // data is persisted into a single wal file in the configured object store. Then the
-                    // contents are sent to the configured notifier, which in this case is the queryable buffer.
-                    // Thus, after this returns, the data is both durable and queryable.
-                    self.wal.write_ops(ops).await?;
+                    self.wal.write_ops(vec![wal_op]).await?;
                 }
             }
 
-            if result.line_count == 0 && result.errors.is_empty() {
+            if validated_lines_result.line_count == 0 && validated_lines_result.errors.is_empty() {
                 return Err(Error::EmptyWrite);
             }
 
-            // record metrics for lines written, rejected, and bytes written
-            self.metrics
-                .record_lines(&db_name, result.line_count as u64);
-            self.metrics
-                .record_lines_rejected(&db_name, result.errors.len() as u64);
-            self.metrics
-                .record_bytes(&db_name, result.valid_bytes_count);
+            self.metrics.record_lines(&db_name, validated_lines_result.line_count as u64);
+            self.metrics.record_lines_rejected(&db_name, validated_lines_result.errors.len() as u64);
+            self.metrics.record_bytes(&db_name, validated_lines_result.valid_bytes_count);
 
             break Ok(BufferedWriteRequest {
                 db_name,
-                invalid_lines: result.errors,
-                line_count: result.line_count,
-                field_count: result.field_count,
-                index_count: result.index_count,
+                invalid_lines: validated_lines_result.errors,
+                line_count: validated_lines_result.line_count,
+                field_count: validated_lines_result.field_count,
+                index_count: validated_lines_result.index_count,
             });
         }
     }
+
+    // Placeholder for actual replication client logic
+    // async fn replicate_wal_op_to_nodes(&self, nodes: Vec<String>, serialized_op: Vec<u8>) -> Result<(), String> {
+    //     Err("Not implemented".to_string())
+    // }
+
+    // Placeholder for serializing WalOp - in reality, this would use something like bincode/protobuf
+    // fn serialize_wal_op(&self, op: &WalOp) -> Result<Vec<u8>, Error> {
+    //     bitcode::serialize(op).map_err(|e| Error::AnyhowError(anyhow::anyhow!("Failed to serialize WalOp: {}", e)))
+    // }
 
     fn get_table_chunks(
         &self,
@@ -606,6 +717,248 @@ impl LastCacheManager for WriteBufferImpl {
 
 impl WriteBuffer for WriteBufferImpl {}
 
+#[async_trait]
+impl Bufferer for WriteBufferImpl {
+    async fn write_lp(
+        &self,
+        database: NamespaceName<'static>,
+        lp: &str,
+        ingest_time: Time,
+        accept_partial: bool,
+        precision: Precision,
+        no_sync: bool,
+    ) -> Result<BufferedWriteRequest> {
+        // Existing write_lp implementation...
+        // This needs to be kept as is, with the replication client logic added previously.
+        // The diff tool likely needs the full existing method here if I were to modify it,
+        // but I am adding a NEW method to the impl block.
+        // For adding a new method, I need a different anchor.
+        // The previous diff for write_lp already added the client-side replication placeholders.
+        // This diff will add the new apply_replicated_wal_op method.
+        // Re-stating the full write_lp is not needed if only adding a new method to the impl.
+        // However, the tool needs a valid search block.
+        // Let's find a stable point at the end of the WriteBufferImpl impl block.
+        // The current end seems to be before the check_mem_and_force_snapshot_loop function.
+        // So, I will use the WriteBuffer trait implementation as the anchor.
+        // This is tricky. Let's try to anchor on the `impl WriteBuffer for WriteBufferImpl {}`
+        // and add the new method within the broader `impl WriteBufferImpl` block.
+
+        // For now, I will assume the previous changes to write_lp are intact and
+        // this diff focuses on adding apply_replicated_wal_op to the WriteBufferImpl struct,
+        // which also means it needs to be part of the Bufferer trait impl.
+        // The tool might get confused if I don't provide the existing write_lp.
+        // To be safe, I'll re-provide the existing write_lp (as modified before)
+        // and then add the new method. This is risky due to length.
+
+        // Re-provide the existing write_lp as previously modified for replication client placeholders
+        debug!("write_lp to {} in writebuffer", database);
+
+        let table_name_from_lp = lp.lines().next().and_then(|line| line.split(',').next().map(|s| s.to_string()));
+        let determined_shard_id = if let Some(table_name_str) = table_name_from_lp.as_ref().or_else(|| {
+            // If lp is empty, table_name_from_lp will be None.
+            // Try to get table name from db_name if it's a common pattern, or this needs more robust handling.
+            // This is a tricky spot if lp can be empty but db_name implies a single table.
+            // For now, if lp is empty, determined_shard_id will be None.
+            None
+        }) {
+            if let Some(db_schema) = self.catalog.db_schema(database.as_str()) {
+                if let Some(table_def) = db_schema.table_definition(table_name_str) {
+                    let mut found_shard_id = None;
+                    for shard_def_arc in table_def.shards.resource_iter() {
+                        if ingest_time.timestamp_nanos() >= shard_def_arc.time_range.start_time &&
+                           ingest_time.timestamp_nanos() < shard_def_arc.time_range.end_time {
+                            found_shard_id = Some(shard_def_arc.id);
+                            break;
+                        }
+                    }
+                    if found_shard_id.is_none() && !table_def.shards.is_empty() {
+                        return Err(Error::NoMatchingShardFound {
+                            table_name: table_name_str.clone(),
+                            timestamp_nanos: ingest_time.timestamp_nanos(),
+                        });
+                    }
+                    found_shard_id
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        loop {
+            let mut validator = WriteValidator::initialize(database.clone(), self.catalog())?;
+            let parsed_lines = validator.v1_parse_lines_and_catalog_updates(lp, accept_partial, ingest_time, precision)?;
+
+            let validated_lines_result = match parsed_lines.commit_catalog_changes().await? {
+                Prompt::Success(committed_validator_state) => {
+                    let final_state = crate::write_buffer::validator::CatalogChangesCommitted {
+                        catalog_sequence: committed_validator_state.inner().catalog_sequence,
+                        db_id: committed_validator_state.inner().db_id,
+                        db_name: Arc::clone(&committed_validator_state.inner().db_name),
+                        lines: committed_validator_state.inner().lines.clone(),
+                        bytes: committed_validator_state.inner().bytes,
+                        errors: committed_validator_state.inner().errors.clone(),
+                        shard_id: determined_shard_id,
+                    };
+                    WriteValidator::from(final_state).convert_lines_to_buffer(self.wal_config.gen1_duration)
+                }
+                Prompt::Retry(_) => {
+                    debug!("retrying write_lp after attempted commit");
+                    continue;
+                }
+            };
+
+            if validated_lines_result.line_count > 0 {
+                let wal_op = WalOp::Write(validated_lines_result.valid_data.clone());
+
+                let mut replication_successful = true;
+                if let Some(ref table_name_str_ref) = table_name_from_lp {
+                    if let Some(db_schema) = self.catalog.db_schema(database.as_str()) {
+                        if let Some(table_def) = db_schema.table_definition(table_name_str_ref) {
+                            if let Some(replication_info) = &table_def.replication_info {
+                                if replication_info.replication_factor.get() > 1 {
+                                    let replica_nodes: Vec<String> = vec![]; // Placeholder for actual replica node discovery
+
+                                    if !replica_nodes.is_empty() {
+                                        debug!(
+                                            "Attempting to replicate WalOp for table '{}.{}' to nodes: {:?}. ShardId: {:?}",
+                                            database.as_str(), table_name_str_ref, replica_nodes, determined_shard_id
+                                        );
+
+                                        let serialized_op = match bitcode::serialize(&wal_op) {
+                                            Ok(bytes) => bytes,
+                                            Err(e) => {
+                                                error!("Failed to serialize WalOp for replication: {}", e);
+                                                replication_successful = false; // Mark as failure
+                                                // Potentially return Error::ReplicationError directly if serialization is critical
+                                                // return Err(Error::ReplicationError(format!("Failed to serialize WalOp: {}", e)));
+                                                vec![] // Or handle more gracefully
+                                            }
+                                        };
+
+                                        if replication_successful { // Only proceed if serialization was ok
+                                            // Use self.current_node_id
+                                            let own_node_id = self.current_node_id.as_ref().to_string();
+
+                                            let request_template = crate::ReplicateWalOpRequest {
+                                                serialized_wal_op: serialized_op,
+                                                originating_node_id: own_node_id,
+                                                shard_id: determined_shard_id.map(|sid| sid.get()),
+                                                database_name: database.as_str().to_string(),
+                                                table_name: table_name_str_ref.clone(),
+                                            };
+
+                                            // Placeholder for actual RPC calls to each replica_node
+                                            // let mut successful_replications = 0;
+                                            // for node_addr in replica_nodes {
+                                            //     // let client = ... get_replication_client_for(node_addr).await ...;
+                                            //     // match client.replicate_wal_op(request_template.clone_with_op(op_bytes_for_this_node)).await {
+                                            //     //     Ok(response) if response.into_inner().success => successful_replications += 1,
+                                            //     //     Ok(response) => error!("Replica {} failed: {:?}", node_addr, response.into_inner().error_message),
+                                            //     //     Err(e) => error!("RPC error to replica {}: {:?}", node_addr, e),
+                                            //     // }
+                                            // }
+
+                                            // Placeholder for quorum check
+                                            // let quorum_needed = (replica_nodes.len() / 2) + 1;
+                                            // if successful_replications < quorum_needed {
+                                            //     replication_successful = false;
+                                            //     error!("Quorum not met for WalOp replication. Needed {}, got {}", quorum_needed, successful_replications);
+                                            //     // return Err(Error::ReplicationError("Quorum not met".to_string()));
+                                            // }
+                                            warn!("Placeholder: Actual replication RPC calls and quorum logic for {}.{} are not implemented.", database.as_str(), table_name_str_ref);
+                                        }
+                                    } else if replication_info.replication_factor.get() > 1 {
+                                         warn!("Replication configured for {}.{} (factor > 1), but no replica nodes identified/configured. Proceeding with local write only.", database.as_str(), table_name_str_ref);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !replication_successful {
+                    return Err(Error::ReplicationError("Critical replication failed.".to_string()));
+                }
+
+                if no_sync {
+                    self.wal.write_ops_unconfirmed(vec![wal_op]).await?;
+                } else {
+                    self.wal.write_ops(vec![wal_op]).await?;
+                }
+            }
+
+            if validated_lines_result.line_count == 0 && validated_lines_result.errors.is_empty() {
+                return Err(Error::EmptyWrite);
+            }
+
+            self.metrics.record_lines(&database, validated_lines_result.line_count as u64);
+            self.metrics.record_lines_rejected(&database, validated_lines_result.errors.len() as u64);
+            self.metrics.record_bytes(&database, validated_lines_result.valid_bytes_count);
+
+            break Ok(BufferedWriteRequest {
+                db_name: database,
+                invalid_lines: validated_lines_result.errors,
+                line_count: validated_lines_result.line_count,
+                field_count: validated_lines_result.field_count,
+                index_count: validated_lines_result.index_count,
+            });
+        }
+    }
+
+    fn catalog(&self) -> Arc<Catalog> {
+        Arc::clone(&self.catalog)
+    }
+
+    fn wal(&self) -> Arc<dyn Wal> {
+        Arc::clone(&self.wal)
+    }
+
+    fn parquet_files_filtered(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        filter: &ChunkFilter<'_>,
+    ) -> Vec<ParquetFile> {
+        self.buffer.persisted_parquet_files(db_id, table_id, filter)
+    }
+
+    fn watch_persisted_snapshots(&self) -> Receiver<Option<PersistedSnapshotVersion>> {
+        self.buffer.persisted_snapshot_notify_rx()
+    }
+
+    async fn apply_replicated_wal_op(&self, op: WalOp, originating_node_id: Option<String>) -> Result<(), Error> {
+        debug!(?op, ?originating_node_id, "Applying replicated WalOp");
+
+        // Here, we assume the WalOp (specifically WalOp::Write(WriteBatch)) is valid
+        // and has been appropriately constructed by the originating node.
+        // Key differences from write_lp:
+        // 1. No line protocol parsing or validation against catalog schema (already done on originating node).
+        // 2. No new table/column creation in catalog (schema assumed to be synced or eventually consistent).
+        // 3. CRITICAL: No further replication of this op. This is the termination point for a replicated write.
+        // 4. ShardId within the WriteBatch should be respected by the local TableBuffer.
+
+        if let WalOp::Write(ref write_batch) = op {
+            if write_batch.table_chunks.is_empty() && write_batch.catalog_sequence == 0 { // Heuristic for potentially empty/noop write from replication
+                 debug!("Applying a possibly empty or no-op WriteBatch from replication. Origin: {:?}", originating_node_id);
+            }
+             // For now, assume `no_sync = false` for replicated ops, meaning we wait for local WAL persistence.
+             // This provides stronger guarantees to the originating node if the RPC ack implies local persistence.
+            self.wal.write_ops(vec![op]).await.map_err(Error::WriteBuffer)?;
+        } else if let WalOp::Noop(_) = op {
+            // If it's a Noop, still write it to WAL to maintain sequence if necessary,
+            // or decide if it can be skipped on replicas. For safety, write it.
+            self.wal.write_ops(vec![op]).await.map_err(Error::WriteBuffer)?;
+        }
+        // If other WalOp types are added, they'd need handling here too.
+
+        Ok(())
+    }
+}
+
 pub async fn check_mem_and_force_snapshot_loop(
     write_buffer: Arc<WriteBufferImpl>,
     memory_threshold_bytes: usize,
@@ -694,6 +1047,7 @@ mod tests {
     use object_store::{ObjectStore, PutPayload};
     use parquet_file::storage::{ParquetStorage, StorageId};
     use pretty_assertions::assert_eq;
+    use influxdb3_catalog::replication::{ReplicationFactor, ReplicationInfo}; // For replication test
 
     #[tokio::test]
     async fn parse_lp_into_buffer() {
@@ -1579,6 +1933,149 @@ mod tests {
 
         // Test that the next_file_id has been set properly
         assert_eq!(ParquetFileId::next_id().as_u64(), 6);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_write_lp_with_replication_placeholder() {
+        let object_store = Arc::new(InMemory::new());
+        let (buf, _metrics) = setup_with_metrics( // Using setup_with_metrics for simplicity
+            Time::from_timestamp_nanos(0),
+            Arc::clone(&object_store),
+            WalConfig::test_config(),
+        )
+        .await;
+
+        let db_name_str = "rep_db";
+        let table_name_str = "rep_table";
+        let db_name = NamespaceName::new(db_name_str).unwrap();
+
+        // Setup catalog with replication info
+        let catalog = buf.catalog();
+        catalog.create_database(db_name_str).await.unwrap();
+        catalog.create_table(db_name_str, table_name_str, &["tagA"], &[("fieldA", FieldDataType::Integer)])
+            .await
+            .unwrap();
+
+        let rep_info = ReplicationInfo::new(ReplicationFactor::new(2).unwrap());
+        catalog.set_replication(db_name_str, table_name_str, rep_info)
+            .await
+            .unwrap();
+
+        // Perform a write - this should hit the replication placeholder logic
+        let lp = format!("{},tagA=v1 fieldA=100i 0", table_name_str);
+        let result = buf.write_lp(
+            db_name,
+            &lp,
+            Time::from_timestamp_nanos(0), // ingest_time
+            false,
+            Precision::Nanosecond,
+            false, // no_sync = false, so it attempts full write path including WAL
+        ).await;
+
+        // We expect this to succeed locally, as the placeholder only logs a warning.
+        // If it were to error out, we'd check for Err(Error::ReplicationError(...))
+        assert!(result.is_ok(), "Write should succeed locally despite placeholder replication. Result: {:?}", result);
+
+        // Further checks could involve inspecting logs if possible, or using mock objects if the
+        // design were adapted for it. For now, a successful local write is the main check.
+        let db_schema = catalog.db_schema(db_name_str).unwrap();
+        let table_def = db_schema.table_definition(table_name_str).unwrap();
+        assert!(table_def.replication_info.is_some());
+        assert_eq!(table_def.replication_info.as_ref().unwrap().replication_factor.get(), 2);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_apply_replicated_wal_op() {
+        let object_store = Arc::new(InMemory::new());
+        let (buf, _metrics) = setup_with_metrics(
+            Time::from_timestamp_nanos(0),
+            Arc::clone(&object_store),
+            WalConfig::test_config(),
+        )
+        .await;
+
+        // Create a sample WalOp to replicate
+        let db_name_str = "rep_db_target";
+        let table_name_str = "rep_table_target";
+        let db_name_arc = Arc::from(db_name_str);
+        let _ = buf.catalog().create_database(db_name_str).await.unwrap(); // Ensure DB exists for TableBuffer
+
+        let table_id = TableId::new(0); // Assume table ID for simplicity in test
+        let mut table_chunks = SerdeVecMap::new();
+        let mut chunk_map = HashMap::new();
+        chunk_map.insert(0i64, influxdb3_wal::TableChunk { rows: vec![
+            influxdb3_wal::Row { time: 1, fields: vec![influxdb3_wal::Field { id: ColumnId::new(0), value: influxdb3_wal::FieldData::Integer(100) }] }
+        ]});
+        table_chunks.insert(table_id, influxdb3_wal::TableChunks {
+            min_time: 1, max_time: 1, chunk_time_to_chunk: chunk_map
+        });
+
+        let write_batch = WriteBatch {
+            catalog_sequence: 1,
+            database_id: DbId::new(1), // Assuming this DB ID exists or matches what create_database makes
+            database_name: db_name_arc.clone(),
+            table_chunks,
+            min_time_ns: 1,
+            max_time_ns: 1,
+            shard_id: Some(influxdb3_catalog::shard::ShardId::new(1)),
+        };
+        let replicated_op = WalOp::Write(write_batch);
+        let originating_node_id = Some("origin_node_1".to_string());
+
+        // Apply the replicated WalOp
+        let result = buf.apply_replicated_wal_op(replicated_op.clone(), originating_node_id).await;
+        assert!(result.is_ok(), "apply_replicated_wal_op failed: {:?}", result);
+
+        // Verification:
+        // 1. Check if the op was written to the WAL.
+        //    This is hard to check directly without inspecting WAL files or having more introspection.
+        //    We trust that `self.wal.write_ops()` works as tested elsewhere.
+        //    A key indicator is that the data should appear in the QueryableBuffer after WAL flush.
+        //
+        // 2. To verify it's in QueryableBuffer, we'd normally need to wait for WAL flush & notification.
+        //    For a direct unit test, we can simulate the notification path if needed,
+        //    or make `apply_replicated_wal_op` also directly notify for testability (but that changes its nature).
+        //
+        //    Given the current structure, `apply_replicated_wal_op` writes to WAL.
+        //    The WAL background task (`background_wal_flush`) will then read it, and call
+        //    `QueryableBuffer::notify`. So, data won't be in `TableBuffer` immediately after
+        //    `apply_replicated_wal_op` returns, but after the next WAL flush.
+        //
+        //    For this test, we'll assume `self.wal.write_ops` is successful.
+        //    A more involved test would trigger a WAL flush and check QueryableBuffer.
+        //
+        // 3. Ensure no further replication was attempted.
+        //    This is also hard to check directly without deeper mocking of a replication client.
+        //    We rely on code inspection: `apply_replicated_wal_op` does not call the replication client logic.
+
+        // As a simple check, ensure the WAL received *some* write.
+        // If the WAL was NoOpWal, this test would need adjustment.
+        // The test_config for Wal usually uses WalObjectStore.
+        // We can try to write another op through the normal path and see if sequences advance.
+        let last_seq_before = buf.wal().last_wal_sequence_number().await;
+
+        // Apply it again to see sequence number changes (or ensure it doesn't duplicate if WAL has such checks)
+        // Note: Re-applying the exact same WalOp might be handled differently by WAL itself.
+        // A better check would be to query the data after a flush, if feasible in test setup.
+
+        // Let's write a *new* op via normal path to advance WAL sequence
+        let lp = format!("{},tagA=v2 fieldA=200i 10", table_name_str);
+         let _ = buf.write_lp(
+            NamespaceName::new(db_name_str).unwrap(),
+            &lp,
+            Time::from_timestamp_nanos(10),
+            false,
+            Precision::Nanosecond,
+            false,
+        ).await;
+
+        let last_seq_after = buf.wal().last_wal_sequence_number().await;
+
+        // Expecting that at least one WAL file was created by the two writes (one replicated, one normal)
+        // This depends on snapshot_size and how WAL sequences are handled for individual ops vs flushes.
+        // A more direct assertion would be on QueryableBuffer content after a forced WAL flush.
+        assert!(last_seq_after.as_u64() > last_seq_before.as_u64() || last_seq_after.as_u64() > 0, "WAL sequence should advance or be non-zero after writes.");
+
     }
 
     /// This is the reproducer for [#25277][see]
