@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     CatalogError, Result,
-    catalog::{DEFAULT_OPERATOR_TOKEN_NAME, NUM_TAG_COLUMNS_LIMIT, RetentionPeriod},
+    catalog::{DEFAULT_OPERATOR_TOKEN_NAME, RetentionPeriod}, // Removed NUM_TAG_COLUMNS_LIMIT
     log::{
         AddFieldsLog, CatalogBatch, ClearRetentionPeriodLog, CreateDatabaseLog, CreateTableLog,
         DatabaseCatalogOp, DeleteDistinctCacheLog, DeleteLastCacheLog, DeleteTokenDetails,
@@ -68,6 +68,7 @@ impl Catalog {
                 database_schema: Arc::clone(&database_schema),
                 ops: vec![],
                 columns_per_table_limit: self.num_columns_per_table_limit(),
+                tag_columns_per_table_limit: self.num_tag_columns_per_table_limit(), // Added
             }),
             None => {
                 if inner.database_count() >= self.num_dbs_limit() {
@@ -92,6 +93,7 @@ impl Catalog {
                     database_schema,
                     ops,
                     columns_per_table_limit: self.num_columns_per_table_limit(),
+                    tag_columns_per_table_limit: self.num_tag_columns_per_table_limit(), // Added
                 })
             }
         }
@@ -964,6 +966,7 @@ pub struct DatabaseCatalogTransaction {
     current_table_count: usize,
     table_limit: usize,
     columns_per_table_limit: usize,
+    tag_columns_per_table_limit: usize, // Added
     time_ns: i64,
     database_schema: Arc<DatabaseSchema>,
     ops: Vec<DatabaseCatalogOp>,
@@ -1042,9 +1045,9 @@ impl DatabaseCatalogTransaction {
                     return Err(CatalogError::TooManyColumns(self.columns_per_table_limit));
                 }
                 if matches!(column_type, FieldDataType::Tag)
-                    && table_def.num_tag_columns() >= NUM_TAG_COLUMNS_LIMIT
+                    && table_def.num_tag_columns() >= self.tag_columns_per_table_limit // Changed
                 {
-                    return Err(CatalogError::TooManyTagColumns);
+                    return Err(CatalogError::TooManyTagColumns(self.tag_columns_per_table_limit)); // Changed
                 }
                 let database_id = self.database_schema.id;
                 let database_name = Arc::clone(&self.database_schema.name);
@@ -1089,10 +1092,10 @@ impl DatabaseCatalogTransaction {
         if self.current_table_count >= self.table_limit {
             return Err(CatalogError::TooManyTables(self.table_limit));
         }
-        if tags.len() > NUM_TAG_COLUMNS_LIMIT {
-            return Err(CatalogError::TooManyTagColumns);
+        if tags.len() > self.tag_columns_per_table_limit { // Changed
+            return Err(CatalogError::TooManyTagColumns(self.tag_columns_per_table_limit)); // Changed
         }
-        if tags.len() + fields.len() > self.columns_per_table_limit - 1 {
+        if tags.len() + fields.len() > self.columns_per_table_limit - 1 { // -1 for time column
             return Err(CatalogError::TooManyColumns(self.columns_per_table_limit));
         }
         let db_schema = Arc::make_mut(&mut self.database_schema);

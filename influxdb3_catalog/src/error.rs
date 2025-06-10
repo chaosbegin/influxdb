@@ -3,10 +3,8 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use schema::InfluxColumnType;
 
-use crate::{
-    catalog::NUM_TAG_COLUMNS_LIMIT, channel::SubscriptionError,
-    object_store::ObjectStoreCatalogError,
-};
+// Removed NUM_TAG_COLUMNS_LIMIT from here as it's now passed into the error variant
+use crate::{channel::SubscriptionError, object_store::ObjectStoreCatalogError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -50,11 +48,8 @@ pub enum CatalogError {
     #[error("Update to schema would exceed number of columns per table limit of {0} columns")]
     TooManyColumns(usize),
 
-    #[error(
-        "Update to schema would exceed number of tag columns per table limit of {} columns",
-        NUM_TAG_COLUMNS_LIMIT
-    )]
-    TooManyTagColumns,
+    #[error("Update to schema would exceed number of tag columns per table limit of {0} columns")]
+    TooManyTagColumns(usize), // Added usize to hold the limit
 
     #[error("Update to schema would exceed number of tables limit of {0} tables")]
     TooManyTables(usize),
