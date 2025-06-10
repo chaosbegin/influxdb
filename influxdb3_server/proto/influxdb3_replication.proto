@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package influxdb3.internal.replication.v1;
+
+// Service for replicating WalOp data between InfluxDB 3 nodes.
+service ReplicationService {
+  // Replicates a single WalOp to a replica node.
+  rpc ReplicateWalOp(ReplicateWalOpRequest) returns (ReplicateWalOpResponse);
+}
+
+// Request message for replicating a WalOp.
+message ReplicateWalOpRequest {
+  // The WalOp, serialized to bytes (e.g., using bitcode or another agreed-upon format).
+  bytes wal_op_bytes = 1;
+
+  // Identifier for the node that originally processed this write.
+  string originating_node_id = 2;
+
+  // Optional ShardId this operation belongs to.
+  // Represented as uint64 as ShardId is typically a u64 wrapper.
+  optional uint64 shard_id = 3;
+
+  // The name of the database.
+  // This might be redundant if fully contained in wal_op_bytes, but can be useful for routing or context.
+  string database_name = 4;
+
+  // The name of the table.
+  // Similar to database_name, might be redundant but useful.
+  string table_name = 5;
+}
+
+// Response message for a ReplicateWalOp RPC call.
+message ReplicateWalOpResponse {
+  // Indicates if the WalOp was successfully applied on the replica.
+  bool success = 1;
+
+  // Provides an error message if the operation failed.
+  optional string error_message = 2;
+}

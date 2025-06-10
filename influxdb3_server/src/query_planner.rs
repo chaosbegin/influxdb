@@ -21,16 +21,26 @@ type Result<T, E = DataFusionError> = std::result::Result<T, E>;
 ///
 /// This is based on the similar implementation for the planner in the flight service [here][ref].
 ///
+use influxdb3_catalog::catalog::Catalog; // Added for Catalog access
+
 /// [ref]: https://github.com/influxdata/influxdb3_core/blob/6fcbb004232738d55655f32f4ad2385523d10696/service_grpc_flight/src/planner.rs#L24-L33
 pub(crate) struct Planner {
     ctx: IOxSessionContext,
+    catalog: Arc<Catalog>,        // Added for sharding info
+    current_node_id: Arc<str>, // Added for local/remote distinction
 }
 
 impl Planner {
     /// Create a new `Planner`
-    pub(crate) fn new(ctx: &IOxSessionContext) -> Self {
+    pub(crate) fn new(
+        ctx: &IOxSessionContext,
+        catalog: Arc<Catalog>,
+        current_node_id: Arc<str>,
+    ) -> Self {
         Self {
             ctx: ctx.child_ctx("rest_api_query_planner"),
+            catalog,
+            current_node_id,
         }
     }
 
@@ -44,7 +54,9 @@ impl Planner {
         let query = query.as_ref();
         let ctx = self.ctx.child_ctx("rest_api_query_planner_sql");
 
-        planner.query(query, params, &ctx).await
+        let logical_plan = planner.query_to_logical_plan(query, &ctx).await?;
+        self.distribute_plan_if_sharded(&logical_plan, "SQL").await?; // Conceptual sharding check
+        ctx.create_physical_plan(&logical_plan).await
     }
 
     /// Plan an InfluxQL query and return a DataFusion physical plan
@@ -56,6 +68,7 @@ impl Planner {
         let ctx = self.ctx.child_ctx("rest_api_query_planner_influxql");
 
         let logical_plan = InfluxQLQueryPlanner::statement_to_plan(statement, params, &ctx).await?;
+        self.distribute_plan_if_sharded(&logical_plan, "InfluxQL").await?; // Conceptual sharding check
         let input = ctx.create_physical_plan(&logical_plan).await?;
         let input_schema = input.schema();
         let mut md = input_schema.metadata().clone();
@@ -66,6 +79,68 @@ impl Planner {
         ));
 
         Ok(Arc::new(SchemaExec::new(input, schema)))
+    }
+
+    async fn distribute_plan_if_sharded(
+        &self,
+        logical_plan: &datafusion::logical_expr::LogicalPlan,
+        query_type: &str,
+    ) -> Result<()> {
+        use datafusion::logical_expr::LogicalPlan;
+        use observability_deps::tracing::debug;
+
+        // Collect table names from the logical plan
+        let mut table_names = std::collections::HashSet::new();
+        logical_plan.collect_table_scan_table_names(&mut table_names);
+
+        for table_name_ref in table_names {
+            let table_name = table_name_ref.table();
+            // Assume tables are in the default database context of the session for simplicity.
+            // IOxSessionContext holds a default catalog and schema.
+            // The catalog name is usually "public" or "datafusion", schema name "public".
+            // The actual database name for our catalog lookup comes from the session context.
+            // This part might need more robust database name resolution if queries can span DBs.
+            let default_db_name = self.ctx.default_database_name();
+
+            if let Some(db_schema) = self.catalog.db_schema(&default_db_name) {
+                if let Some(table_def) = db_schema.table_definition(table_name) {
+                    if !table_def.shards.is_empty() {
+                        debug!(
+                            db_name = %default_db_name,
+                            table_name = %table_name,
+                            query_type = %query_type,
+                            num_shards = %table_def.shards.len(),
+                            current_node_id = %self.current_node_id,
+                            "Query targets a sharded table. Conceptual distributed planning would occur here."
+                        );
+                        // --- Conceptual Distributed Planning Logic ---
+                        // 1. Identify relevant shards based on query predicates (e.g., time range filters).
+                        //    - This requires predicate pushdown analysis or extracting filters from `logical_plan`.
+                        //
+                        // 2. For each relevant shard in `table_def.shards`:
+                        //    - let shard_node_ids = &shard_def.node_ids;
+                        //    - let is_local = shard_node_ids.iter().any(|id| id.to_string() == self.current_node_id.as_ref());
+                        //    - if is_local:
+                        //        - Plan a local scan for this shard. This means the `QueryTable::scan` or underlying
+                        //          `WriteBuffer::get_table_chunks` would need to accept a `shard_id` filter.
+                        //          The `ExecutionPlan` for this local part would be generated.
+                        //    - else (remote shard):
+                        //        - Create a "remote query operator" / `ExecutionPlan` node.
+                        //        - This operator would serialize the relevant part of the query (or a specific fragment plan).
+                        //        - It would make a gRPC call (e.g., to `ExecuteQueryFragment`) to the target node(s) in `shard_node_ids`.
+                        //        - It would deserialize the stream of RecordBatches received from the remote node.
+                        //
+                        // 3. Aggregate Results:
+                        //    - Add an aggregation operator (e.g., `UnionExec`, `SortPreservingMergeExec`, custom shuffle/exchange)
+                        //      to combine results from all local and remote shard plans.
+                        //
+                        // For this subtask, we are only logging and not modifying the plan.
+                        // The original physical plan created by DataFusion (local scan) will be used.
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
