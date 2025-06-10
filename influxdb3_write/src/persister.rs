@@ -82,6 +82,7 @@ pub struct Persister {
     /// time provider
     time_provider: Arc<dyn TimeProvider>,
     pub(crate) mem_pool: Arc<dyn MemoryPool>,
+    parquet_row_group_write_size: usize, // Added
 }
 
 impl Persister {
@@ -89,6 +90,7 @@ impl Persister {
         object_store: Arc<dyn ObjectStore>,
         node_identifier_prefix: impl Into<String>,
         time_provider: Arc<dyn TimeProvider>,
+        parquet_row_group_write_size: usize, // Added
     ) -> Self {
         Self {
             object_store_url: ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
@@ -96,6 +98,7 @@ impl Persister {
             node_identifier_prefix: node_identifier_prefix.into(),
             time_provider,
             mem_pool: Arc::new(UnboundedMemoryPool::default()),
+            parquet_row_group_write_size, // Added
         }
     }
 
@@ -108,7 +111,7 @@ impl Persister {
         &self,
         batches: SendableRecordBatchStream,
     ) -> Result<ParquetBytes> {
-        serialize_to_parquet(Arc::clone(&self.mem_pool), batches).await
+        serialize_to_parquet(Arc::clone(&self.mem_pool), batches, self.parquet_row_group_write_size).await
     }
 
     /// Get the host identifier prefix
@@ -126,8 +129,11 @@ impl Persister {
         let mut futures = FuturesOrdered::new();
         let mut offset: Option<ObjPath> = None;
 
+        // Iteratively list snapshots from object store in batches to avoid overly large
+        // list responses from certain object stores. The internal batch size here (1000)
+        // is an implementation detail for managing these list operations.
         while most_recent_n > 0 {
-            let count = if most_recent_n > 1000 {
+            let count = if most_recent_n > 1000 { // Internal batching size for listing
                 most_recent_n -= 1000;
                 1000
             } else {
@@ -256,6 +262,7 @@ impl Persister {
 pub async fn serialize_to_parquet(
     mem_pool: Arc<dyn MemoryPool>,
     batches: SendableRecordBatchStream,
+    row_group_write_size: usize, // Added
 ) -> Result<ParquetBytes> {
     // The ArrowWriter::write() call will return an error if any subsequent
     // batch does not match this schema, enforcing schema uniformity.
@@ -267,7 +274,7 @@ pub async fn serialize_to_parquet(
 
     // Construct the arrow serializer with the metadata as part of the parquet
     // file properties.
-    let mut writer = TrackedMemoryArrowWriter::try_new(&mut bytes, Arc::clone(&schema), mem_pool)?;
+    let mut writer = TrackedMemoryArrowWriter::try_new(&mut bytes, Arc::clone(&schema), mem_pool, row_group_write_size)?;
 
     while let Some(batch) = stream.try_next().await? {
         writer.write(batch)?;
@@ -300,15 +307,16 @@ pub struct TrackedMemoryArrowWriter<W: Write + Send> {
     reservation: MemoryReservation,
 }
 
-/// Parquet row group write size
-pub const ROW_GROUP_WRITE_SIZE: usize = 100_000;
+// Default Parquet row group write size, used if not overridden by config.
+// This could also be moved to ServeConfig as a default value for the new config param.
+pub const DEFAULT_ROW_GROUP_WRITE_SIZE: usize = 100_000;
 
 impl<W: Write + Send> TrackedMemoryArrowWriter<W> {
     /// create a new `TrackedMemoryArrowWriter<`
-    pub fn try_new(sink: W, schema: SchemaRef, mem_pool: Arc<dyn MemoryPool>) -> Result<Self> {
+    pub fn try_new(sink: W, schema: SchemaRef, mem_pool: Arc<dyn MemoryPool>, row_group_write_size: usize) -> Result<Self> {
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))
-            .set_max_row_group_size(ROW_GROUP_WRITE_SIZE)
+            .set_max_row_group_size(row_group_write_size) // Use passed value
             .build();
         let inner = ArrowWriter::try_new(sink, schema, Some(props))?;
         let consumer = MemoryConsumer::new("InfluxDB3 ParquetWriter (TrackedMemoryArrowWriter)");

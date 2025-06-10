@@ -165,4 +165,79 @@ mod tests {
         // For this test, we primarily check the RPC handler logic (deserialization, call to apply_replicated_wal_op).
         // The `test_apply_replicated_wal_op` in write_buffer tests the next step.
     }
+
+    #[tokio::test]
+    async fn test_replicate_wal_op_server_deserialization_error() {
+        let (_object_store, write_buffer, _metrics) = crate::tests::TestServer::new().await; // Use existing test setup
+        let replication_server = ReplicationServerImpl::new(write_buffer);
+
+        let request_msg = ReplicateWalOpRequest {
+            wal_op_bytes: vec![1, 2, 3, 4, 5], // Invalid bitcode
+            originating_node_id: "origin_node_test_deser_error".to_string(),
+            shard_id: Some(8),
+            database_name: "test_db_deser_error".to_string(),
+            table_name: "test_table_deser_error".to_string(),
+        };
+        let tonic_request = Request::new(request_msg);
+
+        let response = replication_server.replicate_wal_op(tonic_request).await.unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.error_message.is_some());
+        assert!(response.error_message.unwrap().contains("Failed to deserialize WalOp"));
+    }
+
+    // Mock WriteBuffer for apply_replicated_wal_op error testing
+    #[derive(Debug)]
+    struct MockWriteBufferError {}
+
+    #[async_trait::async_trait]
+    impl influxdb3_write::Bufferer for MockWriteBufferError {
+        async fn write_lp(
+            &self, _database: data_types::NamespaceName<'static>, _lp: &str, _ingest_time: iox_time::Time,
+            _accept_partial: bool, _precision: influxdb3_write::Precision, _no_sync: bool,
+        ) -> influxdb3_write::write_buffer::Result<influxdb3_write::BufferedWriteRequest> {
+            unimplemented!()
+        }
+        fn catalog(&self) -> Arc<influxdb3_catalog::catalog::Catalog> { unimplemented!() }
+        fn wal(&self) -> Arc<dyn influxdb3_wal::Wal> { unimplemented!() }
+        fn parquet_files_filtered(&self, _db_id: influxdb3_id::DbId, _table_id: influxdb3_id::TableId, _filter: &influxdb3_write::ChunkFilter<'_>) -> Vec<influxdb3_write::ParquetFile> { unimplemented!() }
+        fn watch_persisted_snapshots(&self) -> tokio::sync::watch::Receiver<Option<influxdb3_write::PersistedSnapshotVersion>> { unimplemented!() }
+        async fn apply_replicated_wal_op(&self, _op: WalOp, _originating_node_id: Option<String>) -> Result<(), influxdb3_write::write_buffer::Error> {
+            Err(influxdb3_write::write_buffer::Error::AnyhowError(anyhow::anyhow!("Mock apply error")))
+        }
+    }
+    impl influxdb3_write::ChunkContainer for MockWriteBufferError {
+        fn get_table_chunks(&self, _db_schema: Arc<influxdb3_catalog::catalog::DatabaseSchema>, _table_def: Arc<influxdb3_catalog::catalog::TableDefinition>, _filter: &influxdb3_write::ChunkFilter<'_>, _projection: Option<&Vec<usize>>, _ctx: &dyn datafusion::catalog::Session) -> influxdb3_write::Result<Vec<Arc<dyn iox_query::QueryChunk>>, datafusion::error::DataFusionError> { unimplemented!() }
+    }
+    impl influxdb3_write::LastCacheManager for MockWriteBufferError {
+        fn last_cache_provider(&self) -> Arc<influxdb3_cache::last_cache::LastCacheProvider> { unimplemented!() }
+    }
+    impl influxdb3_write::DistinctCacheManager for MockWriteBufferError {
+        fn distinct_cache_provider(&self) -> Arc<influxdb3_cache::distinct_cache::DistinctCacheProvider> { unimplemented!() }
+    }
+    impl influxdb3_write::WriteBuffer for MockWriteBufferError {}
+
+
+    #[tokio::test]
+    async fn test_replicate_wal_op_server_apply_error() {
+        let mock_write_buffer = Arc::new(MockWriteBufferError {});
+        let replication_server = ReplicationServerImpl::new(mock_write_buffer);
+
+        let wal_op_to_replicate = WalOp::Noop(influxdb3_wal::NoopDetails::new_for_test(1)); // Simple WalOp
+        let serialized_wal_op = bitcode::serialize(&wal_op_to_replicate).unwrap();
+
+        let request_msg = ReplicateWalOpRequest {
+            wal_op_bytes: serialized_wal_op,
+            originating_node_id: "origin_node_test_apply_error".to_string(),
+            shard_id: None,
+            database_name: "test_db_apply_error".to_string(),
+            table_name: "test_table_apply_error".to_string(),
+        };
+        let tonic_request = Request::new(request_msg);
+
+        let response = replication_server.replicate_wal_op(tonic_request).await.unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.error_message.is_some());
+        assert!(response.error_message.unwrap().contains("Failed to apply replicated WalOp"));
+    }
 }
