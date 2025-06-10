@@ -95,11 +95,6 @@ impl Planner {
 
         for table_name_ref in table_names {
             let table_name = table_name_ref.table();
-            // Assume tables are in the default database context of the session for simplicity.
-            // IOxSessionContext holds a default catalog and schema.
-            // The catalog name is usually "public" or "datafusion", schema name "public".
-            // The actual database name for our catalog lookup comes from the session context.
-            // This part might need more robust database name resolution if queries can span DBs.
             let default_db_name = self.ctx.default_database_name();
 
             if let Some(db_schema) = self.catalog.db_schema(&default_db_name) {
@@ -113,34 +108,139 @@ impl Planner {
                             current_node_id = %self.current_node_id,
                             "Query targets a sharded table. Conceptual distributed planning would occur here."
                         );
-                        // --- Conceptual Distributed Planning Logic ---
-                        // 1. Identify relevant shards based on query predicates (e.g., time range filters).
-                        //    - This requires predicate pushdown analysis or extracting filters from `logical_plan`.
-                        //
-                        // 2. For each relevant shard in `table_def.shards`:
-                        //    - let shard_node_ids = &shard_def.node_ids;
-                        //    - let is_local = shard_node_ids.iter().any(|id| id.to_string() == self.current_node_id.as_ref());
-                        //    - if is_local:
-                        //        - Plan a local scan for this shard. This means the `QueryTable::scan` or underlying
-                        //          `WriteBuffer::get_table_chunks` would need to accept a `shard_id` filter.
-                        //          The `ExecutionPlan` for this local part would be generated.
-                        //    - else (remote shard):
-                        //        - Create a "remote query operator" / `ExecutionPlan` node.
-                        //        - This operator would serialize the relevant part of the query (or a specific fragment plan).
-                        //        - It would make a gRPC call (e.g., to `ExecuteQueryFragment`) to the target node(s) in `shard_node_ids`.
-                        //        - It would deserialize the stream of RecordBatches received from the remote node.
-                        //
-                        // 3. Aggregate Results:
-                        //    - Add an aggregation operator (e.g., `UnionExec`, `SortPreservingMergeExec`, custom shuffle/exchange)
-                        //      to combine results from all local and remote shard plans.
-                        //
-                        // For this subtask, we are only logging and not modifying the plan.
-                        // The original physical plan created by DataFusion (local scan) will be used.
+                        // Conceptual: If a remote shard is identified:
+                        // let remote_node_addr = format!("http://{}:{}", remote_node_id, crate::REPLICATION_PORT); // Placeholder for query port
+                        // let plan_for_remote_bytes = ...; // Serialized sub-plan for the remote shard
+                        // let schema_for_remote = ...; // Expected schema from this remote scan
+                        // let remote_scan_exec = Arc::new(RemoteScanExec::new(
+                        //     remote_node_addr,
+                        //     db_schema.name.to_string(),
+                        //     plan_for_remote_bytes,
+                        //     schema_for_remote,
+                        //     // self.distributed_query_client_factory.clone(), // Would need a factory
+                        // ));
+                        // The plan would then be reconstructed with `remote_scan_exec` nodes,
+                        // potentially wrapped in `UnionExec` or other merge operators.
                     }
                 }
             }
         }
         Ok(())
+    }
+}
+
+// --- RemoteScanExec: Placeholder for distributed query fragment execution ---
+// This new struct would typically be in its own file e.g. physical_plan/remote_scan.rs
+#[derive(Debug)]
+struct RemoteScanExec {
+    target_node_address: String,
+    db_name: String,
+    plan_or_query_bytes: Vec<u8>,
+    expected_schema: SchemaRef,
+    // In a real implementation, this might hold an Arc<dyn DistributedQueryClient>
+    // or a factory to create one. For now, it's omitted for simplicity as the
+    // execute method will be a placeholder.
+    cache: PlanProperties,
+}
+
+impl RemoteScanExec {
+    #[allow(dead_code)] // Will be used when Planner is fully implemented
+    fn new(
+        target_node_address: String,
+        db_name: String,
+        plan_or_query_bytes: Vec<u8>,
+        expected_schema: SchemaRef,
+    ) -> Self {
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&expected_schema)),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion::physical_plan::ExecutionMode::Bounded,
+        );
+        Self {
+            target_node_address,
+            db_name,
+            plan_or_query_bytes,
+            expected_schema,
+            cache,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecutionPlan for RemoteScanExec {
+    fn name(&self) -> &str { "RemoteScanExec" }
+    fn as_any(&self) -> &dyn Any { self }
+    fn schema(&self) -> SchemaRef { Arc::clone(&self.expected_schema) }
+    fn properties(&self) -> &PlanProperties { &self.cache }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Internal("RemoteScanExec does not support children".to_string()))
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        observability_deps::tracing::info!(
+            target_node = %self.target_node_address,
+            db_name = %self.db_name,
+            plan_bytes_len = %self.plan_or_query_bytes.len(),
+            "Executing RemoteScanExec (conceptual placeholder)"
+        );
+
+        // --- Conceptual gRPC Client Call ---
+        // 1. Obtain a DistributedQueryServiceClient instance.
+        //    (e.g., from a client factory or connection pool)
+        //    let mut client = ...;
+        //
+        // 2. Construct ExecuteQueryFragmentRequest
+        //    use crate::distributed_query_service::ExecuteQueryFragmentRequest; // Assuming this path
+        //    let request = ExecuteQueryFragmentRequest {
+        //        database_name: self.db_name.clone(),
+        //        plan_bytes: self.plan_or_query_bytes.clone(),
+        //        shard_id: None, // Or extract if part of plan_or_query_bytes or a separate field
+        //        session_config: std::collections::HashMap::new(), // Populate from TaskContext/Session
+        //        query_id: _context.task_id().unwrap_or("unknown_query_id").to_string(), // Example query_id
+        //        expected_schema_bytes: vec![], // Placeholder for serialized expected schema
+        //    };
+        //
+        // 3. Make the RPC call (conceptual)
+        //    // let tonic_request = tonic::Request::new(request);
+        //    // let stream_of_flight_data = client.execute_query_fragment(tonic_request).await
+        //    //     .map_err(|e| DataFusionError::Execution(format!("Remote query fragment execution failed: {}", e)))?
+        //    //     .into_inner();
+        //
+        // 4. Adapt FlightData stream to SendableRecordBatchStream. This is complex.
+        //    // return Ok(Box::pin(FlightDataStreamAdapter::new(stream_of_flight_data, self.expected_schema.clone())));
+        // --- End Conceptual gRPC Client Call ---
+
+        observability_deps::tracing::error!("RemoteScanExec::execute is a placeholder and not implemented for actual remote execution.");
+        Err(DataFusionError::NotImplemented("RemoteScanExec::execute actual remote call not implemented".to_string()))
+    }
+
+    fn statistics(&self) -> Result<datafusion::physical_plan::Statistics, DataFusionError> {
+        Ok(datafusion::physical_plan::Statistics::new_unknown(&self.schema()))
+    }
+}
+
+impl DisplayAs for RemoteScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "RemoteScanExec: target_node={}, db={}, schema_fields=[{}]",
+                    self.target_node_address,
+                    self.db_name,
+                    self.expected_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>().join(", ")
+                )
+            }
+        }
     }
 }
 

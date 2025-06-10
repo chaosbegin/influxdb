@@ -1084,8 +1084,10 @@ impl DatabaseCatalogTransaction {
         table_name: &str,
         tags: &[impl AsRef<str>],
         fields: &[(impl AsRef<str>, FieldDataType)],
+        shard_key_columns: Option<Vec<String>>, // Added
+        sharding_strategy: Option<ShardingStrategy>, // Added
     ) -> Result<()> {
-        debug!(table_name, "create table in catalog transaction");
+        debug!(table_name, ?shard_key_columns, ?sharding_strategy, "create table in catalog transaction");
         if self.database_schema.table_definition(table_name).is_some() {
             return Err(CatalogError::AlreadyExists);
         }
@@ -1150,6 +1152,8 @@ impl DatabaseCatalogTransaction {
                 table_id,
                 field_definitions,
                 key,
+                shard_key_columns, // Added
+                sharding_strategy, // Added
             }));
 
         Ok(())

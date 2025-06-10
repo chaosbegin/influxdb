@@ -46,7 +46,7 @@ pub use update::{CatalogUpdate, DatabaseCatalogTransaction, Prompt};
 
 use crate::channel::{CatalogSubscriptions, CatalogUpdateReceiver};
 use crate::replication::ReplicationInfo;
-use crate::shard::{ShardDefinition, ShardId};
+use crate::shard::{ShardDefinition, ShardId, ShardingStrategy}; // Added ShardingStrategy
 use crate::log::{
     ClearRetentionPeriodLog, CreateAdminTokenDetails, CreateDatabaseLog, DatabaseBatch,
     DatabaseCatalogOp, NodeBatch, NodeCatalogOp, NodeMode, RegenerateAdminTokenDetails,
@@ -458,6 +458,80 @@ impl Catalog {
                     table_name: table_arc.table_name.clone(),
                     replication_info: replication_info.clone(),
                 })],
+            }))
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_table_sharding_strategy(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        new_strategy: ShardingStrategy,
+        new_shard_key_columns: Option<Vec<String>>,
+    ) -> Result<()> {
+        if new_strategy == ShardingStrategy::TimeAndKey {
+            match &new_shard_key_columns {
+                Some(cols) if cols.is_empty() => {
+                    return Err(CatalogError::InvalidShardKeyColumns {
+                        reason: "Shard key columns cannot be empty for TimeAndKey strategy.".to_string(),
+                    });
+                }
+                None => {
+                    return Err(CatalogError::InvalidShardKeyColumns {
+                        reason: "Shard key columns must be provided for TimeAndKey strategy.".to_string(),
+                    });
+                }
+                _ => {} // Columns are provided and not empty
+            }
+        } else {
+            // If strategy is Time, shard_key_columns should ideally be None or will be ignored.
+            // We could enforce it to be None here, or just let it be stored as is.
+            // For now, allow storing it even if strategy is Time, it will just be unused.
+        }
+
+        let (db_id, table_id) = self.get_db_and_table_ids(db_name, table_name)?;
+
+        // Validate that shard key columns exist in the table definition
+        if let Some(key_columns) = &new_shard_key_columns {
+            if new_strategy == ShardingStrategy::TimeAndKey { // Only validate if strategy uses them
+                let db_schema = self.db_schema_by_id(&db_id)
+                    .ok_or_else(|| CatalogError::DatabaseNotFound(db_name.to_string()))?;
+                let table_arc = db_schema.table_definition_by_id(&table_id)
+                    .ok_or_else(|| CatalogError::TableNotFound { db_name: Arc::from(db_name), table_name: Arc::from(table_name) })?;
+
+                for col_name in key_columns {
+                    if !table_arc.columns.contains_name(col_name) {
+                        return Err(CatalogError::InvalidShardKeyColumns {
+                            reason: format!("Shard key column '{}' not found in table '{}'.", col_name, table_name),
+                        });
+                    }
+                    // Future: Add validation for column type if necessary (e.g., must be tag or specific field types)
+                }
+            }
+        }
+
+        self.catalog_update_with_retry(|| {
+            // Re-fetch db_schema and table_arc inside closure to ensure up-to-date state for the op
+            let db_schema_inner = self.db_schema_by_id(&db_id)
+                .ok_or_else(|| CatalogError::DatabaseNotFound(db_name.to_string()))?;
+            let table_arc_inner = db_schema_inner.table_definition_by_id(&table_id)
+                .ok_or_else(|| CatalogError::TableNotFound { db_name: Arc::from(db_name), table_name: Arc::from(table_name) })?;
+
+            Ok(CatalogBatch::Database(DatabaseBatch {
+                time_ns: self.time_provider.now().timestamp_nanos(),
+                database_id: db_id,
+                database_name: db_schema_inner.name(),
+                ops: vec![DatabaseCatalogOp::UpdateTableShardingStrategy(
+                    UpdateTableShardingStrategyLog {
+                        db_id,
+                        table_id,
+                        table_name: table_arc_inner.table_name.clone(),
+                        new_strategy,
+                        new_shard_key_columns: new_shard_key_columns.clone(),
+                    },
+                )],
             }))
         })
         .await?;
@@ -1652,6 +1726,9 @@ impl UpdateDatabaseSchema for DatabaseCatalogOp {
             DatabaseCatalogOp::SetReplication(set_replication) => {
                 set_replication.update_schema(schema)
             }
+            DatabaseCatalogOp::UpdateTableShardingStrategy(update_sharding_strategy) => {
+                update_sharding_strategy.update_schema(schema)
+            }
         }
     }
 }
@@ -1910,12 +1987,16 @@ pub struct TableDefinition {
     pub shards: Repository<ShardId, ShardDefinition>,
     /// Information about how data in this table is replicated.
     pub replication_info: Option<ReplicationInfo>,
+    /// Optional list of column names to be used as the shard key.
+    pub shard_key_columns: Option<Vec<String>>,
+    /// The sharding strategy employed by this table.
+    pub sharding_strategy: ShardingStrategy,
 }
 
 impl TableDefinition {
     /// Create new empty `TableDefinition`
     pub fn new_empty(table_id: TableId, table_name: Arc<str>) -> Self {
-        Self::new(table_id, table_name, vec![], vec![], None)
+        Self::new(table_id, table_name, vec![], vec![], None, None, ShardingStrategy::default())
             .expect("empty table should create without error")
     }
 
@@ -1928,6 +2009,8 @@ impl TableDefinition {
         columns: Vec<(ColumnId, Arc<str>, InfluxColumnType)>,
         series_key: Vec<ColumnId>,
         replication_info: Option<ReplicationInfo>,
+        shard_key_columns: Option<Vec<String>>, // Added
+        sharding_strategy: ShardingStrategy,    // Added
     ) -> Result<Self> {
         // Use a BTree to ensure that the columns are ordered:
         let mut ordered_columns = BTreeMap::new();
@@ -1985,6 +2068,8 @@ impl TableDefinition {
             hard_delete_time: None,
             shards: Repository::new(),
             replication_info,
+            shard_key_columns,
+            sharding_strategy,
         })
     }
 
@@ -2013,7 +2098,9 @@ impl TableDefinition {
             Arc::clone(&table_definition.table_name),
             columns,
             table_definition.key.clone(),
-            None,
+            None, // ReplicationInfo - still a TODO for CreateTableLog or subsequent op
+            table_definition.shard_key_columns.clone(), // Use from log
+            table_definition.sharding_strategy.unwrap_or_default(), // Use from log, or default if None
         )
         .expect("tables defined from ops should not exceed column limits")
     }
@@ -2419,7 +2506,7 @@ impl TableUpdate for SetReplicationLog {
     }
 
     fn table_name(&self) -> Arc<str> {
-        Arc::from("") // Placeholder
+        Arc::clone(&self.table_name)
     }
 
     fn update_table<'a>(
@@ -2427,6 +2514,28 @@ impl TableUpdate for SetReplicationLog {
         mut table: Cow<'a, TableDefinition>,
     ) -> Result<Cow<'a, TableDefinition>> {
         table.to_mut().replication_info = Some(self.replication_info.clone());
+        Ok(table)
+    }
+}
+
+impl TableUpdate for UpdateTableShardingStrategyLog {
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn table_name(&self) -> Arc<str> {
+        Arc::clone(&self.table_name)
+    }
+
+    fn update_table<'a>(
+        &self,
+        mut table: Cow<'a, TableDefinition>,
+    ) -> Result<Cow<'a, TableDefinition>> {
+        let mut_table = table.to_mut();
+        mut_table.sharding_strategy = self.new_strategy;
+        mut_table.shard_key_columns = self.new_shard_key_columns.clone();
+        // Potentially add validation here: if strategy is TimeAndKey, shard_key_columns should be Some and not empty.
+        // For now, directly applying as per subtask description.
         Ok(table)
     }
 }
@@ -2605,6 +2714,17 @@ mod tests {
                     ("u64_field", FieldDataType::UInteger),
                     ("float_field", FieldDataType::Float),
                 ],
+            )
+            .await
+            .unwrap();
+
+        // Update sharding strategy for the table
+        catalog
+            .update_table_sharding_strategy(
+                "test_db_sharding",
+                "test_table_sharding",
+                ShardingStrategy::TimeAndKey,
+                Some(vec!["tag_sharding".to_string()]),
             )
             .await
             .unwrap();
@@ -3526,6 +3646,15 @@ mod tests {
                     ".databases.repo.1.tables.repo.0.replication_info.replication_factor.0" => insta::dynamic_redaction( |value, _path| {
                         assert_eq!(value.as_u64().unwrap(), 2);
                         "[replication_factor]"
+                    }),
+                    // Added assertions for sharding strategy and key columns
+                    ".databases.repo.1.tables.repo.0.sharding_strategy" => insta::dynamic_redaction( |value, _path| {
+                        assert_eq!(value.as_str().unwrap(), "TimeAndKey");
+                        "[sharding_strategy]"
+                    }),
+                    ".databases.repo.1.tables.repo.0.shard_key_columns.0" => insta::dynamic_redaction( |value, _path| {
+                        assert_eq!(value.as_str().unwrap(), "tag_sharding");
+                        "[shard_key_column_0]"
                     })
                 });
 
@@ -3534,8 +3663,10 @@ mod tests {
                 let snapshot_deserialized = verify_and_deserialize_catalog_checkpoint_file(serialized).unwrap();
                 insta::assert_json_snapshot!(snapshot_deserialized, {
                     ".catalog_uuid" => "[uuid]",
-                    ".databases.repo.1.tables.repo.0.shards.repo.1.id.0" => "[shard_id]", // Using dynamic redaction placeholder
-                    ".databases.repo.1.tables.repo.0.replication_info.replication_factor.0" => "[replication_factor]"
+                    ".databases.repo.1.tables.repo.0.shards.repo.1.id.0" => "[shard_id]",
+                    ".databases.repo.1.tables.repo.0.replication_info.replication_factor.0" => "[replication_factor]",
+                    ".databases.repo.1.tables.repo.0.sharding_strategy" => "[sharding_strategy]",
+                    ".databases.repo.1.tables.repo.0.shard_key_columns.0" => "[shard_key_column_0]"
                 });
 
                 catalog.update_from_snapshot(snapshot_deserialized);
@@ -3547,6 +3678,9 @@ mod tests {
                 assert_eq!(table_def.replication_info.as_ref().unwrap().replication_factor.get(), 2);
                 // Assuming ShardId(1) was used for creation.
                 assert_eq!(table_def.shards.get_by_id(&ShardId::new(1)).unwrap().id.get(), 1);
+                // Verify sharding strategy and key columns after deserialization
+                assert_eq!(table_def.sharding_strategy, ShardingStrategy::TimeAndKey);
+                assert_eq!(table_def.shard_key_columns, Some(vec!["tag_sharding".to_string()]));
             });
         }
     }
@@ -3946,5 +4080,80 @@ mod tests {
         // Test deleting a non-existent shard (should be an error as per current impl)
         let delete_non_existent_result = catalog.delete_shard(db_name, table_name, ShardId::new(99)).await;
         assert!(matches!(delete_non_existent_result, Err(CatalogError::ShardNotFound { .. })));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_update_table_sharding_strategy_api() {
+        let catalog = Catalog::new_in_memory("test_strat_api_host").await.unwrap();
+        let db_name = "strat_db";
+        let table_name = "strat_table";
+
+        catalog.create_database(db_name).await.unwrap();
+        // Create table with a column that can be used as a shard key
+        catalog.create_table(db_name, table_name, &["tag_key"], &[("value", FieldDataType::Integer)]).await.unwrap();
+
+        // 1. Successful update to TimeAndKey
+        let shard_keys = Some(vec!["tag_key".to_string()]);
+        let result = catalog.update_table_sharding_strategy(
+            db_name,
+            table_name,
+            ShardingStrategy::TimeAndKey,
+            shard_keys.clone(),
+        ).await;
+        assert!(result.is_ok(), "Failed to set TimeAndKey strategy: {:?}", result.err());
+
+        let db_schema = catalog.db_schema(db_name).unwrap();
+        let table_def = db_schema.table_definition(table_name).unwrap();
+        assert_eq!(table_def.sharding_strategy, ShardingStrategy::TimeAndKey);
+        assert_eq!(table_def.shard_key_columns, shard_keys);
+
+        // 2. Attempt to set TimeAndKey with empty shard_key_columns vector
+        let result_empty_keys = catalog.update_table_sharding_strategy(
+            db_name,
+            table_name,
+            ShardingStrategy::TimeAndKey,
+            Some(vec![]),
+        ).await;
+        assert!(matches!(result_empty_keys, Err(CatalogError::InvalidShardKeyColumns { .. })));
+        assert_contains!(result_empty_keys.unwrap_err().to_string(), "Shard key columns cannot be empty");
+
+        // 3. Attempt to set TimeAndKey with None for shard_key_columns
+        let result_none_keys = catalog.update_table_sharding_strategy(
+            db_name,
+            table_name,
+            ShardingStrategy::TimeAndKey,
+            None,
+        ).await;
+        assert!(matches!(result_none_keys, Err(CatalogError::InvalidShardKeyColumns { .. })));
+        assert_contains!(result_none_keys.unwrap_err().to_string(), "Shard key columns must be provided");
+
+        // 4. Attempt to set TimeAndKey with a non-existent column
+        let non_existent_keys = Some(vec!["non_existent_tag".to_string()]);
+        let result_non_existent_key = catalog.update_table_sharding_strategy(
+            db_name,
+            table_name,
+            ShardingStrategy::TimeAndKey,
+            non_existent_keys,
+        ).await;
+        assert!(matches!(result_non_existent_key, Err(CatalogError::InvalidShardKeyColumns { .. })));
+        assert_contains!(result_non_existent_key.unwrap_err().to_string(), "Shard key column 'non_existent_tag' not found");
+
+        // 5. Successful update back to Time strategy
+        let result_back_to_time = catalog.update_table_sharding_strategy(
+            db_name,
+            table_name,
+            ShardingStrategy::Time,
+            None, // Explicitly setting to None, though it could be Some and ignored by Time strategy
+        ).await;
+        assert!(result_back_to_time.is_ok(), "Failed to set Time strategy: {:?}", result_back_to_time.err());
+
+        let db_schema_after_time = catalog.db_schema(db_name).unwrap();
+        let table_def_after_time = db_schema_after_time.table_definition(table_name).unwrap();
+        assert_eq!(table_def_after_time.sharding_strategy, ShardingStrategy::Time);
+        // Depending on implementation, shard_key_columns might be reset to None or kept as is.
+        // The current implementation of UpdateTableShardingStrategyLog directly sets it.
+        // If we want it reset, the logic in catalog.rs or TableDefinition should handle that.
+        // For now, asserting it's None as per the update call.
+        assert_eq!(table_def_after_time.shard_key_columns, None);
     }
 }

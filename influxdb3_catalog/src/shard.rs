@@ -42,21 +42,35 @@ pub struct ShardDefinition {
     /// Time range covered by the shard.
     pub time_range: ShardTimeRange,
     /// List of nodes responsible for this shard.
-    /// In a simple setup, this might be a single node.
-    /// For replicated setups, this could be multiple nodes.
     pub node_ids: Vec<NodeId>,
-    // Add other shard-specific information here, e.g.:
-    // - Shard status (e.g., active, inactive, under maintenance)
-    // - Storage location (if not implicitly determined by node_ids)
-    // - Size of the shard
+    /// Optional hash key range this shard is responsible for.
+    /// (min_hash, max_hash_inclusive)
+    pub hash_key_range: Option<(u64, u64)>,
+    // Add other shard-specific information here
 }
 
 impl ShardDefinition {
-    pub fn new(id: ShardId, time_range: ShardTimeRange, node_ids: Vec<NodeId>) -> Self {
+    pub fn new(id: ShardId, time_range: ShardTimeRange, node_ids: Vec<NodeId>, hash_key_range: Option<(u64, u64)>) -> Self {
         Self {
             id,
             time_range,
             node_ids,
+            hash_key_range,
         }
+    }
+}
+
+/// Defines the sharding strategy for a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardingStrategy {
+    /// Shard based on time only.
+    Time,
+    /// Shard based on time and then by a hash of specified shard key columns.
+    TimeAndKey,
+}
+
+impl Default for ShardingStrategy {
+    fn default() -> Self {
+        ShardingStrategy::Time
     }
 }

@@ -779,7 +779,8 @@ pub async fn command(config: Config) -> Result<()> {
         shutdown: shutdown_manager.register(),
         wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
         current_node_id: Arc::from(config.node_identifier_prefix.as_str()),
-        max_snapshots_to_load_on_start: config.max_snapshots_to_load_on_start, // Added this line
+        max_snapshots_to_load_on_start: config.max_snapshots_to_load_on_start,
+        replication_client_factory: influxdb3_write::replication_client::default_replication_client_factory(), // Added
     })
     .await
     .map_err(|e| Error::WriteBufferInit(e.into()))?;

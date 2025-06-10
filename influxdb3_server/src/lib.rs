@@ -21,10 +21,11 @@ pub mod replication_service; // Added module
 mod service;
 mod system_tables;
 
-use crate::grpc::make_flight_server; // Still used to get the Flight service impl
+use crate::grpc::make_flight_server;
 use crate::http::HttpApi;
 use crate::http::route_request;
-use crate::replication_service::{ReplicationServerImpl, ReplicationServiceServer}; // Added
+use crate::replication_service::{ReplicationServerImpl, ReplicationServiceServer};
+use crate::distributed_query_service::{DistributedQueryServerImpl, DistributedQueryServiceServer}; // Added
 use authz::Authorizer;
 use hyper::server::conn::AddrIncoming;
 use hyper::server::conn::Http;
@@ -176,13 +177,15 @@ pub async fn serve(
     let replication_server_impl = ReplicationServerImpl::new(Arc::clone(&server.http.write_buffer));
     let replication_grpc_service = ReplicationServiceServer::new(replication_server_impl);
 
+    // Create Distributed Query service
+    let distributed_query_server_impl = DistributedQueryServerImpl::new(Arc::clone(&server.http.query_executor));
+    let distributed_query_grpc_service = DistributedQueryServiceServer::new(distributed_query_server_impl);
+
     // Combine gRPC services
-    // tonic::transport::Server can be built up with multiple services
-    // and then made into a MakeService or a Router which is a Service.
-    // The grpc_trace_layer expects a Service.
     let combined_grpc_router = tonic::transport::Server::builder()
         .add_service(flight_service_impl)
         .add_service(replication_grpc_service)
+        .add_service(distributed_query_grpc_service) // Added
         .into_router();
 
     let grpc_service = grpc_trace_layer.layer(combined_grpc_router);
@@ -268,9 +271,13 @@ pub async fn serve(
         let replication_server_impl = ReplicationServerImpl::new(Arc::clone(&server.http.write_buffer));
         let replication_grpc_service = ReplicationServiceServer::new(replication_server_impl);
 
+        let distributed_query_server_impl = DistributedQueryServerImpl::new(Arc::clone(&server.http.query_executor));
+        let distributed_query_grpc_service = DistributedQueryServiceServer::new(distributed_query_server_impl);
+
         let combined_grpc_router = tonic::transport::Server::builder()
             .add_service(flight_service_impl)
             .add_service(replication_grpc_service)
+            .add_service(distributed_query_grpc_service) // Added
             .into_router();
 
         let grpc_service = grpc_trace_layer.layer(combined_grpc_router);

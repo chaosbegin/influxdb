@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package influxdb3.internal.query.v1;
+
+// Importing FlightData from Arrow Flight.
+// This assumes that the arrow_flight.proto (or its generated Rust equivalent)
+// is available in the include paths for protoc.
+// For tonic_build, you might need to vendor or specify the path to
+// arrow/flight.proto if not using a pre-packaged solution.
+import "arrow_flight.proto"; // Conceptual import
+
+// Service for executing distributed query fragments.
+service DistributedQueryService {
+  // Executes a query fragment (typically a physical plan or part of one)
+  // on a remote node and streams back results as FlightData.
+  rpc ExecuteQueryFragment(ExecuteQueryFragmentRequest) returns (stream arrow.flight.protocol.FlightData);
+}
+
+// Request to execute a query fragment.
+message ExecuteQueryFragmentRequest {
+  // The name of the database to execute against.
+  string database_name = 1;
+
+  // Serialized representation of the ExecutionPlan fragment.
+  // The exact serialization format (e.g., DataFusion's internal, Substrait, custom JSON/binary)
+  // needs to be standardized across the cluster.
+  bytes plan_bytes = 2;
+
+  // Optional ShardId if this query fragment is specific to a particular shard's data.
+  // This helps the target node route the query to the correct local data partitions.
+  optional uint64 shard_id = 3;
+
+  // Session configuration settings relevant for executing this plan fragment.
+  // (e.g., batch size, timezone, specific DataFusion config overrides).
+  map<string, string> session_config = 4;
+
+  // Unique identifier for the overall query, for tracing and logging.
+  string query_id = 5;
+
+  // Expected schema of the result, serialized (e.g. Arrow IPC Schema format)
+  // This helps in validation and potentially in how FlightData is structured.
+  bytes expected_schema_bytes = 6;
+}
+
+// Note: ExecuteQueryFragmentResponse is a stream of arrow.flight.protocol.FlightData.
+// No separate response message is needed for the RPC itself, beyond the stream.
+// Individual FlightData messages can contain errors or metadata.

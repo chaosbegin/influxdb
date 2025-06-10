@@ -193,6 +193,8 @@ pub enum DatabaseCatalogOp {
     DeleteShard(DeleteShardLog),
     // Replication ops:
     SetReplication(SetReplicationLog),
+    // Sharding strategy ops:
+    UpdateTableShardingStrategy(UpdateTableShardingStrategyLog),
 }
 
 impl DatabaseCatalogOp {
@@ -269,6 +271,10 @@ pub struct CreateTableLog {
     pub table_id: TableId,
     pub field_definitions: Vec<FieldDefinition>,
     pub key: Vec<ColumnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key_columns: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharding_strategy: Option<ShardingStrategy>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -927,4 +933,84 @@ pub struct SetReplicationLog {
     pub table_id: TableId,
     pub table_name: Arc<str>, // Added for context and TableUpdate trait
     pub replication_info: ReplicationInfo,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateTableShardingStrategyLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>, // For context and TableUpdate trait
+    pub new_strategy: ShardingStrategy,
+    pub new_shard_key_columns: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::ShardingStrategy; // Ensure ShardingStrategy is in scope for test
+    use influxdb3_id::{DbId, TableId};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_update_table_sharding_strategy_log_serialization_roundtrip() {
+        let original_op = DatabaseCatalogOp::UpdateTableShardingStrategy(
+            UpdateTableShardingStrategyLog {
+                db_id: DbId::new(1),
+                table_id: TableId::new(2),
+                table_name: Arc::from("test_table"),
+                new_strategy: ShardingStrategy::TimeAndKey,
+                new_shard_key_columns: Some(vec!["tag_a".to_string(), "tag_b".to_string()]),
+            },
+        );
+
+        let serialized = serde_json::to_string(&original_op).expect("Failed to serialize");
+        let deserialized: DatabaseCatalogOp =
+            serde_json::from_str(&serialized).expect("Failed to deserialize");
+
+        assert_eq!(original_op, deserialized);
+    }
+
+    #[test]
+    fn test_database_catalog_op_roundtrip_all_variants() {
+        // This test would ideally cover all variants of DatabaseCatalogOp.
+        // For now, it focuses on ensuring the new one is tested alongside some existing ones.
+
+        let ops_to_test = vec![
+            DatabaseCatalogOp::CreateDatabase(CreateDatabaseLog {
+                database_id: DbId::new(1),
+                database_name: Arc::from("db1"),
+            }),
+            DatabaseCatalogOp::CreateTable(CreateTableLog {
+                database_id: DbId::new(1),
+                database_name: Arc::from("db1"),
+                table_name: Arc::from("table1"),
+                table_id: TableId::new(1),
+                field_definitions: vec![FieldDefinition::new(
+                    ColumnId::new(0),
+                    "field_one",
+                    FieldDataType::Integer,
+                )],
+                key: vec![ColumnId::new(0)],
+                shard_key_columns: None,
+                sharding_strategy: Some(ShardingStrategy::Time),
+            }),
+            DatabaseCatalogOp::UpdateTableShardingStrategy(
+                UpdateTableShardingStrategyLog {
+                    db_id: DbId::new(1),
+                    table_id: TableId::new(1),
+                    table_name: Arc::from("table1"),
+                    new_strategy: ShardingStrategy::TimeAndKey,
+                    new_shard_key_columns: Some(vec!["tag_a".to_string()]),
+                },
+            ),
+            // Add other variants here as needed to make this test more comprehensive
+        ];
+
+        for op in ops_to_test {
+            let serialized = serde_json::to_string(&op).expect("Serialization failed");
+            let deserialized: DatabaseCatalogOp =
+                serde_json::from_str(&serialized).expect("Deserialization failed");
+            assert_eq!(op, deserialized, "Roundtrip failed for op: {:?}", op);
+        }
+    }
 }

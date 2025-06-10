@@ -10,6 +10,8 @@ pub mod deleter;
 pub mod paths;
 pub mod persister;
 pub mod write_buffer;
+pub mod replication_client; // Added module
+pub mod sharding_utils; // Added for consistent hashing
 
 use anyhow::Context;
 use async_trait::async_trait;
