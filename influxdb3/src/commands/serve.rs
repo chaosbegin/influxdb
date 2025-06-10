@@ -427,6 +427,27 @@ pub struct Config {
         default_value_t = Catalog::DEFAULT_HARD_DELETE_DURATION.into(),
     )]
     pub hard_delete_default_duration: humantime::Duration,
+
+    // Catalog limits
+    #[clap(long = "catalog-max-dbs", env = "INFLUXDB3_CATALOG_MAX_DBS", action)]
+    pub catalog_max_dbs: Option<usize>,
+
+    #[clap(long = "catalog-max-tables-total", env = "INFLUXDB3_CATALOG_MAX_TABLES_TOTAL", action)]
+    pub catalog_max_tables_total: Option<usize>,
+
+    #[clap(long = "catalog-max-columns-per-table", env = "INFLUXDB3_CATALOG_MAX_COLUMNS_PER_TABLE", action)]
+    pub catalog_max_columns_per_table: Option<usize>,
+
+    #[clap(long = "catalog-max-tag-columns-per-table", env = "INFLUXDB3_CATALOG_MAX_TAG_COLUMNS_PER_TABLE", action)]
+    pub catalog_max_tag_columns_per_table: Option<usize>,
+
+    // Write buffer limits
+    #[clap(long = "max-snapshots-to-load-on-start", env = "INFLUXDB3_MAX_SNAPSHOTS_TO_LOAD_ON_START", action)]
+    pub max_snapshots_to_load_on_start: Option<usize>,
+
+    // Persister limits
+    #[clap(long = "parquet-row-group-write-size", env = "INFLUXDB3_PARQUET_ROW_GROUP_WRITE_SIZE", action)]
+    pub parquet_row_group_write_size: Option<usize>,
 }
 
 /// The minimum version of TLS to use for InfluxDB
@@ -690,6 +711,7 @@ pub async fn command(config: Config) -> Result<()> {
         Arc::clone(&object_store),
         config.node_identifier_prefix.as_str(),
         Arc::clone(&time_provider) as _,
+        config.parquet_row_group_write_size.unwrap_or(influxdb3_write::persister::DEFAULT_ROW_GROUP_WRITE_SIZE), // Added
     ));
     let wal_config = WalConfig {
         gen1_duration: config.gen1_duration,
@@ -704,6 +726,13 @@ pub async fn command(config: Config) -> Result<()> {
         Arc::<SystemProvider>::clone(&time_provider),
         Arc::clone(&metrics),
         shutdown_manager.register(),
+        // Construct CatalogLimits from config or defaults
+        influxdb3_catalog::catalog::CatalogLimits::new(
+            config.catalog_max_dbs.unwrap_or(influxdb3_catalog::catalog::Catalog::DEFAULT_NUM_DBS_LIMIT),
+            config.catalog_max_tables_total.unwrap_or(influxdb3_catalog::catalog::Catalog::DEFAULT_NUM_TABLES_LIMIT),
+            config.catalog_max_columns_per_table.unwrap_or(influxdb3_catalog::catalog::Catalog::DEFAULT_NUM_COLUMNS_PER_TABLE_LIMIT),
+            config.catalog_max_tag_columns_per_table.unwrap_or(influxdb3_catalog::catalog::Catalog::DEFAULT_NUM_TAG_COLUMNS_LIMIT),
+        ),
     )
     .await?;
     info!(catalog_uuid = ?catalog.catalog_uuid(), "catalog initialized");
@@ -749,7 +778,8 @@ pub async fn command(config: Config) -> Result<()> {
         query_file_limit: config.query_file_limit,
         shutdown: shutdown_manager.register(),
         wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
-        current_node_id: Arc::from(config.node_identifier_prefix.as_str()), // Added current_node_id
+        current_node_id: Arc::from(config.node_identifier_prefix.as_str()),
+        max_snapshots_to_load_on_start: config.max_snapshots_to_load_on_start, // Added this line
     })
     .await
     .map_err(|e| Error::WriteBufferInit(e.into()))?;

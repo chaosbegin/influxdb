@@ -175,28 +175,42 @@ impl Default for CatalogArgs {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CatalogLimits {
-    num_dbs: usize,
-    num_tables: usize,
-    num_columns_per_table: usize,
+    pub num_dbs: usize,
+    pub num_tables: usize,
+    pub num_columns_per_table: usize,
+    pub num_tag_columns_per_table: usize, // Added
+}
+
+impl CatalogLimits {
+    // Added constructor for external use
+    pub fn new(num_dbs: usize, num_tables: usize, num_columns_per_table: usize, num_tag_columns_per_table: usize) -> Self {
+        Self {
+            num_dbs,
+            num_tables,
+            num_columns_per_table,
+            num_tag_columns_per_table,
+        }
+    }
 }
 
 impl Default for CatalogLimits {
     fn default() -> Self {
         Self {
-            num_dbs: Catalog::NUM_DBS_LIMIT,
-            num_tables: Catalog::NUM_TABLES_LIMIT,
-            num_columns_per_table: Catalog::NUM_COLUMNS_PER_TABLE_LIMIT,
+            num_dbs: Catalog::DEFAULT_NUM_DBS_LIMIT,
+            num_tables: Catalog::DEFAULT_NUM_TABLES_LIMIT,
+            num_columns_per_table: Catalog::DEFAULT_NUM_COLUMNS_PER_TABLE_LIMIT,
+            num_tag_columns_per_table: Catalog::DEFAULT_NUM_TAG_COLUMNS_LIMIT, // Added
         }
     }
 }
 
 impl Catalog {
-    /// Limit for the number of Databases that InfluxDB 3 Core can have
-    pub const NUM_DBS_LIMIT: usize = 5;
-    /// Limit for the number of columns per table that InfluxDB 3 Core can have
-    pub const NUM_COLUMNS_PER_TABLE_LIMIT: usize = 500;
-    /// Limit for the number of tables across all DBs that InfluxDB 3 Core can have
-    pub const NUM_TABLES_LIMIT: usize = 2000;
+    // Renamed constants to indicate they are defaults, actual limits are in CatalogLimits struct
+    pub const DEFAULT_NUM_DBS_LIMIT: usize = 5;
+    pub const DEFAULT_NUM_COLUMNS_PER_TABLE_LIMIT: usize = 500;
+    pub const DEFAULT_NUM_TABLES_LIMIT: usize = 2000;
+    pub const DEFAULT_NUM_TAG_COLUMNS_LIMIT: usize = 250; // Moved here from module level
+
     /// Default duration for hard deletion of soft-deleted databases and tables
     pub const DEFAULT_HARD_DELETE_DURATION: Duration = Duration::from_secs(60 * 60 * 72); // 72 hours
 
@@ -205,6 +219,7 @@ impl Catalog {
         store: Arc<dyn ObjectStore>,
         time_provider: Arc<dyn TimeProvider>,
         metric_registry: Arc<Registry>,
+        limits: CatalogLimits, // Added limits
     ) -> Result<Self> {
         Self::new_with_args(
             node_id,
@@ -212,6 +227,7 @@ impl Catalog {
             time_provider,
             metric_registry,
             CatalogArgs::default(),
+            limits, // Pass provided limits
         )
         .await
     }
@@ -222,6 +238,7 @@ impl Catalog {
         time_provider: Arc<dyn TimeProvider>,
         metric_registry: Arc<Registry>,
         args: CatalogArgs,
+        limits: CatalogLimits, // Added limits parameter
     ) -> Result<Self> {
         let node_id = node_id.into();
         let store =
@@ -240,7 +257,7 @@ impl Catalog {
                 store,
                 metrics,
                 inner,
-                limits: Default::default(),
+                limits, // Use passed limits
                 args,
             })?;
 
@@ -259,10 +276,11 @@ impl Catalog {
         time_provider: Arc<dyn TimeProvider>,
         metric_registry: Arc<Registry>,
         shutdown_token: ShutdownToken,
+        limits: CatalogLimits, // Added limits
     ) -> Result<Arc<Self>> {
         let node_id = node_id.into();
         let catalog =
-            Arc::new(Self::new(Arc::clone(&node_id), store, time_provider, metric_registry).await?);
+            Arc::new(Self::new(Arc::clone(&node_id), store, time_provider, metric_registry, limits).await?); // Pass limits
         let catalog_cloned = Arc::clone(&catalog);
         tokio::spawn(async move {
             shutdown_token.wait_for_shutdown().await;
@@ -306,6 +324,10 @@ impl Catalog {
 
     fn num_columns_per_table_limit(&self) -> usize {
         self.limits.num_columns_per_table
+    }
+
+    pub(crate) fn num_tag_columns_per_table_limit(&self) -> usize { // Added getter
+        self.limits.num_tag_columns_per_table
     }
 
     fn default_hard_delete_duration(&self) -> Duration {
@@ -3868,5 +3890,61 @@ mod tests {
             .delete_shard("test_db", "non_existent_table", ShardId::new(1))
             .await;
         assert!(matches!(result, Err(CatalogError::TableNotFound { .. })));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_shard_management_in_table_definition() {
+        use crate::shard::{ShardDefinition, ShardId, ShardTimeRange};
+        use crate::log::FieldDataType;
+        use influxdb3_id::NodeId;
+
+        let catalog = Catalog::new_in_memory("shard_mgmt_test_host").await.unwrap();
+        let db_name = "shard_db";
+        let table_name = "shard_table";
+
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tagS"], &[("fieldS", FieldDataType::String)]).await.unwrap();
+
+        let shard_def1 = ShardDefinition::new(
+            ShardId::new(1),
+            ShardTimeRange { start_time: 0, end_time: 1000 },
+            vec![NodeId::new(1)],
+        );
+        let shard_def2 = ShardDefinition::new(
+            ShardId::new(2),
+            ShardTimeRange { start_time: 1001, end_time: 2000 },
+            vec![NodeId::new(2)],
+        );
+
+        // Create shards
+        catalog.create_shard(db_name, table_name, shard_def1.clone()).await.unwrap();
+        catalog.create_shard(db_name, table_name, shard_def2.clone()).await.unwrap();
+
+        let db_schema = catalog.db_schema(db_name).unwrap();
+        let table_def = db_schema.table_definition(table_name).unwrap();
+        assert_eq!(table_def.shards.len(), 2);
+        assert_eq!(table_def.shards.get_by_id(&ShardId::new(1)).unwrap().as_ref(), &shard_def1);
+        assert_eq!(table_def.shards.get_by_id(&ShardId::new(2)).unwrap().as_ref(), &shard_def2);
+
+        // Update shard nodes
+        let updated_nodes_for_shard1 = vec![NodeId::new(10), NodeId::new(11)];
+        catalog.update_shard_nodes(db_name, table_name, ShardId::new(1), updated_nodes_for_shard1.clone()).await.unwrap();
+
+        let db_schema_after_update = catalog.db_schema(db_name).unwrap();
+        let table_def_after_update = db_schema_after_update.table_definition(table_name).unwrap();
+        let shard1_after_update = table_def_after_update.shards.get_by_id(&ShardId::new(1)).unwrap();
+        assert_eq!(shard1_after_update.node_ids, updated_nodes_for_shard1);
+
+        // Delete a shard
+        catalog.delete_shard(db_name, table_name, ShardId::new(1)).await.unwrap();
+        let db_schema_after_delete = catalog.db_schema(db_name).unwrap();
+        let table_def_after_delete = db_schema_after_delete.table_definition(table_name).unwrap();
+        assert_eq!(table_def_after_delete.shards.len(), 1);
+        assert!(table_def_after_delete.shards.get_by_id(&ShardId::new(1)).is_none());
+        assert!(table_def_after_delete.shards.get_by_id(&ShardId::new(2)).is_some());
+
+        // Test deleting a non-existent shard (should be an error as per current impl)
+        let delete_non_existent_result = catalog.delete_shard(db_name, table_name, ShardId::new(99)).await;
+        assert!(matches!(delete_non_existent_result, Err(CatalogError::ShardNotFound { .. })));
     }
 }
