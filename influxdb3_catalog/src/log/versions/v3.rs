@@ -227,7 +227,7 @@ pub enum DatabaseCatalogOp {
     ClearRetentionPeriod(ClearRetentionPeriodLog),
     // Shard ops:
     CreateShard(CreateShardLog),
-    UpdateShard(UpdateShardLog),
+    UpdateShardMetadata(UpdateShardMetadataLog),
     DeleteShard(DeleteShardLog),
     // Replication ops:
     SetReplication(SetReplicationLog),
@@ -974,13 +974,14 @@ pub struct CreateShardLog {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UpdateShardLog {
+pub struct UpdateShardMetadataLog {
     pub db_id: DbId,
     pub table_id: TableId,
-    pub table_name: Arc<str>, // Added for context and TableUpdate trait
+    pub table_name: Arc<str>,
     pub shard_id: ShardId,
-    pub new_node_ids: Option<Vec<NodeId>>,
-    // Add other updatable fields as necessary, e.g., changes to time_range if allowed
+    pub status: Option<String>,
+    pub node_ids: Option<Vec<NodeId>>,
+    pub updated_at_ts: i64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

@@ -77,14 +77,12 @@ pub async fn initiate_shard_move_conceptual(
     }
 
     // 4. Log intent (already done above)
+    // Note: target_node_id is no longer used in this function directly for setting ownership.
+    // Ownership is now set during complete_shard_cutover_conceptual.
 
-    // 5. Call catalog.update_shard_nodes()
-    // This method replaces the existing node_ids list with the new one.
-    // For a single-owner model per shard (or if target_node_id is meant to be the sole new owner),
-    // this is conceptually what we want for this rudimentary step.
-    // In a replicated scenario, this would be more complex (e.g. add target, remove source later).
+    // 5. Call catalog.update_shard_metadata() to set status to "MigratingData"
     match catalog
-        .update_shard_nodes(db_name, table_name, shard_id, vec![target_node_id])
+        .update_shard_metadata(db_name, table_name, shard_id, Some("MigratingData".to_string()), None)
         .await
     {
         Ok(_) => {
@@ -93,16 +91,122 @@ pub async fn initiate_shard_move_conceptual(
                 db_name,
                 table_name,
                 ?shard_id,
+                // target_node_id is still relevant context for the overall operation
                 ?target_node_id,
-                "Successfully updated catalog for shard to be owned by target node. Conceptual data migration would follow."
+                "Successfully set shard status to 'MigratingData'. Conceptual data migration would follow."
             );
             Ok(())
         }
-        Err(e @ CatalogError::TableNotFound { .. }) => Err(RebalanceError::TableNotFound {
+        Err(CatalogError::DbNotFound(db)) => Err(RebalanceError::DbNotFound(db)),
+        Err(CatalogError::TableNotFound { db_name: d, table_name: t, .. }) => Err(RebalanceError::TableNotFound {
+            db_name: d.into_string(), // Convert Arc<str> to String
+            table_name: t.into_string(), // Convert Arc<str> to String
+        }),
+        Err(CatalogError::ShardNotFound { .. }) => Err(RebalanceError::ShardNotFound {
+            shard_id,
             db_name: db_name.to_string(),
             table_name: table_name.to_string(),
         }),
-        Err(e @ CatalogError::ShardNotFound { .. }) => Err(RebalanceError::ShardNotFound {
+        Err(e) => {
+            error!(
+                db_name,
+                table_name,
+                ?shard_id,
+                ?target_node_id, // Still relevant for logging context
+                error = %e,
+                "Failed to update shard metadata to 'MigratingData' in catalog during conceptual move initiation."
+            );
+            Err(RebalanceError::CatalogError(e))
+        }
+    }
+}
+
+/// Conceptually marks the completion of data transfer for a shard.
+pub async fn complete_shard_data_transfer_conceptual(
+    catalog: Arc<Catalog>,
+    db_name: &str,
+    table_name: &str,
+    shard_id: ShardId,
+) -> Result<(), RebalanceError> {
+    info!(
+        db_name,
+        table_name,
+        ?shard_id,
+        "Attempting to complete conceptual data transfer for shard."
+    );
+
+    match catalog
+        .update_shard_metadata(db_name, table_name, shard_id, Some("AwaitingCutover".to_string()), None)
+        .await
+    {
+        Ok(_) => {
+            info!(
+                db_name,
+                table_name,
+                ?shard_id,
+                "Successfully set shard status to 'AwaitingCutover'."
+            );
+            Ok(())
+        }
+        Err(CatalogError::DbNotFound(db)) => Err(RebalanceError::DbNotFound(db)),
+        Err(CatalogError::TableNotFound { db_name: d, table_name: t, .. }) => Err(RebalanceError::TableNotFound {
+            db_name: d.into_string(),
+            table_name: t.into_string(),
+        }),
+        Err(CatalogError::ShardNotFound { .. }) => Err(RebalanceError::ShardNotFound {
+            shard_id,
+            db_name: db_name.to_string(),
+            table_name: table_name.to_string(),
+        }),
+        Err(e) => {
+            error!(
+                db_name,
+                table_name,
+                ?shard_id,
+                error = %e,
+                "Failed to update shard metadata to 'AwaitingCutover' in catalog."
+            );
+            Err(RebalanceError::CatalogError(e))
+        }
+    }
+}
+
+/// Conceptually completes the cutover for a shard to a target node.
+pub async fn complete_shard_cutover_conceptual(
+    catalog: Arc<Catalog>,
+    db_name: &str,
+    table_name: &str,
+    shard_id: ShardId,
+    target_node_id: NodeId,
+) -> Result<(), RebalanceError> {
+    info!(
+        db_name,
+        table_name,
+        ?shard_id,
+        ?target_node_id,
+        "Attempting to complete conceptual cutover for shard."
+    );
+
+    match catalog
+        .update_shard_metadata(db_name, table_name, shard_id, Some("Stable".to_string()), Some(vec![target_node_id]))
+        .await
+    {
+        Ok(_) => {
+            info!(
+                db_name,
+                table_name,
+                ?shard_id,
+                ?target_node_id,
+                "Successfully set shard status to 'Stable' and assigned to target node."
+            );
+            Ok(())
+        }
+        Err(CatalogError::DbNotFound(db)) => Err(RebalanceError::DbNotFound(db)),
+        Err(CatalogError::TableNotFound { db_name: d, table_name: t, .. }) => Err(RebalanceError::TableNotFound {
+            db_name: d.into_string(),
+            table_name: t.into_string(),
+        }),
+        Err(CatalogError::ShardNotFound { .. }) => Err(RebalanceError::ShardNotFound {
             shard_id,
             db_name: db_name.to_string(),
             table_name: table_name.to_string(),
@@ -114,12 +218,63 @@ pub async fn initiate_shard_move_conceptual(
                 ?shard_id,
                 ?target_node_id,
                 error = %e,
-                "Failed to update shard nodes in catalog during conceptual move."
+                "Failed to update shard metadata to 'Stable' and assign to target node in catalog."
             );
             Err(RebalanceError::CatalogError(e))
         }
     }
 }
+
+/// Conceptually completes the cleanup phase for a shard.
+pub async fn complete_shard_cleanup_conceptual(
+    catalog: Arc<Catalog>,
+    db_name: &str,
+    table_name: &str,
+    shard_id: ShardId,
+) -> Result<(), RebalanceError> {
+    info!(
+        db_name,
+        table_name,
+        ?shard_id,
+        "Attempting to complete conceptual cleanup for shard."
+    );
+
+    match catalog
+        .update_shard_metadata(db_name, table_name, shard_id, Some("Cleaned".to_string()), None) // Assuming node_ids are not changed here
+        .await
+    {
+        Ok(_) => {
+            info!(
+                db_name,
+                table_name,
+                ?shard_id,
+                "Successfully set shard status to 'Cleaned'."
+            );
+            Ok(())
+        }
+        Err(CatalogError::DbNotFound(db)) => Err(RebalanceError::DbNotFound(db)),
+        Err(CatalogError::TableNotFound { db_name: d, table_name: t, .. }) => Err(RebalanceError::TableNotFound {
+            db_name: d.into_string(),
+            table_name: t.into_string(),
+        }),
+        Err(CatalogError::ShardNotFound { .. }) => Err(RebalanceError::ShardNotFound {
+            shard_id,
+            db_name: db_name.to_string(),
+            table_name: table_name.to_string(),
+        }),
+        Err(e) => {
+            error!(
+                db_name,
+                table_name,
+                ?shard_id,
+                error = %e,
+                "Failed to update shard metadata to 'Cleaned' in catalog."
+            );
+            Err(RebalanceError::CatalogError(e))
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -149,25 +304,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_initiate_shard_move_success() {
+    async fn test_shard_migration_lifecycle() {
         let catalog = setup_catalog().await;
-        let db_name = "test_db";
-        let table_name = "test_table";
+        let db_name = "lifecycle_db";
+        let table_name = "lifecycle_table";
         let shard_id = ShardId::new(1);
         let initial_node = NodeId::new(100);
         let target_node = NodeId::new(200);
+        let time_provider = catalog.time_provider(); // Assuming setup_catalog gives a catalog with a time provider
 
         catalog.create_database(db_name).await.unwrap();
-        catalog.create_table(db_name, table_name, &["tag1"], &[(String::from("field1"), FieldDataType::Integer)]).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tagL"], &[(String::from("fieldL"), FieldDataType::Integer)]).await.unwrap();
 
-        let shard_def = ShardDefinition::new(
-            shard_id,
-            ShardTimeRange { start_time: 0, end_time: 1000 },
-            vec![initial_node],
-        );
+        let initial_ts = time_provider.now().timestamp_nanos();
+        let shard_def = ShardDefinition {
+            id: shard_id,
+            time_range: ShardTimeRange { start_time: 0, end_time: 1000 },
+            node_ids: vec![initial_node],
+            status: "Stable".to_string(),
+            updated_at_ts: Some(initial_ts),
+        };
         catalog.create_shard(db_name, table_name, shard_def).await.unwrap();
 
-        let result = initiate_shard_move_conceptual(
+        // 1. Initiate shard move
+        // The target_node_id in initiate_shard_move_conceptual is now just for context/logging,
+        // actual node assignment happens at cutover.
+        let result_initiate = initiate_shard_move_conceptual(
+            Arc::clone(&catalog),
+            db_name,
+            table_name,
+            shard_id,
+            target_node, // Still passed for conceptual target tracking
+        )
+        .await;
+        assert!(result_initiate.is_ok());
+        let shard_after_initiate = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().shards.get_by_id(&shard_id).unwrap();
+        assert_eq!(shard_after_initiate.status, "MigratingData");
+        assert_eq!(shard_after_initiate.node_ids, vec![initial_node]); // Node assignment unchanged
+        assert!(shard_after_initiate.updated_at_ts.unwrap() > initial_ts);
+        let initiate_ts = shard_after_initiate.updated_at_ts.unwrap();
+
+        // 2. Complete data transfer
+        let result_transfer = complete_shard_data_transfer_conceptual(
+            Arc::clone(&catalog),
+            db_name,
+            table_name,
+            shard_id,
+        )
+        .await;
+        assert!(result_transfer.is_ok());
+        let shard_after_transfer = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().shards.get_by_id(&shard_id).unwrap();
+        assert_eq!(shard_after_transfer.status, "AwaitingCutover");
+        assert_eq!(shard_after_transfer.node_ids, vec![initial_node]); // Node assignment still unchanged
+        assert!(shard_after_transfer.updated_at_ts.unwrap() > initiate_ts);
+        let transfer_ts = shard_after_transfer.updated_at_ts.unwrap();
+
+        // 3. Complete cutover
+        let result_cutover = complete_shard_cutover_conceptual(
             Arc::clone(&catalog),
             db_name,
             table_name,
@@ -175,14 +368,29 @@ mod tests {
             target_node,
         )
         .await;
-        assert!(result.is_ok());
+        assert!(result_cutover.is_ok());
+        let shard_after_cutover = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().shards.get_by_id(&shard_id).unwrap();
+        assert_eq!(shard_after_cutover.status, "Stable");
+        assert_eq!(shard_after_cutover.node_ids, vec![target_node]); // Node assignment changed to target
+        assert!(shard_after_cutover.updated_at_ts.unwrap() > transfer_ts);
+        let cutover_ts = shard_after_cutover.updated_at_ts.unwrap();
 
-        let db_schema = catalog.db_schema(db_name).unwrap();
-        let table_def = db_schema.table_definition(table_name).unwrap();
-        let updated_shard = table_def.shards.get_by_id(&shard_id).unwrap();
-        assert_eq!(updated_shard.node_ids, vec![target_node]);
+        // 4. Complete cleanup
+        let result_cleanup = complete_shard_cleanup_conceptual(
+            Arc::clone(&catalog),
+            db_name,
+            table_name,
+            shard_id,
+        )
+        .await;
+        assert!(result_cleanup.is_ok());
+        let shard_after_cleanup = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().shards.get_by_id(&shard_id).unwrap();
+        assert_eq!(shard_after_cleanup.status, "Cleaned");
+        assert_eq!(shard_after_cleanup.node_ids, vec![target_node]); // Node assignment remains target
+        assert!(shard_after_cleanup.updated_at_ts.unwrap() > cutover_ts);
     }
 
+    // Error handling tests for initiate_shard_move_conceptual (can be reused)
     #[tokio::test]
     async fn test_initiate_shard_move_db_not_found() {
         let catalog = setup_catalog().await;
@@ -191,7 +399,7 @@ mod tests {
             "non_existent_db",
             "test_table",
             ShardId::new(1),
-            NodeId::new(1),
+            NodeId::new(1), // target_node_id still needed for function signature
         )
         .await;
         assert!(matches!(result, Err(RebalanceError::DbNotFound(_))));
@@ -208,7 +416,7 @@ mod tests {
             db_name,
             "non_existent_table",
             ShardId::new(1),
-            NodeId::new(1),
+            NodeId::new(1), // target_node_id
         )
         .await;
         assert!(matches!(result, Err(RebalanceError::TableNotFound { .. })));
@@ -227,7 +435,66 @@ mod tests {
             db_name,
             table_name,
             ShardId::new(999), // Non-existent shard
-            NodeId::new(1),
+            NodeId::new(1),    // target_node_id
+        )
+        .await;
+        assert!(matches!(result, Err(RebalanceError::ShardNotFound { .. })));
+    }
+
+    // Error handling tests for complete_shard_data_transfer_conceptual
+    #[tokio::test]
+    async fn test_complete_data_transfer_shard_not_found() {
+        let catalog = setup_catalog().await;
+        let db_name = "test_db_transfer_err";
+        let table_name = "test_table_transfer_err";
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tagE"], &[(String::from("fieldE"), FieldDataType::String)]).await.unwrap();
+
+        let result = complete_shard_data_transfer_conceptual(
+            catalog,
+            db_name,
+            table_name,
+            ShardId::new(888), // Non-existent shard
+        )
+        .await;
+        assert!(matches!(result, Err(RebalanceError::ShardNotFound { .. })));
+    }
+
+    // Error handling tests for complete_shard_cutover_conceptual
+    #[tokio::test]
+    async fn test_complete_cutover_shard_not_found() {
+        let catalog = setup_catalog().await;
+        let db_name = "test_db_cutover_err";
+        let table_name = "test_table_cutover_err";
+        let target_node = NodeId::new(300);
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tagF"], &[(String::from("fieldF"), FieldDataType::Boolean)]).await.unwrap();
+
+        let result = complete_shard_cutover_conceptual(
+            catalog,
+            db_name,
+            table_name,
+            ShardId::new(777), // Non-existent shard
+            target_node,
+        )
+        .await;
+        assert!(matches!(result, Err(RebalanceError::ShardNotFound { .. })));
+    }
+
+    // Error handling tests for complete_shard_cleanup_conceptual
+    #[tokio::test]
+    async fn test_complete_cleanup_shard_not_found() {
+        let catalog = setup_catalog().await;
+        let db_name = "test_db_cleanup_err";
+        let table_name = "test_table_cleanup_err";
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tagG"], &[(String::from("fieldG"), FieldDataType::Float)]).await.unwrap();
+
+        let result = complete_shard_cleanup_conceptual(
+            catalog,
+            db_name,
+            table_name,
+            ShardId::new(666), // Non-existent shard
         )
         .await;
         assert!(matches!(result, Err(RebalanceError::ShardNotFound { .. })));
