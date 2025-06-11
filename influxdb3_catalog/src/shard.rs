@@ -34,8 +34,25 @@ pub struct ShardTimeRange {
     pub end_time: i64,   // nanoseconds since epoch
 }
 
-/// Represents a shard in the catalog.
+/// Represents the migration state of a shard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardMigrationStatus {
+    /// The shard is stable and not currently undergoing migration.
+    Stable,
+    /// The shard is actively migrating its data out to the specified target nodes.
+    MigratingOutTo(Vec<NodeId>),
+    /// This node is in the process of receiving data for this shard from a source node.
+    MigratingInFrom(NodeId),
+}
+
+impl Default for ShardMigrationStatus {
+    fn default() -> Self {
+        ShardMigrationStatus::Stable
+    }
+}
+
+/// Represents a shard in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] // Removed Copy
 pub struct ShardDefinition {
     /// Unique identifier for the shard.
     pub id: ShardId,
@@ -46,16 +63,25 @@ pub struct ShardDefinition {
     /// Optional hash key range this shard is responsible for.
     /// (min_hash, max_hash_inclusive)
     pub hash_key_range: Option<(u64, u64)>,
-    // Add other shard-specific information here
+    /// Current migration status of the shard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_status: Option<ShardMigrationStatus>,
 }
 
 impl ShardDefinition {
-    pub fn new(id: ShardId, time_range: ShardTimeRange, node_ids: Vec<NodeId>, hash_key_range: Option<(u64, u64)>) -> Self {
+    pub fn new(
+        id: ShardId,
+        time_range: ShardTimeRange,
+        node_ids: Vec<NodeId>,
+        hash_key_range: Option<(u64, u64)>,
+        // migration_status is intentionally not in `new` to force default or explicit update
+    ) -> Self {
         Self {
             id,
             time_range,
             node_ids,
             hash_key_range,
+            migration_status: Some(ShardMigrationStatus::default()), // Default to Stable
         }
     }
 }

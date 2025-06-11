@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod channel;
 pub mod error;
+pub mod management; // Added management module
 pub mod id;
 pub mod log;
 pub mod object_store;

@@ -13,11 +13,14 @@ clippy::future_not_send
 
 pub mod all_paths;
 pub mod builder;
+pub mod cluster_management_service;
+pub mod distributed_query_client;
+pub mod distributed_query_service;
 mod grpc;
 mod http;
 pub mod query_executor;
 mod query_planner;
-pub mod replication_service; // Added module
+pub mod replication_service;
 mod service;
 mod system_tables;
 
@@ -25,12 +28,14 @@ use crate::grpc::make_flight_server;
 use crate::http::HttpApi;
 use crate::http::route_request;
 use crate::replication_service::{ReplicationServerImpl, ReplicationServiceServer};
-use crate::distributed_query_service::{DistributedQueryServerImpl, DistributedQueryServiceServer}; // Added
+use crate::distributed_query_service::{DistributedQueryServerImpl, DistributedQueryServiceServer};
+use crate::cluster_management_service::{ClusterManagementServerImpl, ClusterManagementServiceServer}; // Added
 use authz::Authorizer;
 use hyper::server::conn::AddrIncoming;
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
 use influxdb3_authz::AuthProvider;
+use influxdb3_catalog::catalog::Catalog; // Added for ClusterManagementServerImpl
 use influxdb3_telemetry::store::TelemetryStore;
 use influxdb3_write::persister::Persister;
 use observability_deps::tracing::error;
@@ -138,6 +143,7 @@ pub struct Server<'a> {
     key_file: Option<PathBuf>,
     cert_file: Option<PathBuf>,
     tls_minimum_version: &'a [&'static SupportedProtocolVersion],
+    catalog: Arc<Catalog>, // Added to pass to ClusterManagementServerImpl
 }
 
 impl Server<'_> {
@@ -166,26 +172,27 @@ pub async fn serve(
         trace_http::tower::ServiceProtocol::Grpc,
     );
 
-    // Create Flight service
-    let flight_service_impl = make_flight_server( // This returns FlightServer<impl Flight>
+    let flight_service_impl = make_flight_server(
         Arc::clone(&server.http.query_executor),
         Some(server.authorizer()),
     );
 
-    // Create Replication service
-    // HttpApi has a write_buffer field, which is Arc<dyn WriteBuffer>
     let replication_server_impl = ReplicationServerImpl::new(Arc::clone(&server.http.write_buffer));
     let replication_grpc_service = ReplicationServiceServer::new(replication_server_impl);
 
-    // Create Distributed Query service
     let distributed_query_server_impl = DistributedQueryServerImpl::new(Arc::clone(&server.http.query_executor));
     let distributed_query_grpc_service = DistributedQueryServiceServer::new(distributed_query_server_impl);
 
-    // Combine gRPC services
+    // Create Cluster Management service
+    let cluster_management_server_impl = ClusterManagementServerImpl::new(Arc::clone(&server.catalog));
+    let cluster_management_grpc_service = ClusterManagementServiceServer::new(cluster_management_server_impl);
+
+
     let combined_grpc_router = tonic::transport::Server::builder()
         .add_service(flight_service_impl)
         .add_service(replication_grpc_service)
-        .add_service(distributed_query_grpc_service) // Added
+        .add_service(distributed_query_grpc_service)
+        .add_service(cluster_management_grpc_service) // Added new service
         .into_router();
 
     let grpc_service = grpc_trace_layer.layer(combined_grpc_router);
@@ -263,24 +270,19 @@ pub async fn serve(
             .with_graceful_shutdown(shutdown.cancelled())
             .await?;
     } else {
-        // Same logic for non-TLS
-        let flight_service_impl = make_flight_server(
-            Arc::clone(&server.http.query_executor),
-            Some(server.authorizer()),
-        );
-        let replication_server_impl = ReplicationServerImpl::new(Arc::clone(&server.http.write_buffer));
-        let replication_grpc_service = ReplicationServiceServer::new(replication_server_impl);
+        // Non-TLS setup
+        let cluster_management_server_impl_no_tls = ClusterManagementServerImpl::new(Arc::clone(&server.catalog));
+        let cluster_management_grpc_service_no_tls = ClusterManagementServiceServer::new(cluster_management_server_impl_no_tls);
 
-        let distributed_query_server_impl = DistributedQueryServerImpl::new(Arc::clone(&server.http.query_executor));
-        let distributed_query_grpc_service = DistributedQueryServiceServer::new(distributed_query_server_impl);
 
-        let combined_grpc_router = tonic::transport::Server::builder()
-            .add_service(flight_service_impl)
-            .add_service(replication_grpc_service)
-            .add_service(distributed_query_grpc_service) // Added
+        let combined_grpc_router_no_tls = tonic::transport::Server::builder()
+            .add_service(make_flight_server(Arc::clone(&server.http.query_executor), Some(server.authorizer())))
+            .add_service(ReplicationServiceServer::new(ReplicationServerImpl::new(Arc::clone(&server.http.write_buffer))))
+            .add_service(DistributedQueryServiceServer::new(DistributedQueryServerImpl::new(Arc::clone(&server.http.query_executor))))
+            .add_service(cluster_management_grpc_service_no_tls) // Added new service
             .into_router();
 
-        let grpc_service = grpc_trace_layer.layer(combined_grpc_router);
+        let grpc_service_no_tls = grpc_trace_layer.layer(combined_grpc_router_no_tls);
 
         let rest_service = hyper::service::make_service_fn(|_| {
             let http_server = Arc::clone(&server.http);
@@ -296,7 +298,7 @@ pub async fn serve(
             futures::future::ready(Ok::<_, Infallible>(service))
         });
 
-        let hybrid_make_service = hybrid(rest_service, grpc_service);
+        let hybrid_make_service = hybrid(rest_service, grpc_service_no_tls);
         let addr = AddrIncoming::from_listener(server.listener)?;
 
         let timer_end = Instant::now();
@@ -894,13 +896,14 @@ mod tests {
             node_identifier_prefix,
             Arc::clone(&time_provider) as _,
         ));
-        let sample_node_id = Arc::from("sample-host-id");
+        let sample_node_id = Arc::from("sample-host-id"); // Catalog's own ID/prefix
         let catalog = Arc::new(
             Catalog::new(
                 sample_node_id,
                 Arc::clone(&object_store),
                 Arc::clone(&time_provider) as _,
-                Default::default(),
+                Default::default(), // metric registry for catalog
+                Default::default(), // catalog limits
             )
             .await
             .unwrap(),
@@ -929,6 +932,9 @@ mod tests {
                 query_file_limit: None,
                 shutdown: shutdown_manager.register(),
                 wal_replay_concurrency_limit: Some(1),
+                current_node_id: Arc::from(node_identifier_prefix), // current node's cluster ID
+                max_snapshots_to_load_on_start: Some(10),
+                replication_client_factory: influxdb3_write::replication_client::default_replication_client_factory(),
             },
         )
         .await
@@ -962,6 +968,7 @@ mod tests {
             sys_events_store: Arc::clone(&sys_events_store),
             started_with_auth: false,
             time_provider: Arc::clone(&time_provider) as _,
+            current_node_id: Arc::from(node_identifier_prefix), // current node's cluster ID
         }));
 
         // bind to port 0 will assign a random available port:
@@ -991,22 +998,31 @@ mod tests {
         static TLS_MIN_VERSION: &[&rustls::SupportedProtocolVersion] =
             &[&rustls::version::TLS12, &rustls::version::TLS13];
 
-        let server = ServerBuilder::new(common_state)
-            .write_buffer(Arc::clone(&write_buffer))
-            .query_executor(query_executor)
-            .persister(persister)
-            .authorizer(Arc::new(NoAuthAuthenticator))
-            .time_provider(Arc::clone(&time_provider) as _)
-            .tcp_listener(listener)
-            .processing_engine(processing_engine)
-            .build(None, None, TLS_MIN_VERSION)
-            .await;
-        let shutdown = frontend_shutdown.clone();
+        let server_struct = Server { // Renamed from `server` to avoid conflict
+            common_state,
+            http: Arc::new(HttpApi::new(
+                Arc::clone(&write_buffer),
+                Arc::clone(&query_executor),
+                Arc::new(NoAuthAuthenticator::new()), // Assuming NoAuth for tests
+                Arc::clone(&metrics),
+                Arc::clone(&persister),
+                Arc::clone(&processing_engine),
+            )),
+            persister,
+            authorizer: Arc::new(NoAuthAuthenticator::new()),
+            listener,
+            key_file: None,
+            cert_file: None,
+            tls_minimum_version: TLS_MIN_VERSION,
+            catalog: Arc::clone(&catalog), // Pass catalog to Server struct
+        };
+
+        let shutdown_clone = frontend_shutdown.clone(); // Clone for the async block
         let paths = EMPTY_PATHS.get_or_init(std::vec::Vec::new);
         tokio::spawn(async move {
             serve(
-                server,
-                frontend_shutdown,
+                server_struct, // Use renamed variable
+                shutdown_clone,
                 server_start_time,
                 false,
                 paths,
@@ -1083,3 +1099,5 @@ mod tests {
             .expect("http error sending query")
     }
 }
+
+[end of influxdb3_server/src/lib.rs]

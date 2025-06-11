@@ -49,6 +49,9 @@ influxdb3_telemetry = { path = "../influxdb3_telemetry" }
 influxdb3_types = { path = "../influxdb3_types"}
 influxdb3_wal = { path = "../influxdb3_wal"}
 influxdb3_write = { path = "../influxdb3_write" }
+influxdb3_replication_protos = { path = "../influxdb3_replication_protos" }
+influxdb3_distributed_query_protos = { path = "../influxdb3_distributed_query_protos" }
+datafusion_proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" } # Added
 iox_query_influxql_rewrite = { path = "../iox_query_influxql_rewrite" }
 
 # crates.io Dependencies

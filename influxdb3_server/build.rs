@@ -7,8 +7,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true) // Enable client generation for DistributedQueryService
         .compile(
             &[
-                "proto/influxdb3_replication.proto",
-                "proto/influxdb3_distributed_query.proto" // Added new proto
+                "proto/influxdb3_distributed_query.proto",
+                "proto/influxdb3_cluster_management.proto", // Added new cluster management proto
             ],
             &["proto/"], // Include directory for imports
         )?;

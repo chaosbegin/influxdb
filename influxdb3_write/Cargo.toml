@@ -35,9 +35,13 @@ influxdb3_telemetry = { path = "../influxdb3_telemetry" }
 influxdb3_test_helpers = { path = "../influxdb3_test_helpers" }
 influxdb3_types = { path = "../influxdb3_types" }
 influxdb3_wal = { path = "../influxdb3_wal" }
+influxdb3_replication_protos = { path = "../influxdb3_replication_protos" }
 
 # crates.io dependencies
 anyhow.workspace = true
+futures.workspace = true
+prost.workspace = true
+tonic = { workspace = true, features = ["transport"] }
 arrow.workspace = true
 async-trait.workspace = true
 byteorder.workspace  = true

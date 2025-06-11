@@ -1,0 +1,15 @@
+[package]
+name = "influxdb3_cluster_manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+influxdb3_catalog = { path = "../influxdb3_catalog" }
+influxdb3_id = { path = "../influxdb3_id" } # For NodeId, ShardId if not re-exported by catalog's management module
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true, features = ["log"] } # Using tracing, can be configured for log output
+
+[dev-dependencies]
+mockall = { workspace = true }

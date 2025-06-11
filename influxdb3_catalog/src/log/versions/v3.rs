@@ -158,10 +158,16 @@ impl Ord for OrderedCatalogBatch {
     }
 }
 
+use crate::catalog::NodeStatus; // Import the new NodeStatus
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NodeCatalogOp {
-    RegisterNode(RegisterNodeLog),
-    StopNode(StopNodeLog),
+    RegisterNode(RegisterNodeLog), // Existing, to be modified
+    StopNode(StopNodeLog),         // Existing, its application logic will change status
+    AdministrativeAddNode(AdministrativeAddNodeLog), // New
+    UpdateNodeStatus(UpdateNodeStatusLog),     // New
+    UpdateNodeHeartbeat(UpdateNodeHeartbeatLog), // New
+    RemoveNode(RemoveNodeLog),                 // New
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -195,6 +201,11 @@ pub enum DatabaseCatalogOp {
     SetReplication(SetReplicationLog),
     // Sharding strategy ops:
     UpdateTableShardingStrategy(UpdateTableShardingStrategyLog),
+    // Shard Migration ops:
+    BeginShardMigrationOut(BeginShardMigrationOutLog),
+    CommitShardMigrationOnTarget(CommitShardMigrationOnTargetLog),
+    FinalizeShardMigrationOnSource(FinalizeShardMigrationOnSourceLog),
+    UpdateShardMigrationStatus(UpdateShardMigrationStatusLog), // General status update if needed
 }
 
 impl DatabaseCatalogOp {
@@ -210,8 +221,11 @@ impl DatabaseCatalogOp {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegisterNodeLog {
-    pub node_id: Arc<str>,
+    pub node_name: Arc<str>, // Renamed from node_id to node_name for clarity, matching NodeDefinition
+    pub node_catalog_id: NodeId, // This is the internal u64 ID assigned by the catalog for this node
     pub instance_id: Arc<str>,
+    pub rpc_address: String,
+    pub http_address: String,
     pub registered_time_ns: i64,
     pub core_count: u64,
     pub mode: Vec<NodeMode>,
@@ -220,10 +234,41 @@ pub struct RegisterNodeLog {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StopNodeLog {
+    // node_id refers to the user-provided string name for matching existing behavior
+    // but operations should ideally use the internal NodeId (u64) for lookups.
+    // For now, keeping node_id as Arc<str> consistent with RegisterNodeLog's primary key.
+    // The apply logic will map this to the internal NodeId.
     pub node_id: Arc<str>,
     pub stopped_time_ns: i64,
     pub process_uuid: Uuid,
+    // The new status (e.g., Down) will be set by the apply logic.
 }
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdministrativeAddNodeLog {
+    // Uses the full NodeDefinition, which includes the internal u64 NodeId field as `id`
+    // and the string name as `node_name`.
+    // The `id` in NodeDefinition should be assigned by the catalog when this op is created.
+    pub node_definition: crate::catalog::NodeDefinition,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateNodeStatusLog {
+    pub node_catalog_id: NodeId, // Internal u64 ID for lookup
+    pub status: NodeStatus,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateNodeHeartbeatLog {
+    pub node_catalog_id: NodeId, // Internal u64 ID for lookup
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoveNodeLog {
+    pub node_catalog_id: NodeId, // Internal u64 ID for lookup
+}
+
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NodeMode {
@@ -944,12 +989,55 @@ pub struct UpdateTableShardingStrategyLog {
     pub new_shard_key_columns: Option<Vec<String>>,
 }
 
+// --- Shard Migration Log Definitions ---
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BeginShardMigrationOutLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>,
+    pub shard_id: ShardId,
+    pub target_node_ids: Vec<NodeId>, // Nodes the shard is migrating to
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommitShardMigrationOnTargetLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>,
+    pub shard_id: ShardId,
+    pub target_node_id: NodeId, // The target node that has successfully received the shard
+    pub source_node_id: NodeId, // The source node from which data was received
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FinalizeShardMigrationOnSourceLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>,
+    pub shard_id: ShardId,
+    pub migrated_to_node_id: NodeId, // The target node the shard was successfully migrated to
+    // The source node is implicit from which node processes this log.
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateShardMigrationStatusLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>,
+    pub shard_id: ShardId,
+    pub new_status: crate::shard::ShardMigrationStatus, // Using the enum from shard.rs
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shard::ShardingStrategy; // Ensure ShardingStrategy is in scope for test
-    use influxdb3_id::{DbId, TableId};
+    use influxdb3_id::{DbId, TableId, NodeId as CatalogNodeId}; // Aliased for clarity
     use std::sync::Arc;
+    use crate::catalog::{NodeDefinition as CatalogNodeDefinition, NodeStatus as CatalogNodeStatus}; // Use types from catalog
+    use crate::shard::ShardMigrationStatus; // Use type from shard
 
     #[test]
     fn test_update_table_sharding_strategy_log_serialization_roundtrip() {
@@ -972,8 +1060,9 @@ mod tests {
 
     #[test]
     fn test_database_catalog_op_roundtrip_all_variants() {
-        // This test would ideally cover all variants of DatabaseCatalogOp.
-        // For now, it focuses on ensuring the new one is tested alongside some existing ones.
+        let node_id_1 = CatalogNodeId::new(1);
+        let node_id_2 = CatalogNodeId::new(2);
+        let shard_id_1 = ShardId::new(10);
 
         let ops_to_test = vec![
             DatabaseCatalogOp::CreateDatabase(CreateDatabaseLog {
@@ -1003,12 +1092,84 @@ mod tests {
                     new_shard_key_columns: Some(vec!["tag_a".to_string()]),
                 },
             ),
-            // Add other variants here as needed to make this test more comprehensive
+            DatabaseCatalogOp::BeginShardMigrationOut(BeginShardMigrationOutLog {
+                db_id: DbId::new(1), table_id: TableId::new(1), table_name: Arc::from("t1"),
+                shard_id: shard_id_1, target_node_ids: vec![node_id_2]
+            }),
+            DatabaseCatalogOp::CommitShardMigrationOnTarget(CommitShardMigrationOnTargetLog {
+                db_id: DbId::new(1), table_id: TableId::new(1), table_name: Arc::from("t1"),
+                shard_id: shard_id_1, target_node_id: node_id_2, source_node_id: node_id_1
+            }),
+            DatabaseCatalogOp::FinalizeShardMigrationOnSource(FinalizeShardMigrationOnSourceLog {
+                db_id: DbId::new(1), table_id: TableId::new(1), table_name: Arc::from("t1"),
+                shard_id: shard_id_1, migrated_to_node_id: node_id_2
+            }),
+            DatabaseCatalogOp::UpdateShardMigrationStatus(UpdateShardMigrationStatusLog {
+                db_id: DbId::new(1), table_id: TableId::new(1), table_name: Arc::from("t1"),
+                shard_id: shard_id_1, new_status: ShardMigrationStatus::Stable
+            }),
         ];
 
         for op in ops_to_test {
             let serialized = serde_json::to_string(&op).expect("Serialization failed");
             let deserialized: DatabaseCatalogOp =
+                serde_json::from_str(&serialized).expect("Deserialization failed");
+            assert_eq!(op, deserialized, "Roundtrip failed for op: {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_node_catalog_op_serialization_roundtrip() {
+        let node_id_val = CatalogNodeId::new(1);
+        let node_name_val = Arc::from("test-node-1");
+
+        let ops_to_test = vec![
+            NodeCatalogOp::AdministrativeAddNode(AdministrativeAddNodeLog {
+                node_definition: CatalogNodeDefinition { // Use the definition from crate::catalog
+                    id: node_id_val,
+                    node_name: Arc::clone(&node_name_val),
+                    instance_id: Arc::from(Uuid::new_v4().to_string()),
+                    rpc_address: "localhost:8082".to_string(),
+                    http_address: "localhost:8080".to_string(),
+                    mode: vec![NodeMode::Core],
+                    core_count: 4,
+                    status: CatalogNodeStatus::Joining,
+                    last_heartbeat: Some(1234567890),
+                }
+            }),
+            NodeCatalogOp::UpdateNodeStatus(UpdateNodeStatusLog {
+                node_catalog_id: node_id_val,
+                status: CatalogNodeStatus::Active,
+            }),
+            NodeCatalogOp::UpdateNodeHeartbeat(UpdateNodeHeartbeatLog {
+                node_catalog_id: node_id_val,
+                timestamp: 1234599999,
+            }),
+            NodeCatalogOp::RemoveNode(RemoveNodeLog {
+                node_catalog_id: node_id_val,
+            }),
+            // Existing ops (RegisterNode, StopNode) should also be tested here with updated fields
+            NodeCatalogOp::RegisterNode(RegisterNodeLog {
+                node_name: Arc::clone(&node_name_val),
+                node_catalog_id: node_id_val,
+                instance_id: Arc::from(Uuid::new_v4().to_string()),
+                rpc_address: "localhost:9092".to_string(),
+                http_address: "localhost:9090".to_string(),
+                registered_time_ns: 100,
+                core_count: 8,
+                mode: vec![NodeMode::Core],
+                process_uuid: Uuid::new_v4(),
+            }),
+            NodeCatalogOp::StopNode(StopNodeLog {
+                node_id: Arc::clone(&node_name_val), // StopNodeLog uses string name
+                stopped_time_ns: 200,
+                process_uuid: Uuid::new_v4(),
+            }),
+        ];
+
+        for op in ops_to_test {
+            let serialized = serde_json::to_string(&op).expect("Serialization failed");
+            let deserialized: NodeCatalogOp =
                 serde_json::from_str(&serialized).expect("Deserialization failed");
             assert_eq!(op, deserialized, "Roundtrip failed for op: {:?}", op);
         }

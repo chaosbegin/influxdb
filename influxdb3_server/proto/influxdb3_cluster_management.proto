@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package influxdb3.internal.management.v1;
+
+// Re-using NodeId, NodeDefinition, NodeStatus from catalog's potential export
+// or define simplified versions here if direct import is complex for protos.
+// For now, assuming we define what's needed.
+// Consider using well-known types like google.protobuf.Timestamp for timestamps.
+
+message NodeIdMessage {
+  uint64 id = 1;
+}
+
+message NodeDefinitionMessage {
+  uint64 id = 1; // Internal u64 ID
+  string node_name = 2; // User-friendly name
+  string instance_id = 3; // UUID
+  string rpc_address = 4;
+  string http_address = 5;
+  // repeated NodeMode mode = 6; // Assuming NodeMode is simple enough or stringified
+  uint64 core_count = 7;
+  string status = 8; // String representation of NodeStatus
+  optional int64 last_heartbeat_ns = 9;
+}
+
+enum NodeStatusMessage {
+  NODE_STATUS_UNSPECIFIED = 0;
+  NODE_STATUS_JOINING = 1;
+  NODE_STATUS_ACTIVE = 2;
+  NODE_STATUS_LEAVING = 3;
+  NODE_STATUS_DOWN = 4;
+  NODE_STATUS_UNKNOWN = 5;
+}
+
+message AddNodeRequest {
+  NodeDefinitionMessage node_definition = 1;
+}
+
+message AddNodeResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}
+
+message RemoveNodeRequest {
+  NodeIdMessage node_id = 1;
+}
+
+message RemoveNodeResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}
+
+message UpdateNodeStatusRequest {
+  NodeIdMessage node_id = 1;
+  NodeStatusMessage status = 2;
+}
+
+message UpdateNodeStatusResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}
+
+message GetNodeRequest {
+    NodeIdMessage node_id = 1;
+}
+
+message GetNodeResponse {
+    optional NodeDefinitionMessage node_definition = 1;
+}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+    repeated NodeDefinitionMessage nodes = 1;
+}
+
+
+message TriggerRebalanceRequest {
+  // Strategy definition can be more complex, e.g., using a oneof
+  oneof strategy {
+    AddNodeRequest add_node = 1; // Re-use AddNodeRequest for simplicity
+    RemoveNodeRequest decommission_node = 2; // Re-use RemoveNodeRequest
+  }
+  // Could also include specific rebalance parameters here
+}
+
+message TriggerRebalanceResponse {
+  bool success = 1;
+  string message = 2; // e.g., "Rebalance initiated" or error details
+}
+
+
+service ClusterManagementService {
+  rpc AddNode(AddNodeRequest) returns (AddNodeResponse);
+  rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
+  rpc UpdateNodeStatus(UpdateNodeStatusRequest) returns (UpdateNodeStatusResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc TriggerRebalance(TriggerRebalanceRequest) returns (TriggerRebalanceResponse);
+}
