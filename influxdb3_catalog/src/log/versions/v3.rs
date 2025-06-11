@@ -25,15 +25,18 @@ use uuid::Uuid;
 use crate::{
     catalog::{CatalogSequenceNumber, RetentionPeriod},
     replication::{ReplicationFactor, ReplicationInfo},
-    shard::{ShardDefinition, ShardId, ShardTimeRange},
+    shard::{ShardDefinition, ShardId, ShardTimeRange, ShardMigrationStatus}, // Added ShardMigrationStatus
+    node::{NodeDefinition as ClusterNodeDefinition, NodeStatus as ClusterNodeStatus, CatNodeId}, // Added Cluster Node types
     CatalogError, Result, serialize::VersionedFileType,
 };
+use influxdb3_id::NodeId as ComputeNodeId; // Alias for existing NodeId to avoid confusion
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CatalogBatch {
-    Node(NodeBatch),
+    Node(NodeBatch), // For compute nodes
     Database(DatabaseBatch),
     Token(TokenBatch),
+    ClusterManagement(ClusterManagementBatch), // New for cluster membership nodes
 }
 
 impl CatalogBatch {
@@ -193,6 +196,8 @@ pub enum DatabaseCatalogOp {
     DeleteShard(DeleteShardLog),
     // Replication ops:
     SetReplication(SetReplicationLog),
+    // Cluster Management Shard Op (belongs here as it affects db->table->shard)
+    UpdateShardMigrationState(ShardMigrationStateUpdateLog),
 }
 
 impl DatabaseCatalogOp {
@@ -927,4 +932,63 @@ pub struct SetReplicationLog {
     pub table_id: TableId,
     pub table_name: Arc<str>, // Added for context and TableUpdate trait
     pub replication_info: ReplicationInfo,
+}
+
+// --- Cluster Management Log Definitions ---
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct ClusterManagementBatch {
+    pub time_ns: i64,
+    pub ops: Vec<ClusterOp>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ClusterOp {
+    RegisterClusterNode(ClusterNodeDefinitionLog),
+    UpdateClusterNodeStatus(ClusterNodeStatusUpdateLog),
+    UpdateClusterNodeHeartbeat(ClusterNodeHeartbeatLog),
+    DecommissionClusterNode(ClusterNodeDecommissionLog),
+    // UpdateShardMigrationState is now part of DatabaseCatalogOp as it's table/shard specific
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterNodeDefinitionLog {
+    // Using String for id for now, assuming it's the user-defined unique node name.
+    // If CatNodeId is used as the primary key in repo, this log might need it too.
+    // For simplicity, log contains the full definition.
+    pub node_definition: ClusterNodeDefinition,
+    // If we decide to use CatNodeId as the main key in the Repository,
+    // we might need to log it here too, e.g. `pub cat_node_id: CatNodeId,`
+    // and the name would be part of node_definition.id.
+    // For now, assuming node_definition.id (String) is the key.
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterNodeStatusUpdateLog {
+    pub node_id: String, // User-defined node ID
+    pub new_status: ClusterNodeStatus,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterNodeHeartbeatLog {
+    pub node_id: String, // User-defined node ID
+    pub timestamp_ns: i64,
+    pub rpc_address: String, // Heartbeat might also update RPC address
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterNodeDecommissionLog {
+    pub node_id: String, // User-defined node ID
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardMigrationStateUpdateLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    // pub table_name: Arc<str>, // For context, if needed by apply logic easily
+    pub shard_id: ShardId,
+    pub new_migration_status: Option<ShardMigrationStatus>, // Option to allow clearing it (back to Stable/None)
+    pub target_nodes_override: Option<Vec<ComputeNodeId>>, // Using ComputeNodeId as these are physical nodes
+    pub source_nodes_override: Option<Vec<ComputeNodeId>>,
+    pub new_version: u64, // For optimistic locking
 }

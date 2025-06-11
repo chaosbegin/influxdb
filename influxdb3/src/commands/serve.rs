@@ -31,6 +31,9 @@ use influxdb3_server::{
     builder::ServerBuilder,
     query_executor::{CreateQueryExecutorArgs, QueryExecutorImpl},
     serve,
+    // Cluster components:
+    cluster::manager::InMemoryClusterManager,
+    cluster::migration::NoOpShardMigrator,
 };
 use influxdb3_shutdown::{ShutdownManager, wait_for_signal};
 use influxdb3_sys_events::SysEventStore;
@@ -448,6 +451,14 @@ pub struct Config {
     // Persister limits
     #[clap(long = "parquet-row-group-write-size", env = "INFLUXDB3_PARQUET_ROW_GROUP_WRITE_SIZE", action)]
     pub parquet_row_group_write_size: Option<usize>,
+
+    /// Interval for nodes to send heartbeats to the cluster manager. (Currently conceptual)
+    #[clap(
+        long = "cluster-heartbeat-interval",
+        env = "INFLUXDB3_CLUSTER_HEARTBEAT_INTERVAL",
+        action
+    )]
+    pub cluster_heartbeat_interval: Option<humantime::Duration>,
 }
 
 /// The minimum version of TLS to use for InfluxDB
@@ -806,6 +817,51 @@ pub async fn command(config: Config) -> Result<()> {
 
     let write_buffer: Arc<dyn WriteBuffer> = write_buffer_impl;
 
+    // Instantiate ClusterManager and ShardMigrator
+    let cluster_manager = Arc::new(InMemoryClusterManager::new(Arc::clone(&time_provider)));
+    let _shard_migrator = Arc::new(NoOpShardMigrator::new(Arc::clone(&catalog))); // ShardMigrator not used yet, prefixed with _
+
+    // Conceptual: Node self-registration and heartbeat
+    let local_node_id_for_cluster = config.node_identifier_prefix.clone();
+    // Assuming gRPC address is the same as HTTP bind address for simplicity here.
+    let local_rpc_address_for_cluster = format!("http://{}", config.http_bind_address);
+
+    info!(node_id = %local_node_id_for_cluster, rpc_addr = %local_rpc_address_for_cluster, "Conceptual: This node's identity for cluster operations.");
+    // In a real scenario, self-registration and heartbeating would be more robust,
+    // likely involving retries, and happen after services are confirmed to be up.
+    // Example one-off registration:
+    // tokio::spawn({
+    //     let cm = Arc::clone(&cluster_manager);
+    //     let cat = Arc::clone(&catalog); // Catalog also needed for full registration via API
+    //     let node_id = local_node_id_for_cluster.clone();
+    //     let rpc_addr = local_rpc_address_for_cluster.clone();
+    //     async move {
+    //         match influxdb3_server::cluster::api::register_new_node(cm, cat, node_id.clone(), rpc_addr.clone()).await {
+    //             Ok(_) => info!(%node_id, %rpc_addr, "Successfully self-registered with cluster."),
+    //             Err(e) => error!(%node_id, %rpc_addr, error=%e, "Failed to self-register with cluster."),
+    //         }
+    //     }
+    // });
+    //
+    // Example heartbeat task:
+    // if let Some(interval) = config.cluster_heartbeat_interval {
+    //     tokio::spawn({
+    //         let cm = Arc::clone(&cluster_manager);
+    //         let node_id = local_node_id_for_cluster.clone();
+    //         let rpc_addr = local_rpc_address_for_cluster.clone(); // Or a dedicated heartbeat address
+    //         async move {
+    //             let mut interval_timer = tokio::time::interval(interval.into());
+    //             loop {
+    //                 interval_timer.tick().await;
+    //                 info!(%node_id, "Sending conceptual heartbeat to cluster manager.");
+    //                 if let Err(e) = cm.heartbeat(&node_id, &rpc_addr).await { // Assuming direct heartbeat to CM for simplicity
+    //                     error!(%node_id, error = %e, "Failed to send heartbeat");
+    //                 }
+    //             }
+    //         }
+    //     });
+    // }
+
     let common_state = CommonServerState::new(
         Arc::clone(&metrics),
         trace_exporter,
@@ -856,7 +912,8 @@ pub async fn command(config: Config) -> Result<()> {
         .time_provider(Arc::clone(&time_provider) as _)
         .persister(persister)
         .tcp_listener(listener)
-        .processing_engine(processing_engine);
+        .processing_engine(processing_engine)
+        .cluster_manager(cluster_manager); // Pass ClusterManager to ServerBuilder
 
     let cert_file = config.cert_file;
     let key_file = config.key_file;

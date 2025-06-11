@@ -17,7 +17,10 @@ mod grpc;
 mod http;
 pub mod query_executor;
 mod query_planner;
-pub mod replication_service; // Added module
+pub mod replication_service;
+pub mod distributed_planning;
+pub mod distributed_query_service;
+pub mod cluster; // Added module
 mod service;
 mod system_tables;
 
@@ -180,9 +183,13 @@ pub async fn serve(
     // tonic::transport::Server can be built up with multiple services
     // and then made into a MakeService or a Router which is a Service.
     // The grpc_trace_layer expects a Service.
+    let distributed_query_server_impl = crate::distributed_query_service::DistributedQueryServerImpl::new(Arc::clone(&server.http.query_executor));
+    let distributed_query_grpc_service = crate::distributed_query_service::DistributedQueryServiceServer::new(distributed_query_server_impl);
+
     let combined_grpc_router = tonic::transport::Server::builder()
         .add_service(flight_service_impl)
         .add_service(replication_grpc_service)
+        .add_service(distributed_query_grpc_service) // Add new service
         .into_router();
 
     let grpc_service = grpc_trace_layer.layer(combined_grpc_router);
@@ -268,9 +275,13 @@ pub async fn serve(
         let replication_server_impl = ReplicationServerImpl::new(Arc::clone(&server.http.write_buffer));
         let replication_grpc_service = ReplicationServiceServer::new(replication_server_impl);
 
+        let distributed_query_server_impl = crate::distributed_query_service::DistributedQueryServerImpl::new(Arc::clone(&server.http.query_executor));
+        let distributed_query_grpc_service = crate::distributed_query_service::DistributedQueryServiceServer::new(distributed_query_server_impl);
+
         let combined_grpc_router = tonic::transport::Server::builder()
             .add_service(flight_service_impl)
             .add_service(replication_grpc_service)
+            .add_service(distributed_query_grpc_service) // Add new service
             .into_router();
 
         let grpc_service = grpc_trace_layer.layer(combined_grpc_router);

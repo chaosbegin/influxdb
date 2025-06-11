@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package influxdb3.internal.distributed_query.v1;
+
+// Service for executing query fragments on distributed InfluxDB 3 nodes.
+service DistributedQueryService {
+  // Executes a query plan fragment (logical plan) on a specific shard
+  // and streams back results as Arrow RecordBatches.
+  rpc ExecuteQueryFragment(ExecuteQueryFragmentRequest) returns (stream ExecuteQueryFragmentResponse);
+}
+
+// Request message for executing a query fragment.
+message ExecuteQueryFragmentRequest {
+  // The name of the database to query.
+  string db_name = 1;
+
+  // The specific ShardID this query fragment should run against on this node.
+  uint64 shard_id = 2; // Representing ShardId as u64
+
+  // The DataFusion LogicalPlan fragment, serialized to JSON.
+  // The receiving node will deserialize this and create a physical plan.
+  string logical_plan_fragment_json = 3;
+
+  // Key-value pairs for session configuration (e.g., batch size, timezone).
+  map<string, string> session_config = 4;
+
+  // Optional: Can include projection as list of column names or indices
+  // repeated uint32 projection_indices = 5;
+  // Or rely on projection being part of the logical_plan_fragment_json
+}
+
+// Response message for streaming RecordBatch results or an error.
+message ExecuteQueryFragmentResponse {
+  // A RecordBatch serialized using Arrow IPC stream format (encapsulated, one batch per message).
+  // If error_message is set, this should be empty.
+  bytes record_batch_ipc_bytes = 1;
+
+  // If an error occurred during fragment execution on the remote node.
+  // If this is set, success is implied to be false, and no more record_batch_ipc_bytes will be sent.
+  optional string error_message = 2;
+}

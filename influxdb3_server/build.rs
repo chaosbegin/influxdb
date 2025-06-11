@@ -4,9 +4,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // relative to the crate root (influxdb3_server).
     tonic_build::configure()
         .build_server(true) // Generate server code
-        .build_client(false) // Client might be in a different crate or not needed here
+        .build_client(true) // Generate client code as well (Planner might use it)
         .compile(
-            &["proto/influxdb3_replication.proto"], // Path to .proto file
+            &[
+                "proto/influxdb3_replication.proto",
+                "proto/influxdb3_distributed_query.proto", // Added new proto
+            ],
             &["proto/"], // Include directory for imports if any
         )?;
     Ok(())

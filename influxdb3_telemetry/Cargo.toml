@@ -1,3 +1,5 @@
+cargo-features = ["edition2024"]
+
 [package]
 name = "influxdb3_telemetry"
 version.workspace = true
@@ -26,4 +28,3 @@ test-log.workspace = true
 proptest.workspace = true
 mockito.workspace = true
 mockall.workspace = true
-

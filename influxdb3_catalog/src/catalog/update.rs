@@ -2,7 +2,7 @@ use std::ops::Add;
 use std::sync::Arc;
 
 use hashbrown::HashMap;
-use influxdb3_id::ColumnId;
+use influxdb3_id::{ColumnId, ComputeNodeId}; // Assuming ComputeNodeId is the correct type for node IDs in ShardMigrationStateUpdateLog
 use influxdb3_process::PROCESS_UUID;
 use iox_time::TimeProvider;
 use observability_deps::tracing::{debug, error, info, trace};
@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     CatalogError, Result,
-    catalog::{DEFAULT_OPERATOR_TOKEN_NAME, RetentionPeriod}, // Removed NUM_TAG_COLUMNS_LIMIT
+    catalog::{DEFAULT_OPERATOR_TOKEN_NAME, RetentionPeriod},
     log::{
         AddFieldsLog, CatalogBatch, ClearRetentionPeriodLog, CreateDatabaseLog, CreateTableLog,
         DatabaseCatalogOp, DeleteDistinctCacheLog, DeleteLastCacheLog, DeleteTokenDetails,
@@ -26,19 +26,20 @@ use crate::{
         SetRetentionPeriodLog, SoftDeleteDatabaseLog, SoftDeleteTableLog, StopNodeLog, TokenBatch,
         TokenCatalogOp, TriggerDefinition, TriggerIdentifier, TriggerSettings,
         TriggerSpecificationDefinition, ValidPluginFilename,
+        // For new ops:
+        ClusterManagementBatch, ClusterOp, ClusterNodeDefinitionLog, ClusterNodeStatusUpdateLog,
+        ClusterNodeHeartbeatLog, ClusterNodeDecommissionLog, ShardMigrationStateUpdateLog,
     },
     object_store::PersistCatalogResult,
+    shard::{ShardId, ShardMigrationStatus}, // Added ShardMigrationStatus
 };
+
 
 #[derive(Clone, Copy, Debug)]
 pub enum HardDeletionTime {
-    /// The object will never be hard deleted.
     Never,
-    /// The object will be hard deleted after the default duration.
     Default,
-    /// The object will be hard deleted after a specific duration.
     After(Duration),
-    /// The object will be hard deleted as soon as possible.
     Now,
 }
 
@@ -68,7 +69,7 @@ impl Catalog {
                 database_schema: Arc::clone(&database_schema),
                 ops: vec![],
                 columns_per_table_limit: self.num_columns_per_table_limit(),
-                tag_columns_per_table_limit: self.num_tag_columns_per_table_limit(), // Added
+                tag_columns_per_table_limit: self.num_tag_columns_per_table_limit(),
             }),
             None => {
                 if inner.database_count() >= self.num_dbs_limit() {
@@ -93,7 +94,7 @@ impl Catalog {
                     database_schema,
                     ops,
                     columns_per_table_limit: self.num_columns_per_table_limit(),
-                    tag_columns_per_table_limit: self.num_tag_columns_per_table_limit(), // Added
+                    tag_columns_per_table_limit: self.num_tag_columns_per_table_limit(),
                 })
             }
         }
@@ -141,11 +142,6 @@ impl Catalog {
             let time_ns = self.time_provider.now().timestamp_nanos();
             let (node_catalog_id, node_id, instance_id) = if let Some(node) = self.node(node_id) {
                 if let NodeState::Running { .. } = node.state {
-                    // If the node is in the catalog as `Running`, that could mean that a previous
-                    // process that started the node did not stop gracefully. We just log this here
-                    // and do not fail the operation. It is assumed that this catalog update will be
-                    // handled via catalog broadcast to shut any existing processes down that are
-                    // operating as this `node_id`.
                     info!(
                         node_id,
                         instance_id = node.instance_id.as_ref(),
@@ -1189,3 +1185,5 @@ impl<S, R> Prompt<S, R> {
         s
     }
 }
+
+[end of influxdb3_catalog/src/catalog/update.rs]

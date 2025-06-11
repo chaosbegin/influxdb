@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use crate::{CommonServerState, Server, http::HttpApi};
+use crate::{CommonServerState, Server, http::HttpApi, cluster::manager::ClusterManager};
 use influxdb3_authz::{AuthProvider, NoAuthAuthenticator};
 use influxdb3_internal_api::query_executor::QueryExecutor;
 use influxdb3_processing_engine::ProcessingEngineManagerImpl;
@@ -10,7 +10,7 @@ use rustls::SupportedProtocolVersion;
 use tokio::net::TcpListener;
 
 #[derive(Debug)]
-pub struct ServerBuilder<W, Q, P, T, L, E> {
+pub struct ServerBuilder<W, Q, P, T, L, E, CM> {
     common_state: CommonServerState,
     time_provider: T,
     max_request_size: usize,
@@ -20,6 +20,7 @@ pub struct ServerBuilder<W, Q, P, T, L, E> {
     listener: L,
     processing_engine: E,
     authorizer: Arc<dyn AuthProvider>,
+    cluster_manager: CM,
 }
 
 impl
@@ -30,6 +31,7 @@ impl
         NoTimeProvider,
         NoListener,
         NoProcessingEngine,
+        NoClusterManager,
     >
 {
     pub fn new(common_state: CommonServerState) -> Self {
@@ -43,11 +45,12 @@ impl
             listener: NoListener,
             authorizer: Arc::new(NoAuthAuthenticator),
             processing_engine: NoProcessingEngine,
+            cluster_manager: NoClusterManager,
         }
     }
 }
 
-impl<W, Q, P, T, L, E> ServerBuilder<W, Q, P, T, L, E> {
+impl<W, Q, P, T, L, E, CM> ServerBuilder<W, Q, P, T, L, E, CM> {
     pub fn max_request_size(mut self, max_request_size: usize) -> Self {
         self.max_request_size = max_request_size;
         self
@@ -84,12 +87,16 @@ pub struct WithListener(TcpListener);
 pub struct NoProcessingEngine;
 #[derive(Debug)]
 pub struct WithProcessingEngine(Arc<ProcessingEngineManagerImpl>);
+#[derive(Clone, Copy, Debug)]
+pub struct NoClusterManager;
+#[derive(Debug)]
+pub struct WithClusterManager(Arc<dyn ClusterManager>);
 
-impl<Q, P, T, L, E> ServerBuilder<NoWriteBuf, Q, P, T, L, E> {
+impl<Q, P, T, L, E, CM> ServerBuilder<NoWriteBuf, Q, P, T, L, E, CM> {
     pub fn write_buffer(
         self,
         wb: Arc<dyn WriteBuffer>,
-    ) -> ServerBuilder<WithWriteBuf, Q, P, T, L, E> {
+    ) -> ServerBuilder<WithWriteBuf, Q, P, T, L, E, CM> {
         ServerBuilder {
             common_state: self.common_state,
             time_provider: self.time_provider,
@@ -100,15 +107,16 @@ impl<Q, P, T, L, E> ServerBuilder<NoWriteBuf, Q, P, T, L, E> {
             listener: self.listener,
             authorizer: self.authorizer,
             processing_engine: self.processing_engine,
+            cluster_manager: self.cluster_manager,
         }
     }
 }
 
-impl<W, P, T, L, E> ServerBuilder<W, NoQueryExec, P, T, L, E> {
+impl<W, P, T, L, E, CM> ServerBuilder<W, NoQueryExec, P, T, L, E, CM> {
     pub fn query_executor(
         self,
         qe: Arc<dyn QueryExecutor>,
-    ) -> ServerBuilder<W, WithQueryExec, P, T, L, E> {
+    ) -> ServerBuilder<W, WithQueryExec, P, T, L, E, CM> {
         ServerBuilder {
             common_state: self.common_state,
             time_provider: self.time_provider,
@@ -119,12 +127,13 @@ impl<W, P, T, L, E> ServerBuilder<W, NoQueryExec, P, T, L, E> {
             listener: self.listener,
             authorizer: self.authorizer,
             processing_engine: self.processing_engine,
+            cluster_manager: self.cluster_manager,
         }
     }
 }
 
-impl<W, Q, T, L, E> ServerBuilder<W, Q, NoPersister, T, L, E> {
-    pub fn persister(self, p: Arc<Persister>) -> ServerBuilder<W, Q, WithPersister, T, L, E> {
+impl<W, Q, T, L, E, CM> ServerBuilder<W, Q, NoPersister, T, L, E, CM> {
+    pub fn persister(self, p: Arc<Persister>) -> ServerBuilder<W, Q, WithPersister, T, L, E, CM> {
         ServerBuilder {
             common_state: self.common_state,
             time_provider: self.time_provider,
@@ -135,15 +144,16 @@ impl<W, Q, T, L, E> ServerBuilder<W, Q, NoPersister, T, L, E> {
             listener: self.listener,
             authorizer: self.authorizer,
             processing_engine: self.processing_engine,
+            cluster_manager: self.cluster_manager,
         }
     }
 }
 
-impl<W, Q, P, L, E> ServerBuilder<W, Q, P, NoTimeProvider, L, E> {
+impl<W, Q, P, L, E, CM> ServerBuilder<W, Q, P, NoTimeProvider, L, E, CM> {
     pub fn time_provider(
         self,
         tp: Arc<dyn TimeProvider>,
-    ) -> ServerBuilder<W, Q, P, WithTimeProvider, L, E> {
+    ) -> ServerBuilder<W, Q, P, WithTimeProvider, L, E, CM> {
         ServerBuilder {
             common_state: self.common_state,
             time_provider: WithTimeProvider(tp),
@@ -154,12 +164,13 @@ impl<W, Q, P, L, E> ServerBuilder<W, Q, P, NoTimeProvider, L, E> {
             listener: self.listener,
             authorizer: self.authorizer,
             processing_engine: self.processing_engine,
+            cluster_manager: self.cluster_manager,
         }
     }
 }
 
-impl<W, Q, P, T, E> ServerBuilder<W, Q, P, T, NoListener, E> {
-    pub fn tcp_listener(self, listener: TcpListener) -> ServerBuilder<W, Q, P, T, WithListener, E> {
+impl<W, Q, P, T, E, CM> ServerBuilder<W, Q, P, T, NoListener, E, CM> {
+    pub fn tcp_listener(self, listener: TcpListener) -> ServerBuilder<W, Q, P, T, WithListener, E, CM> {
         ServerBuilder {
             common_state: self.common_state,
             time_provider: self.time_provider,
@@ -170,15 +181,16 @@ impl<W, Q, P, T, E> ServerBuilder<W, Q, P, T, NoListener, E> {
             listener: WithListener(listener),
             authorizer: self.authorizer,
             processing_engine: self.processing_engine,
+            cluster_manager: self.cluster_manager,
         }
     }
 }
 
-impl<W, Q, P, T, L> ServerBuilder<W, Q, P, T, L, NoProcessingEngine> {
+impl<W, Q, P, T, L, CM> ServerBuilder<W, Q, P, T, L, NoProcessingEngine, CM> {
     pub fn processing_engine(
         self,
         processing_engine: Arc<ProcessingEngineManagerImpl>,
-    ) -> ServerBuilder<W, Q, P, T, L, WithProcessingEngine> {
+    ) -> ServerBuilder<W, Q, P, T, L, WithProcessingEngine, CM> {
         ServerBuilder {
             common_state: self.common_state,
             time_provider: self.time_provider,
@@ -189,6 +201,27 @@ impl<W, Q, P, T, L> ServerBuilder<W, Q, P, T, L, NoProcessingEngine> {
             listener: self.listener,
             authorizer: self.authorizer,
             processing_engine: WithProcessingEngine(processing_engine),
+            cluster_manager: self.cluster_manager,
+        }
+    }
+}
+
+impl<W, Q, P, T, L, E> ServerBuilder<W, Q, P, T, L, E, NoClusterManager> {
+    pub fn cluster_manager(
+        self,
+        cluster_manager: Arc<dyn ClusterManager>,
+    ) -> ServerBuilder<W, Q, P, T, L, E, WithClusterManager> {
+        ServerBuilder {
+            common_state: self.common_state,
+            time_provider: self.time_provider,
+            max_request_size: self.max_request_size,
+            write_buffer: self.write_buffer,
+            query_executor: self.query_executor,
+            persister: self.persister,
+            listener: self.listener,
+            authorizer: self.authorizer,
+            processing_engine: self.processing_engine,
+            cluster_manager: WithClusterManager(cluster_manager),
         }
     }
 }
@@ -201,6 +234,7 @@ impl
         WithTimeProvider,
         WithListener,
         WithProcessingEngine,
+        WithClusterManager, // Added WithClusterManager
     >
 {
     pub async fn build<'a>(
@@ -212,6 +246,7 @@ impl
         let persister = Arc::clone(&self.persister.0);
         let authorizer = Arc::clone(&self.authorizer);
         let processing_engine = Arc::clone(&self.processing_engine.0);
+        let cluster_manager = Arc::clone(&self.cluster_manager.0); // Clone ClusterManager
 
         Arc::clone(&processing_engine)
             .start_triggers()
@@ -230,6 +265,7 @@ impl
             processing_engine,
             self.max_request_size,
             Arc::clone(&authorizer),
+            cluster_manager, // Pass ClusterManager to HttpApi::new
         ));
         Server {
             common_state: self.common_state,

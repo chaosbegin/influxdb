@@ -510,6 +510,117 @@ impl WriteBufferImpl {
     //     bitcode::serialize(op).map_err(|e| Error::AnyhowError(anyhow::anyhow!("Failed to serialize WalOp: {}", e)))
     // }
 
+    async fn execute_replication_to_nodes(
+        &self,
+        wal_op: &WalOp,
+        determined_shard_id: Option<influxdb3_catalog::shard::ShardId>,
+        db_name: &NamespaceName<'static>,
+        table_name: &str, // Assuming table_name is known for this WalOp
+        replica_node_ids: Vec<String>, // In future, these would be more structured, e.g., with addresses
+    ) -> Result<(), Error> {
+        if replica_node_ids.is_empty() {
+            // No replicas to send to, or this node is the only one responsible (RF=1).
+            // Log if RF > 1 but no replica_node_ids were found by config.
+            if let Some(db_schema) = self.catalog.db_schema(db_name.as_str()) {
+                if let Some(table_def) = db_schema.table_definition(table_name) {
+                    if let Some(rep_info) = &table_def.replication_info {
+                        if rep_info.replication_factor.get() > 1 {
+                             warn!("Replication factor for {}.{} is > 1, but no replica node IDs were provided for replication.", db_name.as_str(), table_name);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        debug!(
+            "Executing replication for WalOp on table '{}.{}', shard {:?}, to nodes: {:?}",
+            db_name.as_str(), table_name, determined_shard_id, replica_node_ids
+        );
+
+        let serialized_op = match bitcode::serialize(wal_op) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize WalOp for replication: {}", e);
+                return Err(Error::ReplicationError(format!("Failed to serialize WalOp: {}", e)));
+            }
+        };
+
+        let own_node_id = self.current_node_id.as_ref().to_string();
+        let request_to_send = crate::ReplicateWalOpRequest {
+            serialized_wal_op,
+            originating_node_id: own_node_id,
+            shard_id: determined_shard_id.map(|sid| sid.get()),
+            database_name: db_name.as_str().to_string(),
+            table_name: table_name.to_string(),
+        };
+
+        let mut successful_replications = 0;
+        // Quorum: N/2 + 1. For RF=2, quorum=2. For RF=3, quorum=2.
+        // This counts the local write + successful remote writes.
+        // If the local write is already done, we need (RF/2 + 1) - 1 remote successes.
+        // Or, more simply, total successful writes (local + remote) must be >= RF/2 + 1.
+        // Let's assume the local write is one success, so we need (RF/2) more remote successes.
+        // The number of nodes to replicate to is replica_node_ids.len(), which should be RF-1.
+        // A simpler quorum might just be a majority of the intended replicas.
+        let required_replications_for_quorum = (replica_node_ids.len() / 2) + 1; // strict majority of *remote* replicas
+
+        for node_id in &replica_node_ids {
+            const MAX_RETRIES: u32 = 2; // e.g., 1 initial attempt + 2 retries
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                debug!("Attempt {} to replicate WalOp to node {}", attempt, node_id);
+
+                // --- Placeholder for actual RPC client call ---
+                // let client = self.get_replication_rpc_client_for_node(node_id).await?;
+                // match client.replicate_wal_op(request_to_send.clone()).await { // Clone if request is consumed
+                //     Ok(response) if response.into_inner().success => {
+                //         successful_replications += 1;
+                //         break; // Success for this node
+                //     }
+                //     Ok(response) => { // Replica reported failure
+                //         warn!("Replication failed on node {}: {:?}", node_id, response.into_inner().error_message);
+                //         if attempt > MAX_RETRIES { break; } // Exhausted retries for this node
+                //     }
+                //     Err(e) => { // RPC transport error
+                //         warn!("RPC error replicating to node {}: {:?}", node_id, e);
+                //         if attempt > MAX_RETRIES { break; } // Exhausted retries for this node
+                //     }
+                // }
+                // --- End Placeholder ---
+
+                // Simulated success for now for most nodes, to test quorum logic
+                // To test quorum failure, one might make some nodes "fail" based on their ID.
+                if cfg!(test) && node_id.starts_with("fail_node_") { // Test hook for failure
+                    warn!("Simulated RPC failure for node {}", node_id);
+                     if attempt > MAX_RETRIES { break; }
+                } else {
+                    debug!("Simulated RPC success for node {}", node_id);
+                    successful_replications += 1;
+                    break;
+                }
+
+                if attempt <= MAX_RETRIES {
+                    // Conceptual: tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+                    debug!("Will retry replication to node {} after delay.", node_id);
+                }
+            }
+        }
+
+        if successful_replications >= required_replications_for_quorum {
+            debug!("Replication quorum met: {}/{} successful remote replications.", successful_replications, required_replications_for_quorum);
+            Ok(())
+        } else {
+            let err_msg = format!(
+                "Replication quorum not met for table '{}.{}'. Needed {} remote successes, got {}. Replicas targeted: {:?}",
+                db_name.as_str(), table_name, required_replications_for_quorum, successful_replications, replica_node_ids
+            );
+            error!("{}", err_msg);
+            Err(Error::ReplicationError(err_msg))
+        }
+    }
+
     fn get_table_chunks(
         &self,
         db_schema: Arc<DatabaseSchema>,

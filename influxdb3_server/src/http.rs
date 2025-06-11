@@ -533,6 +533,8 @@ impl IntoResponse for Error {
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
+use crate::cluster::manager::ClusterManager; // Added for the new field
+
 #[derive(Debug)]
 pub(crate) struct HttpApi {
     common_state: CommonServerState,
@@ -543,6 +545,7 @@ pub(crate) struct HttpApi {
     max_request_bytes: usize,
     authorizer: Arc<dyn AuthProvider>,
     legacy_write_param_unifier: SingleTenantRequestUnifier,
+    cluster_manager: Arc<dyn ClusterManager>, // Added field
 }
 
 impl HttpApi {
@@ -554,6 +557,7 @@ impl HttpApi {
         processing_engine: Arc<ProcessingEngineManagerImpl>,
         max_request_bytes: usize,
         authorizer: Arc<dyn AuthProvider>,
+        cluster_manager: Arc<dyn ClusterManager>, // Added parameter
     ) -> Self {
         // there is a global authentication setup, passing in auth provider just does the same
         // check twice. So, instead we pass in a NoAuthAuthenticator to avoid authenticating twice.
@@ -568,6 +572,7 @@ impl HttpApi {
             authorizer,
             legacy_write_param_unifier,
             processing_engine,
+            cluster_manager, // Stored
         }
     }
 }

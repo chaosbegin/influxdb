@@ -9,6 +9,7 @@ pub mod serialize;
 pub mod snapshot;
 pub mod shard;
 pub mod replication;
+pub mod node; // Added module
 
 pub use error::CatalogError;
 pub(crate) type Result<T, E = CatalogError> = std::result::Result<T, E>;

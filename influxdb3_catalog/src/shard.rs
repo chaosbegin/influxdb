@@ -45,8 +45,16 @@ pub struct ShardDefinition {
     /// In a simple setup, this might be a single node.
     /// For replicated setups, this could be multiple nodes.
     pub node_ids: Vec<NodeId>,
+    /// Current migration status of the shard.
+    pub migration_status: Option<ShardMigrationStatus>,
+    /// If migrating, these are the nodes the shard is intended to move to.
+    pub migration_target_node_ids: Option<Vec<NodeId>>,
+    /// If migrating, these are the nodes the shard is moving from (for cleanup purposes post-migration).
+    pub migration_source_node_ids: Option<Vec<NodeId>>,
+    /// Version of this shard definition, incremented on change.
+    pub version: u64,
     // Add other shard-specific information here, e.g.:
-    // - Shard status (e.g., active, inactive, under maintenance)
+    // - Shard operational status (e.g., active, inactive, under maintenance)
     // - Storage location (if not implicitly determined by node_ids)
     // - Size of the shard
 }
@@ -57,6 +65,28 @@ impl ShardDefinition {
             id,
             time_range,
             node_ids,
+            migration_status: Some(ShardMigrationStatus::Stable),
+            migration_target_node_ids: None,
+            migration_source_node_ids: None,
+            version: 0,
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardMigrationStatus {
+    Stable,          // Shard is not currently being migrated.
+    Preparing,       // Migration initiated, source/target nodes preparing.
+    StreamingData,   // Historical data (e.g., Parquet files) is being copied/made available.
+    WalSync,         // Delta (WAL entries) is being synchronized.
+    AwaitingCutover, // Data sync complete, ready for final ownership switch.
+    Finalizing,      // Catalog updates and cleanup in progress.
+    Aborting,        // Migration is being rolled back.
+    Failed,          // Migration attempt failed.
+}
+
+impl Default for ShardMigrationStatus {
+    fn default() -> Self {
+        Self::Stable
     }
 }
