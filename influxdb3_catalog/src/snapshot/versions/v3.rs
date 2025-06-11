@@ -27,6 +27,20 @@ pub struct CatalogSnapshot {
     pub(crate) tokens: RepositorySnapshot<TokenId, TokenInfoSnapshot>,
     pub(crate) catalog_id: Arc<str>,
     pub(crate) catalog_uuid: Uuid,
+    // Added for cluster node membership
+    #[serde(default)] // To maintain compatibility with older snapshots lacking this field
+    pub(crate) cluster_nodes: RepositorySnapshot<NodeId, ClusterNodeDefinitionSnapshot>,
+}
+
+/// Snapshot representation of a ClusterNodeDefinition
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct ClusterNodeDefinitionSnapshot {
+    pub(crate) id: NodeId,
+    pub(crate) rpc_address: String,
+    pub(crate) http_address: String,
+    pub(crate) status: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
 }
 
 impl VersionedFileType for CatalogSnapshot {

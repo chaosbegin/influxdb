@@ -26,14 +26,51 @@ use crate::{
     catalog::{CatalogSequenceNumber, RetentionPeriod},
     replication::{ReplicationFactor, ReplicationInfo},
     shard::{ShardDefinition, ShardId, ShardTimeRange},
+    cluster_node::ClusterNodeDefinition, // Added
     CatalogError, Result, serialize::VersionedFileType,
 };
 
+
+// --- Cluster Node Operations ---
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AddClusterNodeLog {
+    pub node: ClusterNodeDefinition,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoveClusterNodeLog {
+    pub node_id: NodeId,
+    pub removed_at_ts: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateClusterNodeStatusLog {
+    pub node_id: NodeId,
+    pub status: String,
+    pub updated_at_ts: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ClusterNodeCatalogOp {
+    AddClusterNode(AddClusterNodeLog),
+    RemoveClusterNode(RemoveClusterNodeLog),
+    UpdateClusterNodeStatus(UpdateClusterNodeStatusLog),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct ClusterNodeBatch {
+    pub time_ns: i64,
+    pub ops: Vec<ClusterNodeCatalogOp>,
+}
+
+
+// --- Top-level Catalog Batch ---
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CatalogBatch {
-    Node(NodeBatch),
+    Node(NodeBatch), // For existing node registration (compute nodes)
     Database(DatabaseBatch),
     Token(TokenBatch),
+    ClusterNode(ClusterNodeBatch), // For cluster membership nodes
 }
 
 impl CatalogBatch {
@@ -70,30 +107,28 @@ impl CatalogBatch {
             CatalogBatch::Node(node_batch) => node_batch.ops.len(),
             CatalogBatch::Database(database_batch) => database_batch.ops.len(),
             CatalogBatch::Token(token_batch) => token_batch.ops.len(),
+            CatalogBatch::ClusterNode(batch) => batch.ops.len(),
         }
     }
 
     pub fn as_database(&self) -> Option<&DatabaseBatch> {
         match self {
-            CatalogBatch::Node(_) => None,
             CatalogBatch::Database(database_batch) => Some(database_batch),
-            CatalogBatch::Token(_) => None,
+            _ => None,
         }
     }
 
     pub fn to_database(self) -> Option<DatabaseBatch> {
         match self {
-            CatalogBatch::Node(_) => None,
             CatalogBatch::Database(database_batch) => Some(database_batch),
-            CatalogBatch::Token(_) => None,
+            _ => None,
         }
     }
 
     pub fn as_node(&self) -> Option<&NodeBatch> {
         match self {
             CatalogBatch::Node(node_batch) => Some(node_batch),
-            CatalogBatch::Database(_) => None,
-            CatalogBatch::Token(_) => None,
+            _ => None,
         }
     }
 }
@@ -161,7 +196,10 @@ impl Ord for OrderedCatalogBatch {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NodeCatalogOp {
     RegisterNode(RegisterNodeLog),
-    StopNode(StopNodeLog),
+    UpdateNode(UpdateNodeLog), // For address or other non-state changes
+    StopNode(StopNodeLog), // Specifically for graceful shutdown
+    RemoveNode(RemoveNodeLog), // For explicit removal
+    UpdateNodeState(UpdateNodeStateLog), // For other state changes like Draining, Joining
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -210,11 +248,45 @@ impl DatabaseCatalogOp {
 pub struct RegisterNodeLog {
     pub node_id: Arc<str>,
     pub instance_id: Arc<str>,
-    pub registered_time_ns: i64,
+    pub registered_time_ns: i64, // Also acts as created_at for the registration event
     pub core_count: u64,
     pub mode: Vec<NodeMode>,
+    pub rpc_address: Arc<str>,   // Added
+    pub http_address: Arc<str>,  // Added
     pub process_uuid: Uuid,
+    // updated_at_ts will be the timestamp of the log entry itself
 }
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateNodeLog {
+    // node_id is part of NodeBatch
+    pub rpc_address: Option<Arc<str>>,  // Option to update selectively
+    pub http_address: Option<Arc<str>>, // Option to update selectively
+    pub core_count: Option<u64>,
+    pub mode: Option<Vec<NodeMode>>,
+    pub updated_at_ts: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoveNodeLog {
+    // node_id is part of NodeBatch
+    pub removed_at_ts: i64,
+}
+
+// NodeState in catalog.rs is an enum Running/Stopped.
+// For more granular cluster lifecycle states (e.g. "Draining", "Joining"),
+// we might need to extend NodeState or add a new field to NodeDefinition.
+// This log op assumes NodeState enum will be extended.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateNodeStateLog {
+    // node_id is part of NodeBatch
+    pub new_state_reason: String, // e.g., "Draining for maintenance", "Joining" - could be an enum too
+    pub state_time_ns: i64,       // Timestamp for this state change
+    // Potentially the new crate::catalog::NodeState itself if it becomes more complex
+    // pub new_node_state: crate::catalog::NodeState,
+    // For now, using a string and relying on handler logic to map to NodeState or a new field.
+}
+
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StopNodeLog {

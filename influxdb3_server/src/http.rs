@@ -69,6 +69,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 mod v1;
+pub(crate) mod cluster; // Added cluster module
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1842,6 +1843,9 @@ pub(crate) async fn route_request(
     let content_length = req.headers().get("content-length").cloned();
 
     let response = match (method.clone(), path) {
+        // Cluster Management APIs (example, adjust path as needed)
+        (Method::GET, all_paths::API_V3_CLUSTER_NODES) => cluster::handle_list_cluster_nodes(State(http_server)).await.into_response(),
+
         (Method::DELETE, all_paths::API_V3_CONFIGURE_TOKEN) => http_server.delete_token(req).await,
         (Method::POST, all_paths::API_V3_CONFIGURE_ADMIN_TOKEN) => {
             http_server.create_admin_token(req).await

@@ -176,6 +176,7 @@ pub struct WriteBufferImpl {
     current_node_id: Arc<str>, // Added for node identification in replication
     /// The number of files we will accept for a query
     query_file_limit: usize,
+    mock_replication_client: crate::replication_client::MockReplicationClient, // Added field
     #[cfg(test)]
     last_replicate_wal_op_request_for_test: std::sync::Mutex<Option<crate::ReplicateWalOpRequest>>, // Test only
 }
@@ -327,6 +328,7 @@ impl WriteBufferImpl {
             metrics: WriteMetrics::new(&metric_registry),
             current_node_id, // Store new field
             query_file_limit: query_file_limit.unwrap_or(432),
+            mock_replication_client: crate::replication_client::MockReplicationClient::new(), // Instantiate
             #[cfg(test)]
             last_replicate_wal_op_request_for_test: std.sync::Mutex::new(None), // Test only
         });
@@ -435,31 +437,95 @@ impl WriteBufferImpl {
                         if let Some(table_def) = db_schema.table_definition(table_name_str) {
                             if let Some(replication_info) = &table_def.replication_info {
                                 if replication_info.replication_factor.get() > 1 {
-                                    // In a real scenario, identify replica nodes from catalog/config
-                                    let replica_nodes: Vec<String> = vec![]; // Placeholder
-                                    if !replica_nodes.is_empty() {
-                                        debug!(
-                                            "Replicating WalOp for table '{}.{}' to nodes: {:?}. ShardId: {:?}",
-                                            db_name.as_str(), table_name_str, replica_nodes, determined_shard_id
-                                        );
-                                        // let serialized_op = self.serialize_wal_op(&wal_op)?; // Placeholder method
-                                        // match self.replicate_wal_op_to_nodes(replica_nodes, serialized_op).await {
-                                        //     Ok(_) => { /* replication_successful = true; */ }
-                                        //     Err(e) => {
-                                        //         error!("Failed to replicate WalOp: {}", e);
-                                        //         replication_successful = false;
-                                        //         // TODO: Handle replication failure (e.g., retry, mark as degraded, error to client?)
-                                        //         // For now, we might proceed with local write or error based on policy.
-                                        //         // This subtask assumes a simplified initial implementation.
-                                        //         return Err(Error::ReplicationError(format!("Failed to replicate to nodes: {}", e)));
-                                        //     }
-                                        // }
-                                        // For this subtask, we'll simulate an error if replication is configured but no nodes are (conceptually) found or reachable.
-                                        // This is a placeholder for actual client calls.
-                                        // To make this testable without actual networking, one might check a mock/flag.
-                                        // For now, just logging. A real implementation would call a replication client.
-                                        warn!("Placeholder: Replication configured for {}.{} but actual replication call is not implemented.", db_name.as_str(), table_name_str);
+                                    let factor = replication_info.replication_factor.get() as usize;
+                                    // Conceptual: Get actual replica node addresses from shard_def or a cluster state service.
+                                    // For mock testing, we'll just create some dummy addresses.
+                                    // The number of replica_nodes should ideally be `factor - 1` (excluding self).
+                                    // Or, if `node_ids` on `ShardDefinition` lists all holders (primary + replicas),
+                                    // then filter out self.current_node_id.
+                                    // For simplicity, let's assume `table_def.shards` (if `determined_shard_id` is Some)
+                                    // or a general config gives us the list of target nodes for replication.
+                                    // Here, we'll use a placeholder list of N-1 nodes.
 
+                                    let mut conceptual_replica_nodes = Vec::new();
+                                    if factor > 1 {
+                                        // Create factor-1 dummy node names for testing quorum logic.
+                                        // In reality, these would come from shard assignments in the catalog.
+                                        // And we would not replicate to self.current_node_id.
+                                        for i in 0..(factor -1) { // factor-1 other nodes
+                                            conceptual_replica_nodes.push(format!("replica_node_{}", i+1));
+                                        }
+                                    }
+
+                                    if !conceptual_replica_nodes.is_empty() {
+                                        debug!(
+                                            "Attempting to replicate WalOp for table '{}.{}' to nodes: {:?}. ShardId: {:?}. Replication Factor: {}",
+                                            database.as_str(), table_name_str_ref, conceptual_replica_nodes, determined_shard_id, factor
+                                        );
+
+                                        let serialized_op = match bitcode::serialize(&wal_op) {
+                                            Ok(bytes) => bytes,
+                                            Err(e) => {
+                                                error!("Failed to serialize WalOp for replication: {}", e);
+                                                // This is a critical local error, should probably not proceed.
+                                                return Err(Error::ReplicationError(format!("Failed to serialize WalOp for replication: {}", e)));
+                                            }
+                                        };
+
+                                        let own_node_id = self.current_node_id.as_ref().to_string();
+                                        let request = crate::ReplicateWalOpRequest {
+                                            serialized_wal_op: serialized_op,
+                                            originating_node_id: own_node_id,
+                                            shard_id: determined_shard_id.map(|sid| sid.get()),
+                                            database_name: database.as_str().to_string(),
+                                            table_name: table_name_str_ref.clone(),
+                                        };
+
+                                        #[cfg(test)]
+                                        {
+                                            *self.last_replicate_wal_op_request_for_test.lock().unwrap() = Some(request.clone());
+                                        }
+
+                                        let mut successful_replications = 0;
+                                        for node_addr in &conceptual_replica_nodes {
+                                            // In real code, replace with actual gRPC client call
+                                            match self.mock_replication_client.replicate_wal_op(node_addr, &request).await {
+                                                Ok(response) if response.success => {
+                                                    successful_replications += 1;
+                                                }
+                                                Ok(response) => {
+                                                    warn!("Replica {} failed for table {}.{}: {:?}", node_addr, database.as_str(), table_name_str_ref, response.error_message);
+                                                }
+                                                Err(e) => {
+                                                    warn!("RPC error to replica {} for table {}.{}: {:?}", node_addr, database.as_str(), table_name_str_ref, e);
+                                                }
+                                            }
+                                        }
+
+                                        // Quorum is N/2 + 1 for the *writes* (local write is one, so N-1 replicas)
+                                        // So, for factor F, we need (F/2 + 1) total successes.
+                                        // Local write is one success. So, we need (F/2 + 1) - 1 successful remote replications.
+                                        // Or, more simply, total successes (local + remote) must be >= quorum.
+                                        // Local write counts as 1 success towards the quorum.
+                                        let required_quorum = (factor / 2) + 1;
+                                        if (successful_replications + 1) < required_quorum { // +1 for the local write
+                                            replication_successful = false;
+                                            let err_msg = format!(
+                                                "Quorum not met for table {}.{}: {}/{} successful replications ({} remote successes, 1 local). Replication factor {}",
+                                                database.as_str(), table_name_str_ref,
+                                                successful_replications + 1, required_quorum, successful_replications,
+                                                factor
+                                            );
+                                            error!("{}", err_msg);
+                                            return Err(Error::ReplicationError(err_msg));
+                                        } else {
+                                            debug!("Quorum met for table {}.{}: {}/{} successful replications.", database.as_str(), table_name_str_ref, successful_replications + 1, required_quorum);
+                                        }
+
+                                    } else if factor > 1 { // Replication factor > 1 but no replica nodes found/configured
+                                         warn!("Replication configured for {}.{} (factor {}), but no replica nodes to send to. Proceeding with local write only.", database.as_str(), table_name_str_ref, factor);
+                                         // Depending on policy, this might be an error or just a warning.
+                                         // For now, assume local write is acceptable if no replicas are defined/found.
                                     }
                                 }
                             }
@@ -1994,9 +2060,9 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_write_lp_with_replication_placeholder() {
+    async fn test_write_lp_replication_request_construction() { // Renamed test
         let object_store = Arc::new(InMemory::new());
-        let (buf, _metrics) = setup_with_metrics( // Using setup_with_metrics for simplicity
+        let (buf, _metrics) = setup_with_metrics(
             Time::from_timestamp_nanos(0),
             Arc::clone(&object_store),
             WalConfig::test_config(),
