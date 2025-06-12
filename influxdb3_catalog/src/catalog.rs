@@ -54,7 +54,7 @@ use crate::log::{
     BeginShardMigrationOutLog,
     ClearRetentionPeriodLog, CommitShardMigrationOnTargetLog,
     CreateAdminTokenDetails, CreateDatabaseLog, DatabaseBatch,
-    DatabaseCatalogOp, FinalizeShardMigrationOnSourceLog,
+    DatabaseCatalogOp, FinalizeShardMigrationOnSourceLog, MarkShardMigrationFailedLog,
     NodeBatch, NodeCatalogOp, NodeMode, RegenerateAdminTokenDetails,
     RegisterNodeLog, RemoveNodeLog,
     SetRetentionPeriodLog, StopNodeLog, TokenBatch, TokenCatalogOp,
@@ -300,6 +300,122 @@ impl Catalog {
         }).await?;
         Ok(())
     }
+
+    // --- WAL Orchestration State Methods ---
+    pub async fn mark_source_data_flushed(&self, db_name: &str, table_name: &str, shard_id: &ShardId, targets: Vec<NodeId>) -> Result<()> {
+        self.update_shard_migration_status(db_name, table_name, shard_id, ShardMigrationStatus::SourceDataFlushed { targets }).await
+    }
+
+    pub async fn mark_target_bootstrapped(&self, db_name: &str, table_name: &str, shard_id: &ShardId, source_node_id: NodeId, target_node_id: NodeId) -> Result<()> {
+        self.update_shard_migration_status(db_name, table_name, shard_id, ShardMigrationStatus::TargetBootstrapped { source: source_node_id, target: target_node_id }).await
+    }
+
+    pub async fn mark_target_wal_syncing(&self, db_name: &str, table_name: &str, shard_id: &ShardId, source_node_id: NodeId, target_node_id: NodeId) -> Result<()> {
+        self.update_shard_migration_status(db_name, table_name, shard_id, ShardMigrationStatus::TargetWalSyncing { source: source_node_id, target: target_node_id }).await
+    }
+
+    pub async fn mark_target_ready_for_cutover(&self, db_name: &str, table_name: &str, shard_id: &ShardId, source_node_id: NodeId, target_node_id: NodeId) -> Result<()> {
+        self.update_shard_migration_status(db_name, table_name, shard_id, ShardMigrationStatus::TargetReadyForCutover { source: source_node_id, target: target_node_id }).await
+    }
+
+    // --- Parquet File Listing for Rebalancing ---
+    // TODO: Replace this with a real implementation that queries persisted catalog state or WriteBuffer state.
+    // For now, this provides correctly formatted paths for the orchestrator to use.
+    // This is a placeholder for influxdb3_write::ParquetFile, as we don't have direct access to that type here
+    // without adding a circular dependency or moving types around significantly.
+    // The key is the `path` field for the orchestrator.
+    #[derive(Debug, Clone)]
+    pub struct TempParquetFilePlaceholder {
+        pub id: u64, // Simplified from Uuid for this placeholder
+        pub db_name: Arc<str>,
+        pub table_name: Arc<str>,
+        pub shard_id: ShardId,
+        pub path: String,
+        pub size_bytes: u64,
+        pub row_count: u64,
+        pub min_time: i64,
+        pub max_time: i64,
+        // Other fields like `sequencer_id`, `chunk_id`, `chunk_order` are omitted for simplicity here
+    }
+
+    pub async fn list_parquet_files_for_shard(
+        &self,
+        db_name_str: &str,
+        table_name_str: &str,
+        shard_id: ShardId,
+    ) -> Result<Vec<TempParquetFilePlaceholder>> {
+        let db_id = self.db_name_to_id(db_name_str)
+            .ok_or_else(|| CatalogError::DatabaseNotFound(db_name_str.to_string()))?;
+
+        let db_schema = self.db_schema_by_id(&db_id)
+            .ok_or_else(|| CatalogError::DatabaseNotFound(db_name_str.to_string()))?;
+
+        let table_def = db_schema.table_definition(table_name_str)
+            .ok_or_else(|| CatalogError::TableNotFound {
+                db_name: Arc::from(db_name_str),
+                table_name: Arc::from(table_name_str)
+            })?;
+
+        let shard_def = table_def.shards.get_by_id(&shard_id)
+            .ok_or_else(|| CatalogError::ShardNotFound { shard_id, table_id: table_def.table_id })?;
+
+        // Use the first node_id as the conceptual primary owner for path construction.
+        // In a real scenario, this would be more nuanced, but for path simulation it's okay.
+        let primary_owner_node_id = shard_def.node_ids.first()
+            .ok_or_else(|| CatalogError::InternalError(format!("Shard {} has no assigned nodes", shard_id.get())))?;
+
+        let conceptual_uuid_str1 = "018f9a63-0000-0000-0000-000000000001"; // Fixed UUID for simplicity
+        let conceptual_uuid_str2 = "018f9a63-0000-0000-0000-000000000002";
+
+        let file1_path = format!(
+            "{}/{}/{}/{}/{}/part-{:010}-{:04}-{}.parquet",
+            primary_owner_node_id.get(), // Node ID part of the path
+            db_schema.name(),
+            table_def.table_name,
+            shard_id.get(),
+            0, // Conceptual chunk_time or similar partitioning key part of path
+            1, // Conceptual sequence number
+            conceptual_uuid_str1
+        );
+
+        let file2_path = format!(
+            "{}/{}/{}/{}/{}/part-{:010}-{:04}-{}.parquet",
+            primary_owner_node_id.get(),
+            db_schema.name(),
+            table_def.table_name,
+            shard_id.get(),
+            0,
+            2,
+            conceptual_uuid_str2
+        );
+
+        // Populate with some placeholder values
+        let files = vec![
+            TempParquetFilePlaceholder {
+                id: 1,
+                db_name: Arc::clone(&db_schema.name),
+                table_name: Arc::clone(&table_def.table_name),
+                shard_id,
+                path: file1_path,
+                size_bytes: 1024 * 1024, // 1MB
+                row_count: 10000,
+                min_time: shard_def.time_range.start_time,
+                max_time: shard_def.time_range.end_time / 2, // Arbitrary split
+            },
+            TempParquetFilePlaceholder {
+                id: 2,
+                db_name: Arc::clone(&db_schema.name),
+                table_name: Arc::clone(&table_def.table_name),
+                shard_id,
+                path: file2_path,
+                size_bytes: 2 * 1024 * 1024, // 2MB
+                row_count: 20000,
+                min_time: shard_def.time_range.end_time / 2 + 1, // Arbitrary split
+                max_time: shard_def.time_range.end_time,
+            },
+        ];
+        Ok(files)
+    }
 }
 
 async fn create_internal_db(catalog: &Catalog) { /* ... */ }
@@ -311,6 +427,7 @@ impl Catalog { /* Test constructors */
 
 impl TokenProvider for Catalog { /* ... */ fn get_token(&self, _token_hash: Vec<u8>) -> Option<Arc<TokenInfo>> { None } }
 impl ProcessingEngineMetrics for Catalog { /* ... */ fn num_triggers(&self) -> (u64, u64, u64, u64) { (0,0,0,0) } }
+
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Repository<I: CatalogId, R: CatalogResource> { /* ... */ pub(crate) repo: SerdeVecMap<I, Arc<R>>, pub(crate) id_name_map: BiHashMap<I, Arc<str>>, pub(crate) next_id: I }
@@ -457,7 +574,7 @@ impl NodeDefinition { pub fn new(id: NodeId, node_name: Arc<str>, instance_id: A
 
 #[cfg(test)]
 mod tests { /* ... all existing tests ... */
-    use crate::{log::{FieldDataType, LastCacheSize, LastCacheTtl, MaxAge, MaxCardinality, create, BeginShardMigrationOutLog, CommitShardMigrationOnTargetLog, FinalizeShardMigrationOnSourceLog, UpdateShardMigrationStatusLog}, object_store::CatalogFilePath, serialize::{serialize_catalog_file, verify_and_deserialize_catalog_checkpoint_file}, shard::ShardMigrationStatus}; // Added ShardMigrationStatus and relevant logs
+    use crate::{log::{FieldDataType, LastCacheSize, LastCacheTtl, MaxAge, MaxCardinality, create, BeginShardMigrationOutLog, CommitShardMigrationOnTargetLog, FinalizeShardMigrationOnSourceLog, UpdateShardMigrationStatusLog}, object_store::CatalogFilePath, serialize::{serialize_catalog_file, verify_and_deserialize_catalog_checkpoint_file}, shard::ShardMigrationStatus};
     use super::*;
     use influxdb3_test_helpers::object_store::RequestCountedObjectStore;
     use iox_time::MockProvider;
@@ -528,6 +645,24 @@ mod tests { /* ... all existing tests ... */
         assert_eq!(s_def.migration_status, Some(ShardMigrationStatus::MigratingOutTo(vec![node2])));
         assert_eq!(s_def.node_ids, vec![node1]); // Still on source
 
+        // Test new WAL orchestration states
+        catalog.mark_source_data_flushed(db_name, table_name, &shard_id, vec![node2]).await.unwrap();
+        let s_def = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().shards.get_by_id(&shard_id).unwrap();
+        assert_eq!(s_def.migration_status, Some(ShardMigrationStatus::SourceDataFlushed { targets: vec![node2] }));
+
+        catalog.mark_target_bootstrapped(db_name, table_name, &shard_id, node1, node2).await.unwrap();
+        let s_def = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().shards.get_by_id(&shard_id).unwrap();
+        assert_eq!(s_def.migration_status, Some(ShardMigrationStatus::TargetBootstrapped { source: node1, target: node2 }));
+
+        catalog.mark_target_wal_syncing(db_name, table_name, &shard_id, node1, node2).await.unwrap();
+        let s_def = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().shards.get_by_id(&shard_id).unwrap();
+        assert_eq!(s_def.migration_status, Some(ShardMigrationStatus::TargetWalSyncing { source: node1, target: node2 }));
+
+        catalog.mark_target_ready_for_cutover(db_name, table_name, &shard_id, node1, node2).await.unwrap();
+        let s_def = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().shards.get_by_id(&shard_id).unwrap();
+        assert_eq!(s_def.migration_status, Some(ShardMigrationStatus::TargetReadyForCutover { source: node1, target: node2 }));
+
+
         // 2. Commit on target (node2)
         // (Simulating this call as if node2 confirmed it has the data from node1)
         let commit_res = catalog.commit_shard_migration_on_target(db_name, table_name, &shard_id, node2, node1).await;
@@ -537,7 +672,7 @@ mod tests { /* ... all existing tests ... */
         let table_def = db_schema.table_definition(table_name).unwrap();
         let s_def = table_def.shards.get_by_id(&shard_id).unwrap();
         assert_eq!(s_def.node_ids, vec![node1, node2]); // Both nodes now listed
-        // Migration status might still be MigratingOutTo, or could be a new intermediate state.
+        // Migration status might still be TargetReadyForCutover, or could be a new intermediate state.
         // Current TableUpdate impl for CommitShardMigrationOnTargetLog only adds to node_ids.
 
         // 3. Finalize on source (node1 tells catalog it's done, shard now fully on node2)
@@ -563,6 +698,62 @@ mod tests { /* ... all existing tests ... */
         let s_def = table_def.shards.get_by_id(&shard_id).unwrap();
         assert_eq!(s_def.migration_status, Some(ShardMigrationStatus::MigratingInFrom(node3)));
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_parquet_files_for_shard_placeholder() {
+        let catalog = Arc::new(Catalog::new_in_memory("list_files_host").await.unwrap());
+        let db_name = "test_db";
+        let table_name = "test_table";
+
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tag_k"], &[("field_v", FieldDataType::Integer)]).await.unwrap();
+
+        let node_id = NodeId::new(1);
+        let shard_id_val = ShardId::new(10);
+        let time_range = ShardTimeRange { start_time: 0, end_time: 1000 };
+        let shard_def = ShardDefinition::new(shard_id_val, time_range, vec![node_id], None, Some(ShardMigrationStatus::Stable));
+        catalog.create_shard(db_name, table_name, shard_def).await.unwrap();
+
+        let files = catalog.list_parquet_files_for_shard(db_name, table_name, shard_id_val).await.unwrap();
+        assert_eq!(files.len(), 2);
+
+        let file1 = &files[0];
+        assert_eq!(file1.db_name.as_ref(), db_name);
+        assert_eq!(file1.table_name.as_ref(), table_name);
+        assert_eq!(file1.shard_id, shard_id_val);
+        // Example path: "1/test_db/test_table/10/0/part-0000000001-0001-018f9a63000000000000000000000001.parquet"
+        let expected_path1_suffix = format!(
+            "/{}/{}/{}/{}/part-{:010}-{:04}-{}.parquet",
+            db_name, table_name, shard_id_val.get(), 0, 1, "018f9a63-0000-0000-0000-000000000001"
+        );
+        assert!(file1.path.starts_with(&format!("{}/", node_id.get())), "Path should start with node ID part");
+        assert!(file1.path.ends_with(&expected_path1_suffix), "Path incorrect for file1: got {}, expected suffix {}", file1.path, expected_path1_suffix);
+        assert_eq!(file1.min_time, time_range.start_time);
+
+        let file2 = &files[1];
+        assert_eq!(file2.shard_id, shard_id_val);
+        let expected_path2_suffix = format!(
+            "/{}/{}/{}/{}/part-{:010}-{:04}-{}.parquet",
+            db_name, table_name, shard_id_val.get(), 0, 2, "018f9a63-0000-0000-0000-000000000002"
+        );
+        assert!(file2.path.starts_with(&format!("{}/", node_id.get())), "Path should start with node ID part");
+        assert!(file2.path.ends_with(&expected_path2_suffix), "Path incorrect for file2: got {}, expected suffix {}", file2.path, expected_path2_suffix);
+        assert_eq!(file2.max_time, time_range.end_time);
+
+        // Test case: Shard not found
+        let res_shard_not_found = catalog.list_parquet_files_for_shard(db_name, table_name, ShardId::new(999)).await;
+        assert!(matches!(res_shard_not_found, Err(CatalogError::ShardNotFound { .. })));
+
+        // Test case: Table not found
+        let res_table_not_found = catalog.list_parquet_files_for_shard(db_name, "non_existent_table", shard_id_val).await;
+        assert!(matches!(res_table_not_found, Err(CatalogError::TableNotFound { .. })));
+
+        // Test case: DB not found
+        let res_db_not_found = catalog.list_parquet_files_for_shard("non_existent_db", table_name, shard_id_val).await;
+        assert!(matches!(res_db_not_found, Err(CatalogError::DatabaseNotFound(_))));
+    }
 }
+
+[end of influxdb3_catalog/src/catalog.rs]
 
 [end of influxdb3_catalog/src/catalog.rs]

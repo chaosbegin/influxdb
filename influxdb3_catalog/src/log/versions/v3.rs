@@ -206,6 +206,7 @@ pub enum DatabaseCatalogOp {
     CommitShardMigrationOnTarget(CommitShardMigrationOnTargetLog),
     FinalizeShardMigrationOnSource(FinalizeShardMigrationOnSourceLog),
     UpdateShardMigrationStatus(UpdateShardMigrationStatusLog), // General status update if needed
+    MarkShardMigrationFailed(MarkShardMigrationFailedLog), // For marking a migration as failed
 }
 
 impl DatabaseCatalogOp {
@@ -1029,6 +1030,15 @@ pub struct UpdateShardMigrationStatusLog {
     pub new_status: crate::shard::ShardMigrationStatus, // Using the enum from shard.rs
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MarkShardMigrationFailedLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>,
+    pub shard_id: ShardId,
+    pub error: String,
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1102,11 +1112,17 @@ mod tests {
             }),
             DatabaseCatalogOp::FinalizeShardMigrationOnSource(FinalizeShardMigrationOnSourceLog {
                 db_id: DbId::new(1), table_id: TableId::new(1), table_name: Arc::from("t1"),
-                shard_id: shard_id_1, migrated_to_node_id: node_id_2
+                shard_id: shard_id_1,
+                source_node_id_to_remove: node_id_1, // Added this field
+                migrated_to_node_id: node_id_2
             }),
             DatabaseCatalogOp::UpdateShardMigrationStatus(UpdateShardMigrationStatusLog {
                 db_id: DbId::new(1), table_id: TableId::new(1), table_name: Arc::from("t1"),
                 shard_id: shard_id_1, new_status: ShardMigrationStatus::Stable
+            }),
+            DatabaseCatalogOp::MarkShardMigrationFailed(MarkShardMigrationFailedLog {
+                db_id: DbId::new(1), table_id: TableId::new(1), table_name: Arc::from("t1"),
+                shard_id: shard_id_1, error: "Simulated failure".to_string()
             }),
         ];
 

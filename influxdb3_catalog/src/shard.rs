@@ -40,9 +40,25 @@ pub enum ShardMigrationStatus {
     /// The shard is stable and not currently undergoing migration.
     Stable,
     /// The shard is actively migrating its data out to the specified target nodes.
+    /// This is the initial state set by the orchestrator.
     MigratingOutTo(Vec<NodeId>),
+    /// The source node has flushed its data for the shard and prepared Parquet files.
+    /// It is now waiting for the target(s) to copy the data.
+    SourceDataFlushed { targets: Vec<NodeId> },
+    /// A target node has successfully bootstrapped by copying the Parquet files from the source.
+    /// It is now waiting to start WAL syncing.
+    TargetBootstrapped { source: NodeId, target: NodeId },
+    /// A target node is actively replaying WAL entries from the source.
+    TargetWalSyncing { source: NodeId, target: NodeId },
+    /// A target node has caught up with WAL replay and is ready for the source to cutover.
+    TargetReadyForCutover { source: NodeId, target: NodeId },
     /// This node is in the process of receiving data for this shard from a source node.
+    /// This status is more generic and might be used by nodes themselves to indicate an incoming migration.
+    /// The orchestrator primarily uses the more granular states above.
     MigratingInFrom(NodeId),
+    /// Indicates that a shard migration process has failed.
+    /// The error string provides details about the failure.
+    MigrationFailed { error: String },
 }
 
 impl Default for ShardMigrationStatus {

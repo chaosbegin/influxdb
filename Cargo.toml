@@ -234,6 +234,40 @@ opt-level = 3
 [profile.dev.package.similar]
 opt-level = 3
 
+[dev-dependencies]
+influxdb3_server = { path = "./influxdb3_server" }
+influxdb3_client = { path = "./influxdb3_client" }
+influxdb3_wal = { path = "./influxdb3_wal" }
+influxdb3_write = { path = "./influxdb3_write" }
+influxdb3_catalog = { path = "./influxdb3_catalog" }
+influxdb3_authz = { path = "./influxdb3_authz" }
+influxdb3_cache = { path = "./influxdb3_cache" }
+influxdb3_clap_blocks = { path = "./influxdb3_clap_blocks" }
+influxdb3_id = { path = "./influxdb3_id" }
+influxdb3_processing_engine = { path = "./influxdb3_processing_engine", optional = true } # Optional if only config types are needed
+
+# Workspace dependencies needed for tests
+anyhow = { workspace = true }
+arrow-schema = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, optional = true } # Optional if clap features from server config aren't directly used
+futures = { workspace = true }
+http = { workspace = true, optional = true } # For status codes, if needed
+hyper = { workspace = true, optional = true } # If making direct HTTP calls for health checks etc.
+iox_query = { workspace = true }
+iox_time = { workspace = true }
+metric = { workspace = true }
+object_store = { workspace = true }
+observability_deps = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true } # For CancellationToken
+tonic = { workspace = true }
+url = { workspace = true, optional = true } # For parsing URLs
+uuid = { workspace = true }
+
+
 # Patching Arrow
 #
 # Assuming you have a local checkout of Arrow in a directory alongside your local checkout of influxdb3_core,
