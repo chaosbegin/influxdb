@@ -11,13 +11,17 @@ futures = { workspace = true }
 influxdb3_id = { path = "../influxdb3_id" } # For NodeId if used
 influxdb3_proto = { path = "../influxdb3_proto" }
 parking_lot = { workspace = true }
-serde = { workspace = true, features = ["derive"] } # Added for QueryFragment serde
-serde_json = { workspace = true } # Added for serialization helpers
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true, package = "observability_deps" }
-bytes = { workspace = true } # Added for QueryFragment::SerializedLogicalPlan(Vec<u8>) -> Bytes for proto
-
+bytes = { workspace = true }
+tonic = { workspace = true, features = ["transport", "codegen", "prost"] }
+prost = { workspace = true } # For prost_types, if needed directly
+prost-types = { workspace = true } # For Timestamp, if needed directly
+async-stream = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint", "ipc"] } # Ensure ipc feature
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] } # For tests

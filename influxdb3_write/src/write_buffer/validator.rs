@@ -110,6 +110,59 @@ impl WriteValidator<CatalogChangesCommitted> {
     }
 }
 
+/// Creates a WriteBatch from a slice of QualifiedLines that are assumed to be
+/// for the same target time shard and hash partition.
+///
+/// This function is responsible for the final assembly of rows into the
+/// WriteBatch structure. It assumes that individual lines have already been
+/// schema-validated during the `validate_and_qualify_v1_line` stage.
+/// The primary role is data aggregation into TableChunks.
+/// Errors returned would typically be for inconsistencies found during batch assembly,
+/// if any, rather than individual line parsing/validation errors which are handled earlier.
+pub(crate) fn lines_to_write_batch(
+    db_id: DbId,
+    db_name: Arc<str>,
+    catalog_sequence: CatalogSequenceNumber,
+    lines: &[QualifiedLine], // Slice of qualified lines for this specific partition
+    time_shard_id: ShardId, // The time-based shard_id for this batch
+    hash_partition_index: Option<u32>, // The hash_partition_index for this batch
+    gen1_duration: Gen1Duration,
+) -> Result<WriteBatch, Vec<WriteLineError>> { // Returning Vec<WriteLineError> for now, though less likely to be used
+    let mut table_chunks_map: IndexMap<TableId, TableChunks> = IndexMap::new();
+
+    if lines.is_empty() {
+        // Return minimal WriteBatch if no lines.
+        return Ok(WriteBatch::new(
+            catalog_sequence.get(),
+            db_id,
+            db_name,
+            table_chunks_map, // empty
+            Some(time_shard_id),
+            hash_partition_index,
+        ));
+    }
+
+    for line in lines.iter() {
+        // Logic adapted from the old `convert_qualified_line`
+        let chunk_time = gen1_duration.chunk_time_for_timestamp(Timestamp::new(line.row.time));
+        let table_entry = table_chunks_map.entry(line.table_id).or_default();
+        table_entry.push_row(chunk_time, line.row.clone()); // Clone row as it's borrowed
+    }
+
+    // Currently, this function is not expected to produce WriteLineErrors if individual lines
+    // were already validated. If batch-level validation that could produce such errors
+    // is added here in the future, those errors should be collected and returned in Err().
+    // For now, assume success if lines are provided and processed.
+    Ok(WriteBatch::new(
+        catalog_sequence.get(),
+        db_id,
+        db_name,
+        table_chunks_map,
+        Some(time_shard_id),
+        hash_partition_index,
+    ))
+}
+
 
 impl WriteValidator<Initialized> {
     /// Initialize the [`WriteValidator`] by starting a catalog transaction on the given database
@@ -159,6 +212,7 @@ impl WriteValidator<Initialized> {
                         l,
                         ingest_time,
                         precision,
+                        raw_line.to_string(), // Pass original line string
                     )
                     .inspect(|_| bytes += raw_line.len() as u64)
                 }) {
@@ -193,6 +247,7 @@ fn validate_and_qualify_v1_line(
     line: ParsedLine<'_>,
     ingest_time: Time,
     precision: Precision,
+    original_lp_string: String, // Added parameter
 ) -> Result<QualifiedLine, WriteLineError> {
     let table_name = line.series.measurement.as_str();
     let mut fields = Vec::with_capacity(line.column_count());
@@ -299,6 +354,7 @@ fn validate_and_qualify_v1_line(
         field_count,
         hash_partition_index: calculated_hash_partition_index,
         target_node_id_for_hash_partition: None, // To be filled in later by WriteBufferImpl
+        original_lp_string, // Store it
     })
 }
 
@@ -366,62 +422,53 @@ impl From<ValidatedLines> for WriteBatch {
 }
 
 impl WriteValidator<CatalogChangesCommitted> {
-    pub fn convert_lines_to_buffer(self, gen1_duration: Gen1Duration) -> ValidatedLines {
-        let mut table_chunks = IndexMap::new();
-        let line_count = self.state.lines.len();
-        let mut field_count = 0;
-        let mut index_count = 0;
-
-        for line in self.state.lines.into_iter() {
-            field_count += line.field_count;
-            index_count += line.index_count;
-            convert_qualified_line(line, &mut table_chunks, gen1_duration);
-        }
-
-        let write_batch = WriteBatch::new(
-            self.state.catalog_sequence.get(),
-            self.state.db_id,
-            self.state.db_name,
-            table_chunks,
-            self.state.shard_id,
-            // Determine a single hash_partition_index for the batch.
-            // If all lines have the same Some(index), use it. Otherwise, None.
-            // This is a simplification; true splitting per hash index happens later.
-            self.state.lines.first().and_then(|ql| ql.hash_partition_index)
-                .filter(|&first_hpi| self.state.lines.iter().all(|ql| ql.hash_partition_index == Some(first_hpi))),
-        );
-
-        ValidatedLines {
-            line_count,
-            valid_bytes_count: self.state.bytes,
-            field_count,
-            index_count,
-            errors: self.state.errors,
-            valid_data: write_batch,
-            shard_id: self.state.shard_id,
-        }
+    #[deprecated(note = "This function is being phased out. Logic is moving to WriteBufferImpl::write_lp and lines_to_write_batch.")]
+    pub fn convert_lines_to_buffer(self, _gen1_duration: Gen1Duration) -> ValidatedLines {
+        // The new logic in `WriteBufferImpl::write_lp` will group lines and call
+        // `lines_to_write_batch` for each local partition. This function, which
+        // processed all lines into a single batch, is no longer the primary path.
+        //
+        // For now, to ensure compilability if any old paths still call this,
+        // return a default/empty ValidatedLines. Ideally, all callers are updated.
+        panic!("convert_lines_to_buffer is deprecated and should not be called in the new write path.");
+        // ValidatedLines {
+        //     line_count: 0,
+        //     valid_bytes_count: 0,
+        //     field_count: 0,
+        //     index_count: 0,
+        //     errors: self.state.errors, // Preserve errors if any were collected
+        //     valid_data: WriteBatch::new(
+        //         self.state.catalog_sequence.get(),
+        //         self.state.db_id,
+        //         self.state.db_name,
+        //         IndexMap::new(), // Empty table chunks
+        //         self.state.shard_id,
+        //         None, // No single hash partition index for a potentially mixed batch
+        //     ),
+        //     shard_id: self.state.shard_id,
+        // }
     }
 }
 
-fn convert_qualified_line(
-    line: QualifiedLine,
-    table_chunk_map: &mut IndexMap<TableId, TableChunks>,
-    gen1_duration: Gen1Duration,
-) {
-    let chunk_time = gen1_duration.chunk_time_for_timestamp(Timestamp::new(line.row.time));
-    let table_chunks = table_chunk_map.entry(line.table_id).or_default();
-    table_chunks.push_row(chunk_time, line.row);
-}
+// fn convert_qualified_line( // This function's logic is now effectively in lines_to_write_batch
+//     line: QualifiedLine,
+//     table_chunk_map: &mut IndexMap<TableId, TableChunks>,
+//     gen1_duration: Gen1Duration,
+// ) {
+//     let chunk_time = gen1_duration.chunk_time_for_timestamp(Timestamp::new(line.row.time));
+//     let table_chunks = table_chunk_map.entry(line.table_id).or_default();
+//     table_chunks.push_row(chunk_time, line.row);
+// }
 
-#[derive(Debug)]
-struct QualifiedLine {
-    table_id: TableId,
-    row: Row,
-    index_count: usize,
-    field_count: usize,
-    // New fields for hash partitioning results
-    hash_partition_index: Option<u32>,
-    target_node_id_for_hash_partition: Option<NodeId>,
+#[derive(Debug, Clone)] // Added Clone
+pub(crate) struct QualifiedLine { // Made pub(crate) for mod.rs access
+    pub(crate) table_id: TableId,
+    pub(crate) row: Row,
+    pub(crate) index_count: usize,
+    pub(crate) field_count: usize,
+    pub(crate) hash_partition_index: Option<u32>,
+    pub(crate) target_node_id_for_hash_partition: Option<NodeId>,
+    pub(crate) original_lp_string: String, // Added for error reporting and forwarding
 }
 
 fn apply_precision_to_timestamp(precision: Precision, ts: i64) -> i64 {

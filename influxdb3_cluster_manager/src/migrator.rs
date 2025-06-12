@@ -60,6 +60,15 @@ impl ShardMigrator {
             job.db_name, job.shard_id.get()
         );
 
+        // Conceptual RPC calls for snapshot phase
+        tracing::info!("Job {:?}: Conceptually calling PrepareShardSnapshot on source node {}", job.shard_id, job.source_node_id.get());
+        // Actual client.prepare_shard_snapshot(...) would go here.
+        tracing::info!("Job {:?}: Conceptual PrepareShardSnapshot succeeded on source.", job.shard_id);
+
+        tracing::info!("Job {:?}: Conceptually calling ApplyShardSnapshot on target node {}", job.shard_id, job.target_node_id.get());
+        // Actual client.apply_shard_snapshot(...) would go here.
+        tracing::info!("Job {:?}: Conceptual ApplyShardSnapshot succeeded on target.", job.shard_id);
+
         // 2. Complete snapshot transfer (set status to MigratingWAL)
         complete_shard_snapshot_transfer_conceptual(
             Arc::clone(&self.catalog),
@@ -77,6 +86,8 @@ impl ShardMigrator {
             job.db_name, job.shard_id.get()
         );
 
+        tracing::info!("Job {:?}: Conceptual WAL streaming from source {} to target {} is now active.", job.shard_id, job.source_node_id.get(), job.target_node_id.get());
+
         // 3. Complete WAL sync (set status to AwaitingCutover)
         complete_shard_wal_sync_conceptual(
             Arc::clone(&self.catalog),
@@ -93,6 +104,17 @@ impl ShardMigrator {
             "Job for shard {}:{}: WAL sync complete. Status: AwaitingCutover.",
             job.db_name, job.shard_id.get()
         );
+
+        // Conceptual RPC calls for cutover preparation
+        tracing::info!("Job {:?}: Conceptually calling SignalWalStreamProcessed on target node {}.", job.shard_id, job.target_node_id.get());
+        // Actual client.signal_wal_stream_processed(...) would go here.
+
+        tracing::info!("Job {:?}: Conceptually calling LockShardWrites on source node {}.", job.shard_id, job.source_node_id.get());
+        // Actual client.lock_shard_writes(...) on source would go here.
+        // Potentially also lock on target for new writes if it's a complex cutover:
+        // tracing::info!("Job {:?}: Conceptually calling LockShardWrites on target node {}.", job.shard_id, job.target_node_id.get());
+        // Actual client.lock_shard_writes(...) on target would go here.
+
 
         // 4. Complete cutover (update shard owner to target_node_id, set status to Stable)
         complete_shard_cutover_conceptual(
@@ -113,6 +135,10 @@ impl ShardMigrator {
             job.db_name, job.shard_id.get(), job.target_node_id.get()
         );
 
+        // Conceptual RPC call for unlocking writes on target
+        tracing::info!("Job {:?}: Conceptually calling UnlockShardWrites on target node {}.", job.shard_id, job.target_node_id.get());
+        // Actual client.unlock_shard_writes(...) on target would go here.
+
         // 5. Complete cleanup on source node (set status to Cleaned)
         complete_shard_cleanup_conceptual(
             Arc::clone(&self.catalog),
@@ -131,6 +157,10 @@ impl ShardMigrator {
             "Job for shard {}:{}: Cleanup complete on source {}. Status: Cleaned.",
             job.db_name, job.shard_id.get(), job.source_node_id.get()
         );
+
+        // Conceptual RPC call for deleting data on source
+        tracing::info!("Job {:?}: Conceptually calling DeleteShardData on source node {}.", job.shard_id, job.source_node_id.get());
+        // Actual client.delete_shard_data(...) on source would go here.
 
         tracing::info!(
             db_name = %job.db_name,

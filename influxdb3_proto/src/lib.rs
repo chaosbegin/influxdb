@@ -6,7 +6,8 @@ pub mod gen {
     // The actual generated filename will be `influxdb3.internal.replication.v1.rs`
     // inside the `src/gen` directory.
     tonic::include_proto!("influxdb3.internal.replication.v1");
-    tonic::include_proto!("influxdb3.internal.distributed_query.v1"); // Added
+    tonic::include_proto!("influxdb3.internal.distributed_query.v1");
+    tonic::include_proto!("influxdb3.internal.node_data_management.v1"); // Added new service
 }
 
 // Optional: Re-export the generated types for easier access from other crates.
@@ -39,6 +40,25 @@ pub mod influxdb3 {
                 pub use crate::gen::{
                     DistributedQueryService,
                     DistributedQueryServiceServer,
+                };
+            }
+        }
+        pub mod node_data_management {
+            pub mod v1 {
+                pub use crate::gen::{
+                    node_data_management_service_client as GrpcNodeDataManagementServiceClient,
+                    NodeDataManagementServiceClient,
+                    PrepareShardSnapshotRequest, PrepareShardSnapshotResponse,
+                    ApplyShardSnapshotRequest, ApplyShardSnapshotResponse,
+                    SignalWalStreamProcessedRequest, SignalWalStreamProcessedResponse,
+                    LockShardWritesRequest, LockShardWritesResponse,
+                    UnlockShardWritesRequest, UnlockShardWritesResponse,
+                    DeleteShardDataRequest, DeleteShardDataResponse,
+                    ShardIdentifier, // Message type
+                };
+                pub use crate::gen::{
+                    NodeDataManagementService,
+                    NodeDataManagementServiceServer,
                 };
             }
         }

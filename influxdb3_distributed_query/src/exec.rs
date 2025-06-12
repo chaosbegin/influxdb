@@ -157,11 +157,9 @@ impl ExecutionPlan for RemoteScanExec {
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         tracing::debug!(
-            "Attempting to execute RemoteScanExec: target_node_id={}, target_node_address={}, fragment={:?}, partition={}",
-            self.target_node_id.get(), // Use .get() for NodeId's u64 value
+            "RemoteScanExec: Attempting to execute query fragment on remote node: {} for db: {}",
             self.target_node_address,
-            self.query_fragment,
-            partition
+            self.db_name
         );
 
         // Ensure the partition index is valid (should be 0 for UnknownPartitioning(1))
@@ -172,58 +170,100 @@ impl ExecutionPlan for RemoteScanExec {
             )));
         }
 
-        // ** CONCEPTUAL GRPC CLIENT CALL **
-        tracing::info!("RemoteScanExec: Conceptually connecting to {} for node {}", self.target_node_address, self.target_node_id.get());
-
-        // 1. Conceptual client creation
-        // let mut client = DistributedQueryServiceClient::connect(self.target_node_address.clone()) // Requires "http://" prefix
-        //     .await
-        //     .map_err(|e| DataFusionError::Execution(format!("Failed to connect to remote node {}: {}", self.target_node_address, e)))?;
-
-        // 2. Prepare request
-        let (fragment_bytes, fragment_type_str) = match self.query_fragment.as_ref() {
-            QueryFragment::RawSql(sql) => (Bytes::from(sql.clone()), "RawSql".to_string()),
-            QueryFragment::SerializedPlan(plan_bytes) => (Bytes::from(plan_bytes.clone()), "SerializedDataFusionLogicalPlan".to_string()),
+        let formatted_address = if !self.target_node_address.starts_with("http://") && !self.target_node_address.starts_with("https://") {
+            format!("http://{}", self.target_node_address)
+        } else {
+            self.target_node_address.clone()
         };
 
-        let _request_payload = ExecuteQueryFragmentRequest {
-            db_name: self.db_name.clone(),
-            query_fragment: fragment_bytes,
-            fragment_type: fragment_type_str,
+        let output_schema = self.projected_schema.clone();
+        let db_name_cloned = self.db_name.clone();
+        let query_fragment_cloned = self.query_fragment.clone(); // Arc clone
+        let target_node_address_cloned = self.target_node_address.clone(); // For error messages and logging
+
+        let response_stream = async_stream::try_stream! {
+            // 1. Create gRPC Client
+            let mut client = match influxdb3_proto::influxdb3::internal::distributed_query::v1::distributed_query_service_client::DistributedQueryServiceClient::connect(formatted_address).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let err_msg = format!("Failed to connect to remote query service at {}: {}", target_node_address_cloned, e);
+                    tracing::error!("{}", err_msg);
+                    Err(DataFusionError::Execution(err_msg))?;
+                    unreachable!(); // Should be handled by `?`
+                }
+            };
+
+            // 2. Prepare ExecuteQueryFragmentRequest
+            let query_fragment_bytes = match &*query_fragment_cloned { // Deref Arc
+                QueryFragment::SerializedLogicalPlan(plan_bytes) => plan_bytes.clone(), // plan_bytes is Vec<u8>
+                // QueryFragment::RawSql(_) => { // Example if RawSql was still used
+                //     let err_msg = "RawSql query fragment type is not supported in this path.".to_string();
+                //     tracing::error!("{}", err_msg);
+                //     Err(DataFusionError::NotImplemented(err_msg))?;
+                //     unreachable!();
+                // }
+            };
+
+            let request = tonic::Request::new(
+                influxdb3_proto::influxdb3::internal::distributed_query::v1::ExecuteQueryFragmentRequest {
+                    db_name: db_name_cloned.clone(),
+                    query_fragment: query_fragment_bytes, // Already Vec<u8>
+                    fragment_type: "SerializedDataFusionLogicalPlan".to_string(),
+                },
+            );
+
+            // 3. Execute gRPC Call
+            let mut inner_stream = match client.execute_query_fragment(request).await {
+                Ok(response) => response.into_inner(),
+                Err(status) => {
+                    let err_msg = format!("Remote query fragment execution failed on {}: {}", target_node_address_cloned, status);
+                    tracing::error!("{}", err_msg);
+                    Err(DataFusionError::Execution(err_msg))?;
+                    unreachable!();
+                }
+            };
+
+            // 4. Adapt Stream of Responses
+            fn deserialize_ipc_bytes_to_batch(bytes: bytes::Bytes, schema: SchemaRef) -> DFResult<arrow::record_batch::RecordBatch> {
+                use arrow::ipc::reader::StreamReader;
+                use std::io::Cursor;
+
+                if bytes.is_empty() {
+                    return Ok(arrow::record_batch::RecordBatch::new_empty(schema));
+                }
+
+                let mut cursor = Cursor::new(bytes);
+                let mut reader = StreamReader::try_new(&mut cursor, None)
+                    .map_err(|e| DataFusionError::ArrowError(e, Some(format!("IPC Read Error creating reader for schema {:?}", schema))))?;
+
+                if let Some(batch_result) = reader.next() {
+                    batch_result.map_err(|e| DataFusionError::ArrowError(e, None))
+                } else {
+                    Ok(arrow::record_batch::RecordBatch::new_empty(schema))
+                }
+            }
+
+            while let Some(response_item_result) = inner_stream.next().await {
+                match response_item_result {
+                    Ok(response_item) => {
+                        tracing::debug!("RemoteScanExec: Received batch of size {} bytes from {}", response_item.record_batch_bytes.len(), target_node_address_cloned);
+                        let batch = deserialize_ipc_bytes_to_batch(response_item.record_batch_bytes, output_schema.clone())?;
+                        yield batch;
+                    }
+                    Err(status) => {
+                        tracing::error!("Error in remote query fragment stream from {}: {}", target_node_address_cloned, status);
+                        Err(DataFusionError::Execution(format!("Stream error from remote node {}: {}", target_node_address_cloned, status)))?;
+                    }
+                }
+            }
         };
 
-        // let request = tonic::Request::new(request_payload);
-
-        // 3. Call remote service (conceptual)
-        // let grpc_response_stream = client.execute_query_fragment(request)
-        //     .await
-        //     .map_err(|e| DataFusionError::Execution(format!("Remote query execution failed: {}", e)))?
-        //     .into_inner();
-
-        // 4. Adapt gRPC stream to SendableRecordBatchStream (conceptual)
-        // let output_stream = grpc_response_stream.map_err(|e: tonic::Status| DataFusionError::Execution(format!("gRPC stream error: {}", e)))
-        //     .and_then(|res: ExecuteQueryFragmentResponse| async move {
-        //         if let Some(err_msg) = res.error_message {
-        //              return Err(DataFusionError::Execution(format!("Remote batch error: {}", err_msg)));
-        //         }
-        //         // Deserialize RecordBatch from res.record_batch_bytes (Arrow IPC format)
-        //         let cursor = Cursor::new(res.record_batch_bytes);
-        //         let mut reader = StreamReader::try_new(cursor, None) // Assuming stream format without schema, or schema known
-        //             .map_err(|e| DataFusionError::Execution(format!("Failed to create IPC StreamReader: {}", e)))?;
-        //         if let Some(batch) = reader.next() {
-        //             batch.map_err(|e| DataFusionError::Execution(format!("Failed to read batch from IPC: {}", e)))
-        //         } else {
-        //             Err(DataFusionError::Execution("Received empty or invalid RecordBatch IPC message".to_string()))
-        //         }
-        //     });
-
-        // For this conceptual implementation, return an empty stream with the correct schema.
-        let schema = self.projected_schema.clone();
-        let stream_adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::empty(), // This produces BoxStream<'static, DFResult<RecordBatch>>
-        );
-        Ok(Box::pin(stream_adapter))
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                output_schema,
+                response_stream,
+            ),
+        ))
     }
 
     fn statistics(&self) -> DFResult<Statistics> {
@@ -337,34 +377,75 @@ mod tests {
         let schema = create_test_schema();
         let db_name = "test_db".to_string();
         let node_id = NodeId::new(1);
-        let address = "node1.example.com:8080".to_string();
-        let fragment = QueryFragment::SerializedPlan(vec![1, 2, 3]);
-
-        let exec_plan = Arc::new(RemoteScanExec::new(
-            db_name.clone(),
-            node_id,
-            address.clone(),
-            fragment.clone(),
-            schema.clone(),
-        ));
 
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
 
-        // Test execution for partition 0
-        let stream_result = exec_plan.execute(0, task_ctx.clone()).await;
-        assert!(stream_result.is_ok());
-        let mut stream = stream_result.unwrap();
-        assert_eq!(stream.schema(), schema);
-        assert!(stream.next().await.is_none()); // Expecting an empty stream
+        // Test case 1: Invalid target_node_address (connection error)
+        let invalid_address = "invalid-uri-that-will-not-connect"; // Tonic connect expects "http://" or "https://"
+        let fragment_invalid_conn = QueryFragment::SerializedLogicalPlan(vec![1, 2, 3]); // Content doesn't matter for conn test
 
-        // Test execution for an invalid partition
-        let stream_result_invalid_partition = exec_plan.execute(1, task_ctx).await;
+        let exec_plan_invalid_conn = Arc::new(RemoteScanExec::new(
+            db_name.clone(),
+            node_id,
+            invalid_address.to_string(),
+            fragment_invalid_conn,
+            schema.clone(),
+        ));
+
+        let stream_result_invalid_conn = exec_plan_invalid_conn.execute(0, task_ctx.clone()).await;
+        assert!(stream_result_invalid_conn.is_err(), "Expected error for invalid connection");
+        match stream_result_invalid_conn.err().unwrap() {
+            DataFusionError::Execution(msg) => {
+                assert!(msg.contains("Failed to connect to remote query service"), "Error message mismatch: {}", msg);
+            }
+            other_err => panic!("Expected DataFusionError::Execution, got {:?}", other_err),
+        }
+
+        // Test case 2: Valid address but conceptual server (will likely try to connect and timeout or fail if not running)
+        // This part is harder to test reliably without a mock server or network access control.
+        // The current implementation of execute() will return an empty stream if the server is not found
+        // after connection or if the stream is empty.
+        // For now, we'll test the path that attempts connection and processes an empty stream (conceptual).
+        // A real test would use a mock gRPC server.
+        let valid_but_mock_address = "http://localhost:55555"; // Assume nothing running here for test
+        let fragment_mock_server = QueryFragment::SerializedLogicalPlan(vec![1, 2, 3]);
+        let exec_plan_mock_server = Arc::new(RemoteScanExec::new(
+            db_name.clone(),
+            node_id,
+            valid_but_mock_address.to_string(),
+            fragment_mock_server,
+            schema.clone(),
+        ));
+
+        // This will try to connect. If it fails, it will return DataFusionError::Execution.
+        // If it somehow succeeded (e.g. something IS listening), it would then try to process a stream.
+        let stream_result_mock_server = exec_plan_mock_server.execute(0, task_ctx.clone()).await;
+        // We expect this to fail connection, similar to invalid_address if server not up.
+        assert!(stream_result_mock_server.is_err(), "Expected error for connection to non-existent server");
+         match stream_result_mock_server.err().unwrap() {
+            DataFusionError::Execution(msg) => {
+                assert!(msg.contains("Failed to connect to remote query service") || msg.contains("transport error"));
+            }
+            other_err => panic!("Expected DataFusionError::Execution for mock server, got {:?}", other_err),
+        }
+
+
+        // Test case 3: Execution for an invalid partition index
+        let exec_plan_for_partition_test = Arc::new(RemoteScanExec::new(
+            db_name.clone(),
+            node_id,
+            valid_but_mock_address.to_string(), // Address doesn't matter as it errors before connection
+            QueryFragment::SerializedLogicalPlan(vec![]),
+            schema.clone(),
+        ));
+        let stream_result_invalid_partition = exec_plan_for_partition_test.execute(1, task_ctx).await;
         assert!(stream_result_invalid_partition.is_err());
-        if let Err(DataFusionError::Internal(msg)) = stream_result_invalid_partition {
-            assert!(msg.contains("RemoteScanExec expected partition 0, got 1"));
-        } else {
-            panic!("Expected internal error for invalid partition");
+        match stream_result_invalid_partition.err().unwrap() {
+            DataFusionError::Internal(msg) => {
+                assert!(msg.contains("RemoteScanExec expected partition 0, got 1"));
+            }
+            other_err => panic!("Expected internal error for invalid partition, got {:?}", other_err),
         }
     }
 
