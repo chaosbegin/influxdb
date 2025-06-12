@@ -337,6 +337,67 @@ impl WriteBufferImpl {
         Ok(result)
     }
 
+    // Helper method to create and execute a replication task.
+    // This encapsulates the cfg(test) vs cfg(not(test)) logic for client usage.
+    async fn execute_replication_to_node(
+        &self,
+        target_node_address: String, // Full address for GrpcReplicationClient, or identifier for Mock
+        proto_request: influxdb3_proto::influxdb3::internal::replication::v1::ReplicateWalOpRequest,
+    ) -> bool { // Returns true on successful replication, false otherwise
+        #[cfg(test)]
+        {
+            // Test path using MockReplicationClient
+            // Ensure mock_replication_client is Clone or this needs &self.
+            // The mock's replicate_wal_op takes &str and &Request.
+            match self.mock_replication_client.replicate_wal_op(&target_node_address, &proto_request).await {
+                Ok(response_mock) if response_mock.success => {
+                    debug!("Mock replication to {} successful.", target_node_address);
+                    true
+                }
+                Ok(response_mock) => {
+                    warn!("Mock Replica {} failed: {:?}", target_node_address, response_mock.error_message);
+                    false
+                }
+                Err(e_mock) => {
+                    warn!("Mock RPC error to replica {}: {:?}", target_node_address, e_mock);
+                    false
+                }
+            }
+        }
+        #[cfg(not(test))]
+        {
+            // Production path using GrpcReplicationClient
+            use crate::replication_client::GrpcReplicationClient; // Ensure this is imported
+
+            debug!("Attempting to replicate WalOp to replica: {}", target_node_address);
+            match GrpcReplicationClient::new(target_node_address.clone()).await {
+                Ok(mut client) => {
+                    match client.replicate_wal_op(proto_request).await { // proto_request is consumed here
+                        Ok(response_wrapper) => {
+                            let response = response_wrapper.into_inner();
+                            if response.success {
+                                debug!("Replication to {} successful.", target_node_address);
+                                true
+                            } else {
+                                error!("Replication to {} failed: {:?}", target_node_address, response.error_message.unwrap_or_default());
+                                false
+                            }
+                        }
+                        Err(status) => {
+                            error!("Replication RPC to {} failed: {}", target_node_address, status);
+                            false
+                        }
+                    }
+                }
+                Err(e_client) => {
+                    error!("Failed to create replication client for {}: {:?}", target_node_address, e_client);
+                    false
+                }
+            }
+        }
+    }
+
+
     #[cfg(test)]
     pub(crate) fn take_last_replicate_wal_op_request_for_test(&self) -> Option<influxdb3_proto::influxdb3::internal::replication::v1::ReplicateWalOpRequest> { // Updated type
         self.last_replicate_wal_op_request_for_test.lock().unwrap().take()
@@ -405,23 +466,72 @@ impl WriteBufferImpl {
         // NOTE(trevor/catalog-refactor): should there be some retry limit or timeout?
         loop {
             let mut validator = WriteValidator::initialize(db_name.clone(), self.catalog())?;
-            let parsed_lines = validator.v1_parse_lines_and_catalog_updates(lp, accept_partial, ingest_time, precision)?;
+            let mut lines_parsed_state = validator.v1_parse_lines_and_catalog_updates(lp, accept_partial, ingest_time, precision)?.into_inner();
 
-            let validated_lines_result = match parsed_lines.commit_catalog_changes().await? {
-                Prompt::Success(committed_validator_state) => {
+            // --- Populate target_node_id_for_hash_partition for each QualifiedLine ---
+            if let Some(table_name_for_hashing) = &table_name_from_lp { // Ensure we have a table context
+                if let Some(db_schema_for_hashing) = self.catalog.db_schema(db_name.as_str()) {
+                    if let Some(table_def_for_hashing) = db_schema_for_hashing.table_definition(table_name_for_hashing) {
+                        if let Some(time_shard_id_for_hashing) = determined_shard_id {
+                            if let Some(time_shard_def) = table_def_for_hashing.shards.get_by_id(&time_shard_id_for_hashing) {
+                                let current_node_id_parsed = self.current_node_id.as_ref().parse::<u64>().map(influxdb3_id::NodeId::new).ok();
+
+                                for ql in lines_parsed_state.lines.iter_mut() {
+                                    if ql.table_id == table_def_for_hashing.table_id { // Ensure line belongs to this table
+                                        if let Some(hpi) = ql.hash_partition_index {
+                                            if table_def_for_hashing.num_hash_partitions > 1 {
+                                                if (hpi as usize) < time_shard_def.node_ids.len() {
+                                                    ql.target_node_id_for_hash_partition = Some(time_shard_def.node_ids[hpi as usize]);
+                                                } else {
+                                                    // Misconfiguration: num_hash_partitions > node_ids.len() for time shard
+                                                    // Mark line as error or handle as per policy. For now, log and don't set target.
+                                                    error!(
+                                                        "Misconfiguration for table {}.{}: hash partition index {} out of bounds for time shard {:?} which has {} nodes. Line will not be routed by hash.",
+                                                        db_name.as_str(), table_name_for_hashing, hpi, time_shard_id_for_hashing, time_shard_def.node_ids.len()
+                                                    );
+                                                    // Potentially add to lines_parsed_state.errors here for this line
+                                                }
+                                            } else { // Not hash partitioned (num_hash_partitions == 1)
+                                                ql.target_node_id_for_hash_partition = time_shard_def.node_ids.first().cloned();
+                                            }
+                                        } else { // No hash_partition_index calculated (e.g., missing shard keys)
+                                             // If table IS hash partitioned but this line couldn't be hashed (e.g. missing keys),
+                                             // it was already errored by validator. If it wasn't errored, it means
+                                             // the table wasn't hash partitioned or shard keys were not defined.
+                                             // So, route based on time-shard primary.
+                                            ql.target_node_id_for_hash_partition = time_shard_def.node_ids.first().cloned();
+                                        }
+                                    }
+                                }
+                            } else {
+                                warn!("Time shard definition not found for {:?} in table {}.{}, cannot determine target node IDs for hash partitions.", determined_shard_id, db_name.as_str(), table_name_for_hashing);
+                            }
+                        } else { // No specific time shard (e.g., table not sharded by time, or no matching time range)
+                            // Default to primary node of the table if not sharded by time but sharded by hash?
+                            // This case needs clarification. For now, if no time_shard_id, cannot determine target node.
+                            // However, determined_shard_id is calculated before validator, so it should exist if table has shards.
+                            // If table_def.shards is empty, this whole block is skipped by determined_shard_id.
+                        }
+                    }
+                }
+            }
+            // --- End Populate target_node_id_for_hash_partition ---
+
+            let validated_lines_result = match self.catalog.commit(lines_parsed_state.txn).await? {
+                Prompt::Success(catalog_sequence) => {
                     let final_state = crate::write_buffer::validator::CatalogChangesCommitted {
-                        catalog_sequence: committed_validator_state.inner().catalog_sequence,
-                        db_id: committed_validator_state.inner().db_id,
-                        db_name: Arc::clone(&committed_validator_state.inner().db_name),
-                        lines: committed_validator_state.inner().lines.clone(),
-                        bytes: committed_validator_state.inner().bytes,
-                        errors: committed_validator_state.inner().errors.clone(),
-                        shard_id: determined_shard_id,
+                        catalog_sequence,
+                        db_id: lines_parsed_state.db_id(), // Assuming LinesParsed has accessors or direct field
+                        db_name: lines_parsed_state.db_name(), // Assuming LinesParsed has accessors
+                        lines: lines_parsed_state.lines, // These now have target_node_id potentially set
+                        bytes: lines_parsed_state.bytes,
+                        errors: lines_parsed_state.errors,
+                        shard_id: determined_shard_id, // This is time-based shard_id
                     };
                     WriteValidator::from(final_state).convert_lines_to_buffer(self.wal_config.gen1_duration)
                 }
                 Prompt::Retry(_) => {
-                    debug!("retrying write_lp after attempted commit");
+                    debug!("retrying write_lp after catalog commit attempt");
                     continue;
                 }
             };
@@ -430,157 +540,198 @@ impl WriteBufferImpl {
 
             // Only buffer to the WAL if there are actually writes in the batch
             if validated_lines_result.line_count > 0 {
-                let wal_op = WalOp::Write(validated_lines_result.valid_data.clone()); // Clone for potential replication
+                // The validated_lines_result.valid_data is a single WriteBatch.
+                // If hash partitioning resulted in lines belonging to different local hash partitions,
+                // the validator's convert_lines_to_buffer (as of P119) sets WriteBatch.hash_partition_index
+                // to Some(idx) only if all lines map to the same index, otherwise None.
+                // The actual splitting of one LP request into multiple WriteBatches for different
+                // local hash partitions is NOT YET IMPLEMENTED in the validator.
+                // For now, we assume one WriteBatch is produced by the validator for all lines
+                // targeting the local node for a given time shard.
 
-                // --- Replication Logic Placeholder ---
-                let mut replication_successful = true; // Assume success if no replication needed
-                if let Some(table_name_str) = &table_name_from_lp { // Use previously parsed table name
+                let local_write_batch = validated_lines_result.valid_data; // This is the batch for local operations
+                let current_node_id_val = self.current_node_id.as_ref().parse::<u64>().map(influxdb3_id::NodeId::new).ok();
+
+                // --- Group lines by target node (conceptual, full_lines_info needed if we split validated_lines_result) ---
+                // To properly implement routing based on `target_node_id_for_hash_partition` (which is on QualifiedLine),
+                // `validated_lines_result` would need to expose `Vec<QualifiedLine>` or `convert_lines_to_buffer`
+                // would need to produce multiple `WriteBatch`es, each tagged for its target.
+                //
+                // Current simplification: `local_write_batch` contains all lines.
+                // We will determine if this WHOLE batch is local or remote based on its (potentially uniform) hash partition.
+                // If `local_write_batch.hash_partition_index` is None because lines were mixed, this logic defaults to time-shard primary.
+
+                let mut ops_for_local_wal: Vec<WalOp> = Vec::new();
+                let mut remote_replication_tasks = Vec::new();
+
+                if let Some(table_name_str_ref) = &table_name_from_lp {
                     if let Some(db_schema) = self.catalog.db_schema(db_name.as_str()) {
                         if let Some(table_def) = db_schema.table_definition(table_name_str) {
+                            let mut target_node_for_this_batch = None;
+                            if table_def.num_hash_partitions > 1 && !table_def.shard_keys.is_empty() {
+                                if let Some(hpi) = local_write_batch.hash_partition_index {
+                                    if let Some(time_shard_id) = local_write_batch.shard_id { // Should be determined_shard_id
+                                        if let Some(time_shard_def) = table_def.shards.get_by_id(&time_shard_id) {
+                                            if (hpi as usize) < time_shard_def.node_ids.len() {
+                                                target_node_for_this_batch = Some(time_shard_def.node_ids[hpi as usize]);
+                                            } else {
+                                                error!("Misconfiguration for table {}.{}: WriteBatch HPI {} out of bounds for time shard {:?} nodes.", db_name.as_str(), table_name_str_ref, hpi, time_shard_id);
+                                                return Err(Error::ReplicationError("Misconfigured sharding, hash partition index out of bounds.".to_string()));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                     // Batch has mixed hash partitions or hashing wasn't applicable to all lines uniformly.
+                                     // Default to time-shard primary for now for the entire batch.
+                                     if let Some(time_shard_id) = local_write_batch.shard_id {
+                                         if let Some(time_shard_def) = table_def.shards.get_by_id(&time_shard_id) {
+                                             target_node_for_this_batch = time_shard_def.node_ids.first().cloned();
+                                         }
+                                     }
+                                }
+                            } else { // Not hash partitioned
+                                if let Some(time_shard_id) = local_write_batch.shard_id {
+                                    if let Some(time_shard_def) = table_def.shards.get_by_id(&time_shard_id) {
+                                        target_node_for_this_batch = time_shard_def.node_ids.first().cloned();
+                                    }
+                                }
+                            }
+
+                            let is_local_op = target_node_for_this_batch.map_or(true, |id| Some(id) == current_node_id_val);
+
+                            if is_local_op {
+                                ops_for_local_wal.push(WalOp::Write(local_write_batch.clone())); // Clone for local WAL
+                            }
+
+                            // Replication logic (if needed based on RF and target)
                             if let Some(replication_info) = &table_def.replication_info {
                                 if replication_info.replication_factor.get() > 1 {
                                     let factor = replication_info.replication_factor.get() as usize;
-                                    // Conceptual: Get actual replica node addresses from shard_def or a cluster state service.
-                                    // For mock testing, we'll just create some dummy addresses.
-                                    // The number of replica_nodes should ideally be `factor - 1` (excluding self).
-                                    // Or, if `node_ids` on `ShardDefinition` lists all holders (primary + replicas),
-                                    // then filter out self.current_node_id.
-                                    // For simplicity, let's assume `table_def.shards` (if `determined_shard_id` is Some)
-                                    // or a general config gives us the list of target nodes for replication.
-                                    // Here, we'll use a placeholder list of N-1 nodes.
+                                    let required_quorum = (factor / 2) + 1;
+                                    let mut successful_replications_count = 0;
+                                    if is_local_op { successful_replications_count +=1; } // Local write counts
 
-                                    let mut conceptual_replica_nodes = Vec::new();
+                                    // Determine actual replica nodes. This is still conceptual.
+                                    // If `target_node_for_this_batch` is remote, that's the primary for this data.
+                                    // If local, we need to find other replica nodes.
+                                    // For now, use `conceptual_replica_nodes` but filter out `target_node_for_this_batch` if it's remote,
+                                    // or `current_node_id` if it's local.
+                                    let mut conceptual_replica_nodes_for_this_batch = Vec::new();
+                                    // This placeholder needs to be smarter: it should get actual replica peers for the
+                                    // specific shard (time+hash). For now, assume generic other nodes.
                                     if factor > 1 {
-                                        // Create factor-1 dummy node names for testing quorum logic.
-                                        // In reality, these would come from shard assignments in the catalog.
-                                        // And we would not replicate to self.current_node_id.
-                                        for i in 0..(factor -1) { // factor-1 other nodes
-                                            conceptual_replica_nodes.push(format!("replica_node_{}", i+1));
+                                        for i in 0..(factor -1) { conceptual_replica_nodes_for_this_batch.push(format!("replica_node_for_table_{}_{}", table_name_str_ref, i+1)); }
+                                    }
+
+                                    let nodes_to_replicate_to: Vec<_> = conceptual_replica_nodes_for_this_batch.iter()
+                                        .filter(|&n_addr| target_node_for_this_batch.map_or(true, |id| Some(id.to_string()) != Some(n_addr.clone()) )) // Don't replicate to self if remote primary
+                                        .filter(|&n_addr| Some(self.current_node_id.to_string()) != Some(n_addr.clone())) // Don't replicate to self if local primary
+                                        .collect();
+
+
+                                    let wal_op_for_batch = WalOp::Write(local_write_batch.clone());
+                                    let serialized_op = match bitcode::serialize(&wal_op_for_batch) {
+                                        Ok(bytes) => bytes,
+                                        Err(e) => {
+                                            error!("Failed to serialize WalOp for replication: {}", e);
+                                            return Err(Error::ReplicationError(format!("Failed to serialize WalOp: {}", e)));
+                                        }
+                                    };
+                                    let own_node_id_str = self.current_node_id.as_ref().to_string();
+                                    let proto_request_template = influxdb3_proto::influxdb3::internal::replication::v1::ReplicateWalOpRequest {
+                                        wal_op_bytes: serialized_op.into(),
+                                        originating_node_id: own_node_id_str,
+                                        shard_id: local_write_batch.shard_id.map(|sid| sid.get()), // Time Shard ID
+                                        database_name: db_name.as_str().to_string(),
+                                        table_name: table_name_str_ref.clone(),
+                                    };
+
+                                    #[cfg(test)]
+                                    {
+                                        *self.last_replicate_wal_op_request_for_test.lock().unwrap() = Some(proto_request_template.clone());
+                                    }
+
+                                    if !is_local_op {
+                                        if let Some(remote_target_node) = target_node_for_this_batch {
+                                            // This is the primary remote write (forwarding)
+                                            // Address needs to be resolved from NodeId via catalog. For now, use NodeId as string.
+                                            let remote_target_address = format!("node_{}", remote_target_node.get()); // Placeholder address
+                                            if self.execute_replication_to_node(remote_target_address, proto_request_template.clone()).await {
+                                                successful_replications_count += 1;
+                                            } else {
+                                                // Failure to write to primary remote target is critical for this batch
+                                                let err_msg = format!("Failed to forward write to primary remote target node {:?} for table {}.{}", remote_target_node, db_name.as_str(), table_name_str_ref);
+                                                error!("{}", err_msg);
+                                                return Err(Error::ReplicationError(err_msg));
+                                            }
+                                        } else {
+                                            // Should not happen if !is_local_op
+                                            error!("Remote operation targeted but no target node ID resolved for table {}.{}", db_name.as_str(), table_name_str_ref);
+                                            return Err(Error::ReplicationError("Internal error: remote target node ID missing.".to_string()));
                                         }
                                     }
 
-                                    if !conceptual_replica_nodes.is_empty() {
-                                        debug!(
-                                            "Attempting to replicate WalOp for table '{}.{}' to nodes: {:?}. ShardId: {:?}. Replication Factor: {}",
-                                            database.as_str(), table_name_str_ref, conceptual_replica_nodes, determined_shard_id, factor
+                                    // Handle replication to other conceptual replicas (RF > 1 cases)
+                                    // `nodes_to_send_replication_to` should be the actual replica peers for the specific data slice (time-shard + hash-partition)
+                                    // This part is still highly conceptual as replica sets per hash partition aren't defined.
+                                    // We use `conceptual_replica_nodes_for_this_batch` as a stand-in.
+                                    for replica_node_addr_str in &nodes_to_send_replication_to {
+                                        // The execute_replication_to_node helper handles cfg(test) vs cfg(not(test))
+                                        if self.execute_replication_to_node(replica_node_addr_str.clone(), proto_request_template.clone()).await {
+                                            successful_replications_count += 1;
+                                        }
+                                    }
+
+                                    // Quorum check
+                                    if successful_replications_count < required_quorum {
+                                        let err_msg = format!(
+                                            "Quorum not met for table {}.{}: {}/{} successful operations. Replication factor {}",
+                                            db_name.as_str(), table_name_str_ref,
+                                            successful_replications_count, required_quorum,
+                                            factor
                                         );
-
-                                        let serialized_op = match bitcode::serialize(&wal_op) {
-                                            Ok(bytes) => bytes,
-                                            Err(e) => {
-                                                error!("Failed to serialize WalOp for replication: {}", e);
-                                                // This is a critical local error, should probably not proceed.
-                                                return Err(Error::ReplicationError(format!("Failed to serialize WalOp for replication: {}", e)));
-                                            }
-                                        };
-
+                                        error!("{}", err_msg);
+                                        return Err(Error::ReplicationError(err_msg));
+                                    } else {
+                                        debug!("Quorum met for table {}.{}: {}/{} successful operations.", db_name.as_str(), table_name_str_ref, successful_replications_count, required_quorum);
+                                    }
+                                } else { // RF is 1 or less.
+                                    if !is_local_op && target_node_for_this_batch.is_some() {
+                                        // Data is for a remote node, RF=1. This is a forward.
+                                        let remote_target_address = format!("node_{}", target_node_for_this_batch.unwrap().get()); // Placeholder
+                                        let wal_op_for_batch = WalOp::Write(local_write_batch.clone());
+                                        let serialized_op = bitcode::serialize(&wal_op_for_batch).map_err(|e| Error::ReplicationError(format!("Serialize error: {}", e)))?;
                                         let own_node_id_str = self.current_node_id.as_ref().to_string();
-                                        // Construct the protobuf ReplicateWalOpRequest
                                         let proto_request = influxdb3_proto::influxdb3::internal::replication::v1::ReplicateWalOpRequest {
-                                            wal_op_bytes: serialized_op.into(), // Convert Vec<u8> to bytes::Bytes
+                                            wal_op_bytes: serialized_op.into(),
                                             originating_node_id: own_node_id_str,
-                                            shard_id: determined_shard_id.map(|sid| sid.get()),
-                                            database_name: database.as_str().to_string(),
+                                            shard_id: local_write_batch.shard_id.map(|sid| sid.get()),
+                                            database_name: db_name.as_str().to_string(),
                                             table_name: table_name_str_ref.clone(),
                                         };
-
-                                        #[cfg(test)]
-                                        {
-                                            // For tests, use the mock client
-                                            *self.last_replicate_wal_op_request_for_test.lock().unwrap() = Some(proto_request.clone());
-                                            let mut successful_remote_replications_mock = 0;
-                                            for node_addr_mock in &conceptual_replica_nodes {
-                                                // Assuming MockReplicationClient is updated to handle proto_request or we adapt here
-                                                match self.mock_replication_client.replicate_wal_op(node_addr_mock, &proto_request).await {
-                                                    Ok(response_mock) if response_mock.success => {
-                                                        successful_remote_replications_mock += 1;
-                                                    }
-                                                    Ok(response_mock) => {
-                                                        warn!("Mock Replica {} failed for table {}.{}: {:?}", node_addr_mock, database.as_str(), table_name_str_ref, response_mock.error_message);
-                                                    }
-                                                    Err(e_mock) => {
-                                                        warn!("Mock RPC error to replica {} for table {}.{}: {:?}", node_addr_mock, database.as_str(), table_name_str_ref, e_mock);
-                                                    }
-                                                }
-                                            }
-                                            successful_replications = successful_remote_replications_mock; // Use this for quorum check in test mode
+                                        if !self.execute_replication_to_node(remote_target_address, proto_request.clone()).await {
+                                            return Err(Error::ReplicationError(format!("Failed to forward write (RF=1) to primary owner {:?}", target_node_for_this_batch)));
                                         }
-
-                                        #[cfg(not(test))]
-                                        {
-                                            // Production path: Use GrpcReplicationClient
-                                            use crate::replication_client::GrpcReplicationClient; // Ensure this is imported
-                                            let mut successful_remote_replications_grpc = 0;
-                                            for replica_address in &conceptual_replica_nodes {
-                                                debug!("Attempting to replicate WalOp to replica: {}", replica_address);
-                                                match GrpcReplicationClient::new(replica_address.clone()).await {
-                                                    Ok(mut client) => {
-                                                        match client.replicate_wal_op(proto_request.clone()).await {
-                                                            Ok(response_wrapper) => {
-                                                                let response = response_wrapper.into_inner();
-                                                                if response.success {
-                                                                    successful_remote_replications_grpc += 1;
-                                                                } else {
-                                                                    error!("Replication to {} failed: {:?}", replica_address, response.error_message.unwrap_or_default());
-                                                                }
-                                                            }
-                                                            Err(status) => {
-                                                                error!("Replication RPC to {} failed: {}", replica_address, status);
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e_client) => {
-                                                        error!("Failed to create replication client for {}: {:?}", replica_address, e_client);
-                                                        // Treat as a replication failure for this replica
-                                                    }
-                                                }
-                                            }
-                                            successful_replications = successful_remote_replications_grpc;
-                                        }
-
-                                        // Quorum logic (remains the same)
-                                        // So, for factor F, we need (F/2 + 1) total successes.
-                                        // Local write is one success. So, we need (F/2 + 1) - 1 successful remote replications.
-                                        // Or, more simply, total successes (local + remote) must be >= quorum.
-                                        // Local write counts as 1 success towards the quorum.
-                                        let required_quorum = (factor / 2) + 1;
-                                        if (successful_replications + 1) < required_quorum { // +1 for the local write
-                                            replication_successful = false;
-                                            let err_msg = format!(
-                                                "Quorum not met for table {}.{}: {}/{} successful replications ({} remote successes, 1 local). Replication factor {}",
-                                                database.as_str(), table_name_str_ref,
-                                                successful_replications + 1, required_quorum, successful_replications,
-                                                factor
-                                            );
-                                            error!("{}", err_msg);
-                                            return Err(Error::ReplicationError(err_msg));
-                                        } else {
-                                            debug!("Quorum met for table {}.{}: {}/{} successful replications.", database.as_str(), table_name_str_ref, successful_replications + 1, required_quorum);
-                                        }
-
-                                    } else if factor > 1 { // Replication factor > 1 but no replica nodes found/configured
-                                         warn!("Replication configured for {}.{} (factor {}), but no replica nodes to send to. Proceeding with local write only.", database.as_str(), table_name_str_ref, factor);
-                                         // Depending on policy, this might be an error or just a warning.
-                                         // For now, assume local write is acceptable if no replicas are defined/found.
                                     }
+                                    // If local_op and RF=1, ops_for_local_wal already has it, no remote ops needed.
+                                }
+                            } else { // No replication info, only local write
+                                if !is_local_op && target_node_for_this_batch.is_some() {
+                                    error!("Data for table {}.{} hashes to remote node {:?} but no replication info found.", db_name.as_str(), table_name_str_ref, target_node_for_this_batch);
+                                    return Err(Error::ReplicationError("Cannot route write: data for remote node but no replication configured.".to_string()));
                                 }
                             }
                         }
                     }
                 }
-                // --- End Replication Logic Placeholder ---
 
-                if !replication_successful {
-                     // If replication failed and is critical, error out or handle according to policy
-                     // For now, this path might not be hit due to placeholder logic.
-                    return Err(Error::ReplicationError("Critical replication failed.".to_string()));
-                }
-
-                // Proceed with local WAL write
-                if no_sync {
-                    self.wal.write_ops_unconfirmed(vec![wal_op]).await?;
-                } else {
-                    self.wal.write_ops(vec![wal_op]).await?;
+                // Write all locally destined ops to WAL
+                if !ops_for_local_wal.is_empty() {
+                    if no_sync {
+                        self.wal.write_ops_unconfirmed(ops_for_local_wal).await?;
+                    } else {
+                        self.wal.write_ops(ops_for_local_wal).await?;
+                    }
                 }
             }
 

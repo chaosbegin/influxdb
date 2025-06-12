@@ -1,8 +1,17 @@
 pub mod rebalance;
 pub mod error;
-pub mod membership; // Added membership module
+pub mod membership;
+pub mod migrator; // Added migrator module
 
 pub use rebalance::initiate_shard_move_conceptual;
-pub use rebalance::RebalanceError; // Assuming RebalanceError is still relevant from its own module
+// Re-exporting all conceptual steps for potential individual use or testing
+pub use rebalance::{
+    complete_shard_snapshot_transfer_conceptual,
+    complete_shard_wal_sync_conceptual,
+    complete_shard_cutover_conceptual,
+    complete_shard_cleanup_conceptual,
+    RebalanceError
+};
 pub use error::ClusterManagerError;
-pub use membership::StaticClusterMembership; // Added use
+pub use membership::StaticClusterMembership;
+pub use migrator::{ShardMigrator, ShardMigrationJob}; // Added exports

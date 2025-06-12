@@ -19,6 +19,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+// Default for num_hash_partitions in TableSnapshot
+fn default_num_hash_partitions_snapshot() -> u32 {
+    1
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CatalogSnapshot {
     pub(crate) nodes: RepositorySnapshot<NodeId, NodeSnapshot>,
@@ -144,8 +149,12 @@ pub(crate) struct TableSnapshot {
     // TODO(sgc): Remove `skip_serializing_if` when implementation is complete
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub(crate) hard_delete_time: Option<i64>,
-    #[serde(default)] // For backward compatibility with snapshots without shards
+    #[serde(default)]
     pub(crate) shards: RepositorySnapshot<ShardId, ShardDefinitionSnapshot>,
+    #[serde(default)] // Defaults to empty Vec
+    pub(crate) shard_keys: Vec<String>,
+    #[serde(default = "default_num_hash_partitions_snapshot")]
+    pub(crate) num_hash_partitions: u32,
 }
 
 fn default_shard_status() -> String {
@@ -414,7 +423,9 @@ impl From<&crate::catalog::TableDefinition> for TableSnapshot {
             distinct_caches: td.distinct_caches.snapshot_with_item_transform(crate::snapshot::DistinctCacheSnapshot::from),
             deleted: td.deleted,
             hard_delete_time: td.hard_delete_time.map(|t| t.timestamp_nanos()),
-            shards: td.shards.snapshot_with_item_transform(ShardDefinitionSnapshot::from), // Added
+            shards: td.shards.snapshot_with_item_transform(ShardDefinitionSnapshot::from),
+            shard_keys: td.shard_keys.clone(), // Added
+            num_hash_partitions: td.num_hash_partitions, // Added
         }
     }
 }
@@ -473,9 +484,11 @@ impl From<TableSnapshot> for crate::catalog::TableDefinition {
             hard_delete_time: ts.hard_delete_time.map(iox_time::Time::from_timestamp_nanos),
             shards: crate::catalog::Repository::from_snapshot_with_item_transform(
                 ts.shards,
-                crate::shard::ShardDefinition::from, // Uses From impl created earlier
+                crate::shard::ShardDefinition::from,
             ),
-            replication_info: None, // TODO: Add replication_info to TableSnapshot if it's not there
+            replication_info: None, // TODO: Add replication_info to TableSnapshot if not present
+            shard_keys: ts.shard_keys, // Added
+            num_hash_partitions: ts.num_hash_partitions, // Added
         }
     }
 }

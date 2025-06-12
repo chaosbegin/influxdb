@@ -274,7 +274,8 @@ pub struct WriteBatch {
     pub table_chunks: SerdeVecMap<TableId, TableChunks>,
     pub min_time_ns: i64,
     pub max_time_ns: i64,
-    pub shard_id: Option<ShardId>, // Added for sharding
+    pub shard_id: Option<ShardId>, // For time-based sharding
+    pub hash_partition_index: Option<u32>, // For hash-based sharding within a time shard
 }
 
 impl WriteBatch {
@@ -283,7 +284,8 @@ impl WriteBatch {
         database_id: DbId,
         database_name: Arc<str>,
         table_chunks: IndexMap<TableId, TableChunks>,
-        shard_id: Option<ShardId>, // Added for sharding
+        shard_id: Option<ShardId>,
+        hash_partition_index: Option<u32>, // Added
     ) -> Self {
         // find the min and max times across the table chunks
         let (min_time_ns, max_time_ns) = table_chunks.values().fold(
@@ -303,7 +305,8 @@ impl WriteBatch {
             table_chunks: table_chunks.into(),
             min_time_ns,
             max_time_ns,
-            shard_id, // Added for sharding
+            shard_id,
+            hash_partition_index, // Added
         }
     }
 

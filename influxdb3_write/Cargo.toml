@@ -47,6 +47,7 @@ bimap.workspace = true
 chrono.workspace  = true
 # http is required for tonic::transport::Error potentially wrapping http::uri::InvalidUri
 http.workspace = true
+murmur3 = "0.0.5" # Added for consistent hashing
 # prost is required by tonic/influxdb3_proto
 prost.workspace = true
 crc32fast.workspace  = true

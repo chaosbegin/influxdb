@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package influxdb3.internal.distributed_query.v1;
+
+// Message Definitions
+message ExecuteQueryFragmentRequest {
+  string db_name = 1; // Database name to execute against
+  bytes query_fragment = 2; // Could be serialized LogicalPlan, physical plan part, or specific SQL/InfluxQL
+  string fragment_type = 3; // E.g., "RawSql", "SerializedDataFusionLogicalPlan", "InfluxQLShardQuery"
+  // Optional: map<string, string> parameters = 4; // For parameterized queries
+  // Optional: string trace_id = 5;
+  // Optional: string session_id = 6; // To link to a session context if needed
+  // Optional: bytes schema = 7; // Serialized Arrow schema for the fragment, if needed by receiver
+}
+
+message ExecuteQueryFragmentResponse {
+  bytes record_batch_bytes = 1; // Serialized Arrow RecordBatch (e.g., using IPC stream format without schema, or single batch IPC format)
+  // Optional: string error_message = 2; // If a batch processing error occurs mid-stream
+}
+
+// Service Definition
+service DistributedQueryService {
+  rpc ExecuteQueryFragment(ExecuteQueryFragmentRequest) returns (stream ExecuteQueryFragmentResponse);
+}

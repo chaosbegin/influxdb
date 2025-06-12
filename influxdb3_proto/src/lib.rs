@@ -6,6 +6,7 @@ pub mod gen {
     // The actual generated filename will be `influxdb3.internal.replication.v1.rs`
     // inside the `src/gen` directory.
     tonic::include_proto!("influxdb3.internal.replication.v1");
+    tonic::include_proto!("influxdb3.internal.distributed_query.v1"); // Added
 }
 
 // Optional: Re-export the generated types for easier access from other crates.
@@ -15,18 +16,29 @@ pub mod influxdb3 {
         pub mod replication {
             pub mod v1 {
                 pub use crate::gen::{
-                    replication_service_client, // Client struct: ReplicationServiceClient
-                    ReplicationServiceClient,   // Alias for convenience if needed, or rely on full path
+                    replication_service_client as GrpcReplicationServiceClient, // Alias to avoid name clash if re-exporting multiple clients
+                    ReplicationServiceClient,
                     ReplicateWalOpRequest,
                     ReplicateWalOpResponse,
-                    // Add other request/response types generated if any
                 };
-
-                // Re-export server traits if this crate is also used by servers
-                // (which it is, as per build.rs)
                 pub use crate::gen::{
-                    ReplicationService,         // Service trait: ReplicationService
-                    ReplicationServiceServer,   // Server struct: ReplicationServiceServer
+                    ReplicationService,
+                    ReplicationServiceServer,
+                };
+            }
+        }
+
+        pub mod distributed_query {
+            pub mod v1 {
+                pub use crate::gen::{
+                    distributed_query_service_client as GrpcDistributedQueryServiceClient, // Alias
+                    DistributedQueryServiceClient,
+                    ExecuteQueryFragmentRequest,
+                    ExecuteQueryFragmentResponse,
+                };
+                pub use crate::gen::{
+                    DistributedQueryService,
+                    DistributedQueryServiceServer,
                 };
             }
         }

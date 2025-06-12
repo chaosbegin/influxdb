@@ -231,6 +231,19 @@ pub enum DatabaseCatalogOp {
     DeleteShard(DeleteShardLog),
     // Replication ops:
     SetReplication(SetReplicationLog),
+    // Table metadata ops (new)
+    UpdateTableMetadata(UpdateTableMetadataLog),
+}
+
+/// Log operation for updating table-level metadata, specifically for sharding.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateTableMetadataLog {
+    pub db_id: DbId,
+    pub table_id: TableId,
+    pub table_name: Arc<str>, // For context and consistency with other ops
+    pub shard_keys: Option<Vec<String>>,
+    pub num_hash_partitions: Option<u32>,
+    // updated_at_ts is implicitly the time_ns of the DatabaseBatch
 }
 
 impl DatabaseCatalogOp {

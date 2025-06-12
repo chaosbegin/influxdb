@@ -534,13 +534,16 @@ impl IntoResponse for Error {
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
+use crate::query_executor::QueryExecutorImpl; // Added for concrete type
+
 #[derive(Debug)]
 pub(crate) struct HttpApi {
     common_state: CommonServerState,
     write_buffer: Arc<dyn WriteBuffer>,
     processing_engine: Arc<ProcessingEngineManagerImpl>,
     time_provider: Arc<dyn TimeProvider>,
-    pub(crate) query_executor: Arc<dyn QueryExecutor>,
+    pub(crate) query_executor: Arc<dyn QueryExecutor>, // Stays as dyn for general use
+    query_executor_impl_concrete: Arc<QueryExecutorImpl>, // Added for specific DI needs
     max_request_bytes: usize,
     authorizer: Arc<dyn AuthProvider>,
     legacy_write_param_unifier: SingleTenantRequestUnifier,
@@ -551,7 +554,7 @@ impl HttpApi {
         common_state: CommonServerState,
         time_provider: Arc<dyn TimeProvider>,
         write_buffer: Arc<dyn WriteBuffer>,
-        query_executor: Arc<dyn QueryExecutor>,
+        query_executor: Arc<QueryExecutorImpl>, // Changed to concrete type
         processing_engine: Arc<ProcessingEngineManagerImpl>,
         max_request_bytes: usize,
         authorizer: Arc<dyn AuthProvider>,
@@ -560,16 +563,30 @@ impl HttpApi {
         // check twice. So, instead we pass in a NoAuthAuthenticator to avoid authenticating twice.
         let legacy_write_param_unifier =
             SingleTenantRequestUnifier::new(Arc::clone(&NoAuthAuthenticator.upcast()));
+
+        let query_executor_dyn: Arc<dyn QueryExecutor> = Arc::clone(&query_executor); // Upcast for general field
+
         Self {
             common_state,
             time_provider,
             write_buffer,
-            query_executor,
+            query_executor: query_executor_dyn, // Store as dyn
+            query_executor_impl_concrete: query_executor, // Store concrete
             max_request_bytes,
             authorizer,
             legacy_write_param_unifier,
             processing_engine,
         }
+    }
+
+    // Getter for the concrete QueryExecutorImpl
+    pub(crate) fn query_executor_impl(&self) -> Arc<QueryExecutorImpl> {
+        Arc::clone(&self.query_executor_impl_concrete)
+    }
+
+    // Getter for the catalog (assuming WriteBuffer has it)
+    pub(crate) fn catalog(&self) -> Arc<influxdb3_catalog::catalog::Catalog> {
+        self.write_buffer.catalog()
     }
 }
 
@@ -1870,6 +1887,8 @@ pub(crate) async fn route_request(
             cluster::handle_update_node_status(State(Arc::clone(&http_server)), Path(node_id_str), http_server.read_body_json(req).await?).await.into_response()
         },
         (Method::POST, all_paths::API_V3_CLUSTER_SHARDS_MOVE) => cluster::handle_initiate_shard_move(State(Arc::clone(&http_server)), http_server.read_body_json(req).await?).await.into_response(),
+        // New route for updating table sharding configuration
+        (Method::PUT, all_paths::API_V3_TABLE_SHARDING_CONFIG) => cluster::handle_update_table_sharding_config(State(Arc::clone(&http_server)), http_server.read_body_json(req).await?).await.into_response(),
 
 
         (Method::DELETE, all_paths::API_V3_CONFIGURE_TOKEN) => http_server.delete_token(req).await,

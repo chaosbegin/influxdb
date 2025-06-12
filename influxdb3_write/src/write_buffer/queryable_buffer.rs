@@ -203,10 +203,12 @@ impl QueryableBuffer {
                                 table_name.as_ref(),
                                 table_id.get(),
                                 chunk.chunk_time,
-                                chunk.shard_id, // Pass shard_id to ParquetFilePath
+                                chunk.time_shard_id, // Pass time_shard_id from SnapshotChunk
+                                chunk.hash_partition_index, // Pass hash_partition_index from SnapshotChunk
                                 snapshot_details.last_wal_sequence_number,
                             ),
-                            shard_id: chunk.shard_id, // Store shard_id in PersistJob
+                            shard_id: chunk.time_shard_id, // Store time_shard_id
+                            hash_partition_index: chunk.hash_partition_index, // Store hash_partition_index
                             batch: chunk.record_batch,
                             schema: chunk.schema,
                             timestamp_min_max: chunk.timestamp_min_max,
@@ -522,7 +524,8 @@ struct PersistJob {
     database_id: DbId,
     table_id: TableId,
     table_name: Arc<str>,
-    shard_id: Option<ShardId>, // Added shard_id
+    shard_id: Option<ShardId>, // This is the time_shard_id
+    hash_partition_index: Option<u32>, // Added
     chunk_time: i64,
     path: ParquetFilePath,
     batch: RecordBatch,

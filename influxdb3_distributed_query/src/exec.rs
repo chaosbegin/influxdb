@@ -11,9 +11,15 @@ use futures::stream::{self, StreamExt}; // For creating a SendableRecordBatchStr
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-// use tokio::sync::Mutex; // Not needed for the conceptual client placeholder
 
-use influxdb3_id::NodeId; // Using NodeId from influxdb3_id
+use influxdb3_id::NodeId;
+use influxdb3_proto::influxdb3::internal::distributed_query::v1::{
+    distributed_query_service_client::DistributedQueryServiceClient, // For conceptual client
+    ExecuteQueryFragmentRequest, ExecuteQueryFragmentResponse,
+};
+use arrow::ipc::reader::StreamReader; // For deserializing RecordBatch
+use std::io::Cursor; // To read bytes as a stream
+use bytes::Bytes; // For request bytes
 
 // Conceptual representation of what might be sent to a remote node for execution.
 #[derive(Debug, Clone)]
@@ -33,16 +39,18 @@ pub enum QueryFragment {
 /// query fragment on a remote InfluxDB 3 node and streaming the results back.
 #[derive(Debug)]
 pub struct RemoteScanExec {
-    target_node_id: NodeId, // Using the strong type NodeId
-    target_node_address: String, // RPC address (e.g., "host:port")
-    query_fragment: Arc<QueryFragment>, // Using Arc to allow cloning without deep copying QueryFragment
-    projected_schema: SchemaRef, // The schema of the data this operator will produce
-    cache: PlanProperties, // Cache for PlanProperties
+    db_name: String, // Added database name
+    target_node_id: NodeId,
+    target_node_address: String,
+    query_fragment: Arc<QueryFragment>,
+    projected_schema: SchemaRef,
+    cache: PlanProperties,
 }
 
 impl RemoteScanExec {
     /// Creates a new `RemoteScanExec` operator.
     pub fn new(
+        db_name: String, // Added
         target_node_id: NodeId,
         target_node_address: String,
         query_fragment: QueryFragment,
@@ -50,6 +58,7 @@ impl RemoteScanExec {
     ) -> Self {
         let cache = Self::compute_properties(projected_schema.clone());
         Self {
+            db_name, // Added
             target_node_id,
             target_node_address,
             query_fragment: Arc::new(query_fragment),
@@ -92,6 +101,11 @@ impl RemoteScanExec {
     /// Returns the network address of the target node.
     pub fn target_node_address(&self) -> &str {
         &self.target_node_address
+    }
+
+    /// Returns the database name for the query.
+    pub fn db_name(&self) -> &str {
+        &self.db_name
     }
 }
 
@@ -145,49 +159,57 @@ impl ExecutionPlan for RemoteScanExec {
         }
 
         // ** CONCEPTUAL GRPC CLIENT CALL **
-        // The following section is a placeholder for the actual gRPC client implementation.
-        // In a real scenario:
-        // 1. A gRPC client for a `DistributedQueryService` would be instantiated,
-        //    connecting to `self.target_node_address`. This client might be managed
-        //    by the TaskContext or a query session state.
-        //    Example:
-        //    `let mut client = context.get_distributed_query_client(&self.target_node_address).await.map_err(|e| DataFusionError::Execution(format!("Failed to connect: {}", e)))?;`
-        //
-        // 2. A request message (e.g., `ExecuteFragmentRequest` from a .proto definition)
-        //    would be constructed using `self.query_fragment` and other necessary context
-        //    (like trace IDs, session parameters from `_context`).
-        //    Example:
-        //    `let proto_fragment = self.query_fragment.to_proto_enum(); // Assuming conversion to proto type`
-        //    `let request = tonic::Request::new(ExecuteFragmentRequest { query_fragment: Some(proto_fragment), ... });`
-        //
-        // 3. The client's RPC method would be called:
-        //    `let response_stream = client.execute_fragment(request).await.map_err(|e| DataFusionError::Execution(format!("Remote execution failed: {}", e)))?;`
-        //
-        // 4. The `response_stream` (a `tonic::Streaming<ExecuteFragmentResponse>`) would then be
-        //    adapted into a `SendableRecordBatchStream`. Each `ExecuteFragmentResponse` would
-        //    likely contain a serialized `RecordBatch` that needs deserialization.
-        //    This adaptation requires careful handling of Arrow data over gRPC, often using
-        //    Arrow Flight or a custom serialization format for RecordBatches.
+        tracing::info!("RemoteScanExec: Conceptually connecting to {} for node {}", self.target_node_address, self.target_node_id.get());
 
-        // For this conceptual implementation, we return an empty stream with the correct schema.
-        // This allows the operator to be integrated into a plan and tested without
-        // requiring a live gRPC service or client.
+        // 1. Conceptual client creation
+        // let mut client = DistributedQueryServiceClient::connect(self.target_node_address.clone()) // Requires "http://" prefix
+        //     .await
+        //     .map_err(|e| DataFusionError::Execution(format!("Failed to connect to remote node {}: {}", self.target_node_address, e)))?;
+
+        // 2. Prepare request
+        let (fragment_bytes, fragment_type_str) = match self.query_fragment.as_ref() {
+            QueryFragment::RawSql(sql) => (Bytes::from(sql.clone()), "RawSql".to_string()),
+            QueryFragment::SerializedPlan(plan_bytes) => (Bytes::from(plan_bytes.clone()), "SerializedDataFusionLogicalPlan".to_string()),
+        };
+
+        let _request_payload = ExecuteQueryFragmentRequest {
+            db_name: self.db_name.clone(),
+            query_fragment: fragment_bytes,
+            fragment_type: fragment_type_str,
+        };
+
+        // let request = tonic::Request::new(request_payload);
+
+        // 3. Call remote service (conceptual)
+        // let grpc_response_stream = client.execute_query_fragment(request)
+        //     .await
+        //     .map_err(|e| DataFusionError::Execution(format!("Remote query execution failed: {}", e)))?
+        //     .into_inner();
+
+        // 4. Adapt gRPC stream to SendableRecordBatchStream (conceptual)
+        // let output_stream = grpc_response_stream.map_err(|e: tonic::Status| DataFusionError::Execution(format!("gRPC stream error: {}", e)))
+        //     .and_then(|res: ExecuteQueryFragmentResponse| async move {
+        //         if let Some(err_msg) = res.error_message {
+        //              return Err(DataFusionError::Execution(format!("Remote batch error: {}", err_msg)));
+        //         }
+        //         // Deserialize RecordBatch from res.record_batch_bytes (Arrow IPC format)
+        //         let cursor = Cursor::new(res.record_batch_bytes);
+        //         let mut reader = StreamReader::try_new(cursor, None) // Assuming stream format without schema, or schema known
+        //             .map_err(|e| DataFusionError::Execution(format!("Failed to create IPC StreamReader: {}", e)))?;
+        //         if let Some(batch) = reader.next() {
+        //             batch.map_err(|e| DataFusionError::Execution(format!("Failed to read batch from IPC: {}", e)))
+        //         } else {
+        //             Err(DataFusionError::Execution("Received empty or invalid RecordBatch IPC message".to_string()))
+        //         }
+        //     });
+
+        // For this conceptual implementation, return an empty stream with the correct schema.
         let schema = self.projected_schema.clone();
-        let empty_stream = futures::stream::empty();
-
-        // Wrap the empty stream with RecordBatchStreamAdapter
-        // This adapter requires the schema and the stream of RecordBatches.
-        // Since our stream is `futures::stream::Empty<DFResult<RecordBatch>>`,
-        // we need to ensure the types match. `Empty` produces `()`, not `DFResult<RecordBatch>`.
-        // Correct way for an empty stream of RecordBatches:
-        let stream_of_results: BoxStream<'static, DFResult<arrow::record_batch::RecordBatch>> = Box::pin(stream::empty());
-
-        Ok(Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                schema,
-                stream_of_results,
-            ),
-        ))
+        let stream_adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::empty(), // This produces BoxStream<'static, DFResult<RecordBatch>>
+        );
+        Ok(Box::pin(stream_adapter))
     }
 
     fn statistics(&self) -> DFResult<Statistics> {
@@ -209,10 +231,11 @@ impl DisplayAs for RemoteScanExec {
 
                 write!(
                     f,
-                    "RemoteScanExec: target_node_id={}, target_node_address={}, fragment_type={}, projection=[{}]",
-                    self.target_node_id.get(), // Use .get() for NodeId's u64 value
+                    "RemoteScanExec: db_name={}, target_node_id={}, target_node_address={}, fragment_type={}, projection=[{}]",
+                    self.db_name,
+                    self.target_node_id.get(),
                     self.target_node_address,
-                    match *self.query_fragment { // Dereference Arc then match
+                    match *self.query_fragment {
                         QueryFragment::SerializedPlan(_) => "SerializedPlan",
                         QueryFragment::RawSql(_) => "RawSql",
                     },
@@ -267,17 +290,20 @@ mod tests {
     #[test]
     fn test_remote_scan_exec_new() {
         let schema = create_test_schema();
+        let db_name = "test_db".to_string();
         let node_id = NodeId::new(1);
         let address = "node1.example.com:8080".to_string();
         let fragment = QueryFragment::RawSql("SELECT * FROM test_table".to_string());
 
         let exec_plan = RemoteScanExec::new(
+            db_name.clone(),
             node_id,
             address.clone(),
             fragment.clone(),
             schema.clone(),
         );
 
+        assert_eq!(exec_plan.db_name(), db_name);
         assert_eq!(exec_plan.target_node_id(), node_id);
         assert_eq!(exec_plan.target_node_address(), address);
         match &*exec_plan.query_fragment() { // Dereference Arc
@@ -293,11 +319,13 @@ mod tests {
     #[tokio::test]
     async fn test_remote_scan_exec_execute() {
         let schema = create_test_schema();
+        let db_name = "test_db".to_string();
         let node_id = NodeId::new(1);
         let address = "node1.example.com:8080".to_string();
         let fragment = QueryFragment::SerializedPlan(vec![1, 2, 3]);
 
         let exec_plan = Arc::new(RemoteScanExec::new(
+            db_name.clone(),
             node_id,
             address.clone(),
             fragment.clone(),
@@ -327,11 +355,13 @@ mod tests {
     #[test]
     fn test_remote_scan_exec_display_as() {
         let schema = create_test_schema();
+        let db_name = "test_db_display".to_string();
         let node_id = NodeId::new(1);
         let address = "node1.example.com:8080".to_string();
         let fragment_sql = QueryFragment::RawSql("SELECT id, value FROM test_table".to_string());
 
         let exec_plan_sql = RemoteScanExec::new(
+            db_name.clone(),
             node_id,
             address.clone(),
             fragment_sql.clone(),
@@ -341,11 +371,12 @@ mod tests {
         let display_sql = format!("{}", exec_plan_sql.displayable());
         assert_eq!(
             display_sql,
-            "RemoteScanExec: target_node_id=1, target_node_address=node1.example.com:8080, fragment_type=RawSql, projection=[id, value]"
+            "RemoteScanExec: db_name=test_db_display, target_node_id=1, target_node_address=node1.example.com:8080, fragment_type=RawSql, projection=[id, value]"
         );
 
         let fragment_plan = QueryFragment::SerializedPlan(vec![0xDE, 0xAD, 0xBE, 0xEF]);
          let exec_plan_plan = RemoteScanExec::new(
+            db_name.clone(),
             node_id,
             address.clone(),
             fragment_plan.clone(),
@@ -354,18 +385,20 @@ mod tests {
         let display_plan = format!("{}", exec_plan_plan.displayable());
          assert_eq!(
             display_plan,
-            "RemoteScanExec: target_node_id=1, target_node_address=node1.example.com:8080, fragment_type=SerializedPlan, projection=[id, value]"
+            "RemoteScanExec: db_name=test_db_display, target_node_id=1, target_node_address=node1.example.com:8080, fragment_type=SerializedPlan, projection=[id, value]"
         );
     }
 
      #[test]
     fn test_with_new_children() {
         let schema = create_test_schema();
+        let db_name = "test_db_children".to_string();
         let node_id = NodeId::new(1);
         let address = "node1.example.com:8080".to_string();
         let fragment = QueryFragment::RawSql("SELECT * FROM test_table".to_string());
 
         let exec_plan = Arc::new(RemoteScanExec::new(
+            db_name.clone(),
             node_id,
             address.clone(),
             fragment.clone(),
@@ -388,11 +421,13 @@ mod tests {
     #[tokio::test]
     async fn test_statistics() {
         let schema = create_test_schema();
+        let db_name = "test_db_stats".to_string();
         let node_id = NodeId::new(1);
         let address = "node1.example.com:8080".to_string();
         let fragment = QueryFragment::RawSql("SELECT * FROM test_table".to_string());
 
         let exec_plan = RemoteScanExec::new(
+            db_name.clone(),
             node_id,
             address.clone(),
             fragment.clone(),

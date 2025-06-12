@@ -64,6 +64,11 @@ pub struct CatalogChangesCommitted {
 }
 
 use influxdb3_catalog::shard::ShardId;
+use influxdb3_catalog::shard::ShardId;
+use influxdb3_id::NodeId;
+use murmur3::murmur3_32; // For hashing
+use std::io::Cursor; // For hashing writable
+use std::collections::BTreeMap; // For sorted shard key string
 
 impl CatalogChangesCommitted {
     /// Convert this set of parsed and qualified lines into a set of rows
@@ -240,6 +245,50 @@ fn validate_and_qualify_v1_line(
         .unwrap_or(ingest_time.timestamp_nanos());
     fields.push(Field::new(time_col_id, FieldData::Timestamp(timestamp_ns)));
 
+    // --- Hashing Logic ---
+    // Get shard keys from table_def
+    let shard_keys_from_def = &table_def.shard_keys;
+    let num_partitions = table_def.num_hash_partitions;
+    let mut calculated_hash_partition_index: Option<u32> = None;
+
+    if num_partitions > 1 && !shard_keys_from_def.is_empty() {
+        // Collect tags from the current line
+        let mut line_tags = BTreeMap::new(); // Use BTreeMap for sorted keys
+        if let Some(tag_set) = &line.series.tag_set {
+            for (k, v) in tag_set.iter() {
+                line_tags.insert(k.as_str().to_string(), v.as_str().to_string());
+            }
+        }
+
+        let mut shard_key_parts = Vec::with_capacity(shard_keys_from_def.len());
+        for key_name in shard_keys_from_def {
+            if let Some(value) = line_tags.get(key_name) {
+                shard_key_parts.push(format!("{}={}", key_name, value));
+            } else {
+                // A defined shard key is missing from the line's tags
+                return Err(WriteLineError {
+                    original_line: line.to_string(),
+                    line_number: line_number + 1,
+                    error_message: format!("Missing required shard key tag: {}", key_name),
+                });
+            }
+        }
+        // Canonical string: already sorted by BTreeMap iteration if shard_keys_from_def was sorted,
+        // or sort shard_key_parts now if shard_keys_from_def order isn't guaranteed/canonical.
+        // Assuming shard_keys_from_def is the canonical order.
+        let canonical_shard_key_string = shard_key_parts.join(",");
+
+        let hash_value = murmur3_32(&mut Cursor::new(canonical_shard_key_string.as_bytes()), 0)
+            .map_err(|e| WriteLineError {
+                original_line: line.to_string(),
+                line_number: line_number + 1,
+                error_message: format!("Failed to compute shard key hash: {}", e),
+            })?;
+
+        calculated_hash_partition_index = Some(hash_value % num_partitions);
+    }
+    // --- End Hashing Logic ---
+
     Ok(QualifiedLine {
         table_id: table_def.table_id,
         row: Row {
@@ -248,6 +297,8 @@ fn validate_and_qualify_v1_line(
         },
         index_count,
         field_count,
+        hash_partition_index: calculated_hash_partition_index,
+        target_node_id_for_hash_partition: None, // To be filled in later by WriteBufferImpl
     })
 }
 
@@ -333,6 +384,11 @@ impl WriteValidator<CatalogChangesCommitted> {
             self.state.db_name,
             table_chunks,
             self.state.shard_id,
+            // Determine a single hash_partition_index for the batch.
+            // If all lines have the same Some(index), use it. Otherwise, None.
+            // This is a simplification; true splitting per hash index happens later.
+            self.state.lines.first().and_then(|ql| ql.hash_partition_index)
+                .filter(|&first_hpi| self.state.lines.iter().all(|ql| ql.hash_partition_index == Some(first_hpi))),
         );
 
         ValidatedLines {
@@ -363,6 +419,9 @@ struct QualifiedLine {
     row: Row,
     index_count: usize,
     field_count: usize,
+    // New fields for hash partitioning results
+    hash_partition_index: Option<u32>,
+    target_node_id_for_hash_partition: Option<NodeId>,
 }
 
 fn apply_precision_to_timestamp(precision: Precision, ts: i64) -> i64 {
@@ -389,10 +448,11 @@ mod tests {
     use crate::{Precision, write_buffer::Error};
     use data_types::NamespaceName;
     use influxdb3_catalog::catalog::Catalog;
-    use influxdb3_id::TableId;
-    use influxdb3_wal::Gen1Duration;
+    use influxdb3_id::{TableId, NodeId}; // Added NodeId for tests
+    use influxdb3_wal::{Gen1Duration, WriteBatch}; // Added WriteBatch for inspection
     use iox_time::{MockProvider, Time};
     use object_store::memory::InMemory;
+    use crate::write_buffer::validator::QualifiedLine; // To inspect QualifiedLine
 
     #[tokio::test]
     async fn write_validator_v1() -> Result<(), Error> {
@@ -471,6 +531,184 @@ mod tests {
         assert_eq!(result.index_count, 1);
         assert!(result.errors.is_empty());
         assert_eq!(expected_sequence, catalog.sequence_number());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_qualify_line_with_hashing() -> Result<(), Error> {
+        let node_id_arc = Arc::from("test_node_hashing");
+        let obj_store = Arc::new(InMemory::new());
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let catalog = Arc::new(
+            Catalog::new(node_id_arc, obj_store, time_provider, Default::default())
+                .await
+                .unwrap(),
+        );
+
+        let db_name_str = "hash_db";
+        let table_name_str = "hash_table";
+        let db_name_ns = NamespaceName::new(db_name_str).unwrap();
+
+        // Setup table with shard_keys and num_hash_partitions
+        catalog.create_database(db_name_str).await.unwrap();
+        // For this test, we don't need to create columns via API, as validate_and_qualify_v1_line will add them.
+        // We manually update the table's sharding metadata after it's implicitly created by first write.
+
+        // Initial write to create the table implicitly
+        let initial_lp = format!("{},tag1=valA,tag2=valX field1=1i 100", table_name_str);
+        let mut validator = WriteValidator::initialize(db_name_ns.clone(), Arc::clone(&catalog))?;
+        let lines_parsed_state = validator.v1_parse_lines_and_catalog_updates(
+            &initial_lp, false, Time::from_timestamp_nanos(0), Precision::Nanosecond
+        )?.into_inner();
+
+        let db_id = lines_parsed_state.txn.db_schema().id;
+        let table_id = lines_parsed_state.txn.db_schema().table_name_to_id(table_name_str).unwrap();
+
+        // Now, apply the catalog changes from the initial write
+        let _ = catalog.commit(lines_parsed_state.txn).await.unwrap();
+
+
+        // Update table metadata for sharding
+        let shard_keys = vec!["tag1".to_string(), "tag2".to_string()];
+        let num_hash_partitions = 4u32;
+        catalog.update_table_sharding_metadata(db_name_str, table_name_str, Some(shard_keys.clone()), Some(num_hash_partitions)).await.unwrap();
+
+        // Test line that should be hashed
+        let lp_to_hash = format!("{},tag1=valB,tag2=valY field2=2i 200", table_name_str);
+        let mut validator_for_hash = WriteValidator::initialize(db_name_ns.clone(), Arc::clone(&catalog))?;
+        let lines_parsed_for_hash = validator_for_hash.v1_parse_lines_and_catalog_updates(
+            &lp_to_hash, false, Time::from_timestamp_nanos(0), Precision::Nanosecond
+        )?.into_inner();
+
+        assert_eq!(lines_parsed_for_hash.lines.len(), 1);
+        let qualified_line_hashed = &lines_parsed_for_hash.lines[0];
+
+        // Verify hash_partition_index calculation
+        let expected_key_string = "tag1=valB,tag2=valY"; // Order based on shard_keys vec
+        let expected_hash = murmur3_32(&mut Cursor::new(expected_key_string.as_bytes()), 0).unwrap();
+        let expected_index = expected_hash % num_hash_partitions;
+
+        assert_eq!(qualified_line_hashed.hash_partition_index, Some(expected_index));
+        assert!(qualified_line_hashed.target_node_id_for_hash_partition.is_none()); // Still None at this stage
+
+        // Test line missing a shard key tag (should error)
+        let lp_missing_key = format!("{},tag1=valC field3=3i 300", table_name_str);
+        let mut validator_missing_key = WriteValidator::initialize(db_name_ns.clone(), Arc::clone(&catalog))?;
+        let result_missing_key = validator_missing_key.v1_parse_lines_and_catalog_updates(
+            &lp_missing_key, false, Time::from_timestamp_nanos(0), Precision::Nanosecond
+        );
+        assert!(result_missing_key.is_err());
+        if let Err(Error::ParseError(write_line_error)) = result_missing_key {
+            assert!(write_line_error.error_message.contains("Missing required shard key tag: tag2"));
+        } else {
+            panic!("Expected a ParseError for missing shard key tag, got {:?}", result_missing_key);
+        }
+
+        // Test line for a table with num_hash_partitions = 1 (should result in None for hash_partition_index)
+        let table_no_hash_str = "no_hash_table";
+        let lp_no_hash = format!("{},tag1=valD field4=4i 400", table_no_hash_str);
+        // Write to implicitly create table, default num_hash_partitions will be 1
+        let mut validator_no_hash_create = WriteValidator::initialize(db_name_ns.clone(), Arc::clone(&catalog))?;
+        let _ = validator_no_hash_create.v1_parse_lines_and_catalog_updates(
+            &lp_no_hash, false, Time::from_timestamp_nanos(0), Precision::Nanosecond
+        )?.into_inner(); // Consumed to create table in txn
+
+        // Now parse again to check QualifiedLine
+        let mut validator_no_hash = WriteValidator::initialize(db_name_ns.clone(), Arc::clone(&catalog))?;
+        let lines_parsed_no_hash = validator_no_hash.v1_parse_lines_and_catalog_updates(
+            &lp_no_hash, false, Time::from_timestamp_nanos(0), Precision::Nanosecond
+        )?.into_inner();
+        assert_eq!(lines_parsed_no_hash.lines.len(), 1);
+        let qualified_line_no_hash = &lines_parsed_no_hash.lines[0];
+        assert!(qualified_line_no_hash.hash_partition_index.is_none());
+        assert!(qualified_line_no_hash.target_node_id_for_hash_partition.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_convert_lines_to_buffer_sets_hash_partition_index() -> Result<(), Error> {
+        let node_id_arc = Arc::from("test_node_convert");
+        let obj_store = Arc::new(InMemory::new());
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let catalog = Arc::new(
+            Catalog::new(node_id_arc, obj_store, time_provider, Default::default())
+                .await
+                .unwrap(),
+        );
+        let db_name_str = "hash_convert_db";
+        let db_name_ns = NamespaceName::new(db_name_str).unwrap();
+        catalog.create_database(db_name_str).await.unwrap();
+
+        // Lines for the same table, time shard, but potentially different hash partitions
+        let ql1 = QualifiedLine {
+            table_id: TableId::new(1), row: Row { time: 100, fields: vec![] },
+            index_count: 0, field_count: 0,
+            hash_partition_index: Some(0), target_node_id_for_hash_partition: None,
+        };
+        let ql2 = QualifiedLine {
+            table_id: TableId::new(1), row: Row { time: 101, fields: vec![] },
+            index_count: 0, field_count: 0,
+            hash_partition_index: Some(0), target_node_id_for_hash_partition: None,
+        };
+        let ql_different_hpi = QualifiedLine {
+            table_id: TableId::new(1), row: Row { time: 102, fields: vec![] },
+            index_count: 0, field_count: 0,
+            hash_partition_index: Some(1), target_node_id_for_hash_partition: None,
+        };
+        let ql_none_hpi = QualifiedLine {
+            table_id: TableId::new(1), row: Row { time: 103, fields: vec![] },
+            index_count: 0, field_count: 0,
+            hash_partition_index: None, target_node_id_for_hash_partition: None,
+        };
+
+        let time_shard_id = Some(ShardId::new(100));
+
+        // Case 1: All lines have the same Some(hash_partition_index)
+        let state1 = CatalogChangesCommitted {
+            catalog_sequence: CatalogSequenceNumber::new(1), db_id: DbId::new(1), db_name: Arc::from(db_name_str),
+            lines: vec![ql1.clone(), ql2.clone()], bytes: 10, errors: vec![], shard_id: time_shard_id,
+        };
+        let validator1 = WriteValidator::from(state1);
+        let validated_lines1 = validator1.convert_lines_to_buffer(Gen1Duration::new_5m());
+        assert_eq!(validated_lines1.valid_data.hash_partition_index, Some(0));
+
+        // Case 2: Lines have different hash_partition_index values
+        let state2 = CatalogChangesCommitted {
+            catalog_sequence: CatalogSequenceNumber::new(2), db_id: DbId::new(1), db_name: Arc::from(db_name_str),
+            lines: vec![ql1.clone(), ql_different_hpi.clone()], bytes: 10, errors: vec![], shard_id: time_shard_id,
+        };
+        let validator2 = WriteValidator::from(state2);
+        let validated_lines2 = validator2.convert_lines_to_buffer(Gen1Duration::new_5m());
+        assert_eq!(validated_lines2.valid_data.hash_partition_index, None);
+
+        // Case 3: Some lines have None, others Some
+        let state3 = CatalogChangesCommitted {
+            catalog_sequence: CatalogSequenceNumber::new(3), db_id: DbId::new(1), db_name: Arc::from(db_name_str),
+            lines: vec![ql1.clone(), ql_none_hpi.clone()], bytes: 10, errors: vec![], shard_id: time_shard_id,
+        };
+        let validator3 = WriteValidator::from(state3);
+        let validated_lines3 = validator3.convert_lines_to_buffer(Gen1Duration::new_5m());
+        assert_eq!(validated_lines3.valid_data.hash_partition_index, None);
+
+        // Case 4: All lines have None for hash_partition_index
+        let state4 = CatalogChangesCommitted {
+            catalog_sequence: CatalogSequenceNumber::new(4), db_id: DbId::new(1), db_name: Arc::from(db_name_str),
+            lines: vec![ql_none_hpi.clone(), ql_none_hpi.clone()], bytes: 10, errors: vec![], shard_id: time_shard_id,
+        };
+        let validator4 = WriteValidator::from(state4);
+        let validated_lines4 = validator4.convert_lines_to_buffer(Gen1Duration::new_5m());
+        assert_eq!(validated_lines4.valid_data.hash_partition_index, None); // Still None as filter checks for Some(first_hpi)
+
+        // Case 5: Empty lines vector
+        let state5 = CatalogChangesCommitted {
+            catalog_sequence: CatalogSequenceNumber::new(5), db_id: DbId::new(1), db_name: Arc::from(db_name_str),
+            lines: vec![], bytes: 0, errors: vec![], shard_id: time_shard_id,
+        };
+        let validator5 = WriteValidator::from(state5);
+        let validated_lines5 = validator5.convert_lines_to_buffer(Gen1Duration::new_5m());
+        assert_eq!(validated_lines5.valid_data.hash_partition_index, None);
 
         Ok(())
     }

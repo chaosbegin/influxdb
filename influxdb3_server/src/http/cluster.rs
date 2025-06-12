@@ -32,6 +32,14 @@ pub(crate) struct InitiateShardMovePayload {
     pub target_node_id_str: String,
 }
 
+#[derive(serde::Deserialize, Debug)]
+pub(crate) struct UpdateTableShardingPayload {
+    pub db_name: String,
+    pub table_name: String,
+    pub shard_keys: Option<Vec<String>>,
+    pub num_hash_partitions: Option<u32>,
+}
+
 // --- Helper Functions ---
 
 fn parse_id_str<T>(
@@ -177,5 +185,33 @@ pub(crate) async fn handle_initiate_shard_move(
     ).await {
         Ok(_) => (StatusCode::ACCEPTED, Json(json!({"status": "shard move initiated"}))),
         Err(e) => map_rebalance_error(e),
+    }
+}
+
+pub(crate) async fn handle_update_table_sharding_config(
+    State(http_api): State<Arc<HttpApi>>,
+    payload: UpdateTableShardingPayload, // Already deserialized by http.rs dispatcher
+) -> impl IntoResponse {
+    debug!(?payload, "Handling update table sharding config request");
+
+    // Input validation for num_hash_partitions (already done in catalog method, but good for API too)
+    if let Some(n) = payload.num_hash_partitions {
+        if n == 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "num_hash_partitions cannot be 0"})),
+            );
+        }
+        // Further validation (e.g., max value) could be added here if desired.
+    }
+
+    match http_api.catalog().update_table_sharding_metadata(
+        &payload.db_name,
+        &payload.table_name,
+        payload.shard_keys, // Pass Option directly
+        payload.num_hash_partitions, // Pass Option directly
+    ).await {
+        Ok(_) => (StatusCode::OK, Json(json!({"status": "table sharding configuration updated"}))),
+        Err(e) => map_catalog_error(e), // map_catalog_error will handle DbNotFound, TableNotFound, InvalidConfiguration etc.
     }
 }

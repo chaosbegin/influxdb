@@ -72,7 +72,8 @@ impl ParquetFilePath {
         table_name: &str,
         table_id: u32,
         chunk_time: i64,
-        shard_id: Option<ShardId>, // Added shard_id
+        shard_id: Option<ShardId>,
+        hash_partition_index: Option<u32>, // Added hash_partition_index
         wal_file_sequence_number: WalFileSequenceNumber,
     ) -> Self {
         let date_time = DateTime::<Utc>::from_timestamp_nanos(chunk_time);
@@ -80,8 +81,12 @@ impl ParquetFilePath {
             || "".to_string(),
             |sid| format!("shard{}_", sid.get())
         );
+        let hash_prefix = hash_partition_index.map_or_else(
+            || "".to_string(),
+            |hidx| format!("hash{}_", hidx)
+        );
         let path = ObjPath::from(format!(
-            "{host_prefix}/dbs/{db_name}-{db_id}/{table_name}-{table_id}/{date_string}/{shard_prefix}{wal_seq:010}.{ext}",
+            "{host_prefix}/dbs/{db_name}-{db_id}/{table_name}-{table_id}/{date_string}/{shard_prefix}{hash_prefix}{wal_seq:010}.{ext}",
             date_string = date_time.format("%Y-%m-%d/%H-%M"),
             wal_seq = wal_file_sequence_number.as_u64(),
             ext = PARQUET_FILE_EXTENSION
@@ -157,7 +162,8 @@ fn parquet_file_path_new() {
                 .unwrap()
                 .timestamp_nanos_opt()
                 .unwrap(),
-            None, // No shard_id
+            None, // No time shard_id
+            None, // No hash_partition_index
             WalFileSequenceNumber::new(1337),
         ),
         ObjPath::from("my_host/dbs/my_db-0/my_table-0/2038-01-19/03-14/0000001337.parquet")
@@ -174,10 +180,47 @@ fn parquet_file_path_new() {
                 .unwrap()
                 .timestamp_nanos_opt()
                 .unwrap(),
-            Some(ShardId::new(42)), // With shard_id
+            Some(ShardId::new(42)), // With time shard_id
+            None, // No hash_partition_index
             WalFileSequenceNumber::new(1338),
         ),
         ObjPath::from("my_host/dbs/my_db-0/my_table-0/2038-01-19/03-14/shard42_0000001338.parquet")
+    );
+
+    assert_eq!(
+        *ParquetFilePath::new(
+            "my_host",
+            "my_db",
+            0,
+            "my_table",
+            0,
+            Utc.with_ymd_and_hms(2038, 1, 19, 3, 14, 7)
+                .unwrap()
+                .timestamp_nanos_opt()
+                .unwrap(),
+            Some(ShardId::new(42)), // With time shard_id
+            Some(3u32), // With hash_partition_index
+            WalFileSequenceNumber::new(1339),
+        ),
+        ObjPath::from("my_host/dbs/my_db-0/my_table-0/2038-01-19/03-14/shard42_hash3_0000001339.parquet")
+    );
+
+     assert_eq!(
+        *ParquetFilePath::new(
+            "my_host",
+            "my_db",
+            0,
+            "my_table",
+            0,
+            Utc.with_ymd_and_hms(2038, 1, 19, 3, 14, 7)
+                .unwrap()
+                .timestamp_nanos_opt()
+                .unwrap(),
+            None, // No time shard_id
+            Some(5u32), // With hash_partition_index but no time shard (less common but possible)
+            WalFileSequenceNumber::new(1340),
+        ),
+        ObjPath::from("my_host/dbs/my_db-0/my_table-0/2038-01-19/03-14/hash5_0000001340.parquet")
     );
 }
 
@@ -194,12 +237,13 @@ fn parquet_file_percent_encoded() {
                 .unwrap()
                 .timestamp_nanos_opt()
                 .unwrap(),
-            Some(ShardId::new(7)), // With shard_id
+            Some(ShardId::new(7)),
+            Some(2u32),
             WalFileSequenceNumber::new(100),
         )
         .as_ref()
         .as_ref(),
-        "%2E%2E/dbs/..-0/..-0/2038-01-19/03-14/shard7_0000000100.parquet"
+        "%2E%2E/dbs/..-0/..-0/2038-01-19/03-14/shard7_hash2_0000000100.parquet"
     );
 
     assert_eq!(
@@ -213,12 +257,13 @@ fn parquet_file_percent_encoded() {
                 .unwrap()
                 .timestamp_nanos_opt()
                 .unwrap(),
-            None, // No shard_id
+            None,
+            None,
             WalFileSequenceNumber::new(101),
         )
         .as_ref()
         .as_ref(),
-        "%2E%2E/dbs/..-0/..-0/2038-01-19/03-14/0000000101.parquet" // Corrected path
+        "%2E%2E/dbs/..-0/..-0/2038-01-19/03-14/0000000101.parquet"
     );
 }
 
