@@ -4,8 +4,13 @@ pub mod membership;
 pub mod migrator; // Added migrator module
 
 #[cfg(any(test, feature = "test_utils"))]
-pub mod node_data_client_mock; // Added mock client module
+pub mod node_data_client_mock;
 
+pub mod node_data_client; // Added
+pub mod grpc_node_data_client; // Added
+
+pub use node_data_client::NodeDataManagementClient; // Added
+pub use grpc_node_data_client::GrpcNodeDataManagementClient; // Added
 pub use rebalance::initiate_shard_move_conceptual;
 // Re-exporting all conceptual steps for potential individual use or testing
 pub use rebalance::{

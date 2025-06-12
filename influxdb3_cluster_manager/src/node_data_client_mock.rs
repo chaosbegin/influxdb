@@ -8,10 +8,12 @@ use influxdb3_proto::influxdb3::internal::node_data_management::v1::{
     PrepareShardSnapshotRequest, PrepareShardSnapshotResponse,
     SignalWalStreamProcessedRequest, SignalWalStreamProcessedResponse,
     UnlockShardWritesRequest, UnlockShardWritesResponse,
-    ShardIdentifier as ProtoShardIdentifier, // Renamed to avoid clash if local struct is ever named the same
+    ShardIdentifier as ProtoShardIdentifier,
 };
 use std::sync::{Arc, Mutex};
-use tonic::{Response, Status}; // Assuming tonic is available (skipped Cargo.toml update)
+use tonic::{Response, Status};
+use async_trait::async_trait; // Added
+use super::node_data_client::NodeDataManagementClient; // Added
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExpectedNodeCall {

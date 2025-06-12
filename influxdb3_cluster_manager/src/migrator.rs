@@ -3,8 +3,11 @@ use influxdb3_catalog::shard::ShardId;
 use influxdb3_id::NodeId;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test_utils"))]
-use crate::node_data_client_mock::MockNodeDataManagementClient; // Test only
-use influxdb3_proto::influxdb3::internal::node_data_management::v1 as proto_ndm; // For proto types
+use crate::node_data_client_mock::MockNodeDataManagementClient;
+#[cfg(any(test, feature = "test_utils"))]
+use std::sync::Mutex; // For test fields in ShardMigrator
+use crate::node_data_client::NodeDataManagementClient; // Import the trait
+use influxdb3_proto::influxdb3::internal::node_data_management::v1 as proto_ndm;
 use crate::rebalance::{
     initiate_shard_move_conceptual,
     complete_shard_snapshot_transfer_conceptual,
@@ -28,9 +31,9 @@ pub struct ShardMigrationJob {
 pub struct ShardMigrator {
     catalog: Arc<Catalog>,
     #[cfg(any(test, feature = "test_utils"))]
-    source_node_data_client_for_test: Option<Arc<MockNodeDataManagementClient>>,
+    source_node_data_client: Option<MockNodeDataManagementClient>, // Store concrete mock
     #[cfg(any(test, feature = "test_utils"))]
-    target_node_data_client_for_test: Option<Arc<MockNodeDataManagementClient>>,
+    target_node_data_client: Option<MockNodeDataManagementClient>, // Store concrete mock
 }
 
 // Helper function to create ProtoShardIdentifier
@@ -47,26 +50,84 @@ impl ShardMigrator {
         Self {
             catalog,
             #[cfg(any(test, feature = "test_utils"))]
-            source_node_data_client_for_test: None,
+            source_node_data_client: None,
             #[cfg(any(test, feature = "test_utils"))]
-            target_node_data_client_for_test: None,
+            target_node_data_client: None,
         }
     }
 
     #[cfg(any(test, feature = "test_utils"))]
     pub fn new_for_test(
         catalog: Arc<Catalog>,
-        source_node_data_client: Arc<MockNodeDataManagementClient>,
-        target_node_data_client: Arc<MockNodeDataManagementClient>,
+        source_client: MockNodeDataManagementClient, // Take by value
+        target_client: MockNodeDataManagementClient, // Take by value
     ) -> Self {
         Self {
             catalog,
-            source_node_data_client_for_test: Some(source_node_data_client),
-            target_node_data_client_for_test: Some(target_node_data_client),
+            source_node_data_client: Some(source_client),
+            target_node_data_client: Some(target_client),
         }
     }
 
-    pub async fn run_migration_job(&self, job: ShardMigrationJob) -> Result<(), ClusterManagerError> {
+    // run_migration_job needs &mut self to call &mut self on client trait objects if they are not behind Mutex/RefCell.
+    // However, if the mock client uses interior mutability (Arc<Mutex<Vec<Calls>>>) for its recording,
+    // and the GrpcClient is Clone (tonic clients often are, or can be wrapped in Arc for sharing),
+    // then &self might be possible for run_migration_job.
+    // The trait currently specifies &mut self for its methods.
+    // So, if ShardMigrator directly holds and calls these, it needs &mut self access to them.
+    // If client fields are Arc<Mutex<dyn Trait>>, then &self is fine for run_migration_job.
+    // Let's assume for now the test fields are Arc<Mutex<MockNodeDataManagementClient>> and we lock for calls.
+    // Or, more simply, the test fields are Arc<MockNodeDataManagementClient> and the mock's trait impl methods
+    // use their internal Arc<Mutex<Vec<Calls>>> for recording, thus not needing &mut self on the mock object itself for recording.
+    // The trait requires &mut self. The mock must implement &mut self.
+    // Therefore, to call it, ShardMigrator needs mutable access to the mock client instance.
+    //
+    // Simplest path for this iteration:
+    // - ShardMigrator test fields: source_node_data_client: Option<Arc<Mutex<dyn NodeDataManagementClient>>>
+    // - new_for_test takes these Arcs.
+    // - Inside run_migration_job, for test path: lock and call.
+    // This means MockNodeDataManagementClient doesn't need to be Clone for the Arc<Mutex<>>.
+    // And GrpcNodeDataManagementClient would also be wrapped in Arc<Mutex<>> if used this way in prod.
+    //
+    // Let's stick to the prompt's revised plan:
+    // - ShardMigrator test fields: Option<Arc<dyn NodeDataManagementClient>>
+    // - MockNodeDataManagementClient uses interior mutability for calls.
+    // - Trait methods on MockNodeDataManagementClient take `&mut self` as required by trait, but internally use `&self` for call recording.
+    // - When ShardMigrator calls methods on Arc<dyn NodeDataManagementClient>, it needs to handle the `&mut self`.
+    //   This is the tricky part. `Arc` doesn't allow getting `&mut`.
+    //   This implies the design in the prompt ("ShardMigrator will store these Arc<dyn NodeDataManagementClient>s (still test-only for now)")
+    //   is problematic if the trait requires `&mut self`.
+    //
+    // The most direct way if the trait *must* have `&mut self`:
+    // ShardMigrator.run_migration_job becomes `&mut self`.
+    // Test fields become `Option<MockNodeDataManagementClient>` (not Arc, not dyn).
+    // `new_for_test` takes `MockNodeDataManagementClient` by value.
+    // This avoids `dyn Trait` complexity for now if only Mock is used in tests.
+    //
+    // Sticking to prompt's "Arc<dyn NodeDataManagementClient>" for test fields:
+    // This will only work if the *trait methods themselves* can take `&self`.
+    // If they must take `&mut self`, then `ShardMigrator` cannot use `Arc<dyn Trait>` to call them.
+    //
+    // The prompt says: "MockNodeDataManagementClient methods should also be updated to take ActualMessage directly."
+    // And "Trait methods on MockNodeDataManagementClient take `&mut self` as required by trait".
+    // This is a conflict if ShardMigrator holds Arc<dyn Trait>.
+    //
+    // RESOLUTION: The mock client's state (`calls`) is behind an `Arc<Mutex<>>`.
+    // So, the mock client's implementation of the trait methods (which take `&mut self`)
+    // can call its internal `record_call_internal(&self, ...)` method which uses the `Mutex`.
+    // The `&mut self` on the trait method for the mock becomes a formality; it doesn't actually mutate `MockNodeDataManagementClient`'s direct fields.
+    // So, `ShardMigrator` can hold `Option<Arc<dyn NodeDataManagementClient>>` and the calls in the test path will be:
+    // `if let Some(client_trait_obj_arc) = &self.source_node_data_client { let mut client_dyn = client_trait_obj_arc.clone(); client_dyn.method(..).await }`
+    // No, this doesn't work. `clone()` on `Arc<dyn T>` gives another `Arc<dyn T>`. We still can't get `&mut`.
+    //
+    // The only way for `ShardMigrator` to call `&mut self` methods on a trait object it owns via `Arc` is if the trait object itself is `Send + Sync + 'static`
+    // and the method calls are dispatched dynamically, and the underlying object can handle it.
+    //
+    // Let's simplify: For the test path, we will require `run_migration_job` to be `&mut self`
+    // and store `Option<MockNodeDataManagementClient>` directly. This is the most straightforward.
+    // This means the production path of `run_migration_job` also becomes `&mut self`, which is fine.
+
+    pub async fn run_migration_job(&mut self, job: ShardMigrationJob) -> Result<(), ClusterManagerError> { // Changed to &mut self
         tracing::info!(
             db_name = %job.db_name,
             table_name = %job.table_name,
@@ -100,19 +161,19 @@ impl ShardMigrator {
 
         #[cfg(any(test, feature = "test_utils"))]
         {
-            if let Some(client) = &self.source_node_data_client_for_test {
+            if let Some(client) = &mut self.source_node_data_client { // Now &mut self
                 let req = proto_ndm::PrepareShardSnapshotRequest { shard_identifier: proto_shard_id.clone() };
                 client.prepare_shard_snapshot(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
                 tracing::info!("Job {:?}: Mock PrepareShardSnapshot called on source node {}.", job.shard_id, job.source_node_id.get());
             } else {
-                tracing::warn!("Job {:?}: Source node data client not available for test (PrepareShardSnapshot).", job.shard_id);
+                tracing::warn!("Job {:?}: Source node data client (mock) not available for test (PrepareShardSnapshot).", job.shard_id);
             }
-            if let Some(client) = &self.target_node_data_client_for_test {
+            if let Some(client) = &mut self.target_node_data_client { // Now &mut self
                  let req = proto_ndm::ApplyShardSnapshotRequest { shard_identifier: proto_shard_id.clone() };
                  client.apply_shard_snapshot(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
                  tracing::info!("Job {:?}: Mock ApplyShardSnapshot called on target node {}.", job.shard_id, job.target_node_id.get());
             } else {
-                tracing::warn!("Job {:?}: Target node data client not available for test (ApplyShardSnapshot).", job.shard_id);
+                tracing::warn!("Job {:?}: Target node data client (mock) not available for test (ApplyShardSnapshot).", job.shard_id);
             }
         }
         #[cfg(not(any(test, feature = "test_utils")))]
@@ -162,19 +223,19 @@ impl ShardMigrator {
         // Conceptual RPC calls for cutover preparation
         #[cfg(any(test, feature = "test_utils"))]
         {
-            if let Some(client) = &self.target_node_data_client_for_test { // Assuming target signals/is signaled
+            if let Some(client) = &mut self.target_node_data_client {
                 let req = proto_ndm::SignalWalStreamProcessedRequest { shard_identifier: proto_shard_id.clone() };
                 client.signal_wal_stream_processed(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
                 tracing::info!("Job {:?}: Mock SignalWalStreamProcessed called on target node {}.", job.shard_id, job.target_node_id.get());
             } else {
-                tracing::warn!("Job {:?}: Target node data client not available for test (SignalWalStreamProcessed).", job.shard_id);
+                tracing::warn!("Job {:?}: Target node data client (mock) not available for test (SignalWalStreamProcessed).", job.shard_id);
             }
-            if let Some(client) = &self.source_node_data_client_for_test {
+            if let Some(client) = &mut self.source_node_data_client {
                 let req = proto_ndm::LockShardWritesRequest { shard_identifier: proto_shard_id.clone() };
                 client.lock_shard_writes(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
                 tracing::info!("Job {:?}: Mock LockShardWrites called on source node {}.", job.shard_id, job.source_node_id.get());
             } else {
-                tracing::warn!("Job {:?}: Source node data client not available for test (LockShardWrites).", job.shard_id);
+                tracing::warn!("Job {:?}: Source node data client (mock) not available for test (LockShardWrites).", job.shard_id);
             }
         }
         #[cfg(not(any(test, feature = "test_utils")))]
@@ -205,12 +266,12 @@ impl ShardMigrator {
         // Conceptual RPC call for unlocking writes on target
         #[cfg(any(test, feature = "test_utils"))]
         {
-            if let Some(client) = &self.target_node_data_client_for_test {
+            if let Some(client) = &mut self.target_node_data_client {
                 let req = proto_ndm::UnlockShardWritesRequest { shard_identifier: proto_shard_id.clone() };
                 client.unlock_shard_writes(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
                 tracing::info!("Job {:?}: Mock UnlockShardWrites called on target node {}.", job.shard_id, job.target_node_id.get());
             } else {
-                tracing::warn!("Job {:?}: Target node data client not available for test (UnlockShardWrites).", job.shard_id);
+                tracing::warn!("Job {:?}: Target node data client (mock) not available for test (UnlockShardWrites).", job.shard_id);
             }
         }
         #[cfg(not(any(test, feature = "test_utils")))]
@@ -240,12 +301,12 @@ impl ShardMigrator {
         // Conceptual RPC call for deleting data on source
         #[cfg(any(test, feature = "test_utils"))]
         {
-            if let Some(client) = &self.source_node_data_client_for_test {
+            if let Some(client) = &mut self.source_node_data_client {
                  let req = proto_ndm::DeleteShardDataRequest { shard_identifier: proto_shard_id.clone() };
                  client.delete_shard_data(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
                  tracing::info!("Job {:?}: Mock DeleteShardData called on source node {}.", job.shard_id, job.source_node_id.get());
             } else {
-                tracing::warn!("Job {:?}: Source node data client not available for test (DeleteShardData).", job.shard_id);
+                tracing::warn!("Job {:?}: Source node data client (mock) not available for test (DeleteShardData).", job.shard_id);
             }
         }
         #[cfg(not(any(test, feature = "test_utils")))]
