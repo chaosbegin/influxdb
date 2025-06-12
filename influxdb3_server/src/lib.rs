@@ -134,6 +134,10 @@ impl CommonServerState {
     }
 }
 
+use object_store::ObjectStore; // For Arc<dyn ObjectStore>
+use influxdb3_cluster_manager::NodeInfoProvider; // For RebalanceOrchestrator
+use crate::cluster_management_service::ServerMockNodeInfoProvider; // Placeholder
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Server<'a> {
@@ -145,7 +149,8 @@ pub struct Server<'a> {
     key_file: Option<PathBuf>,
     cert_file: Option<PathBuf>,
     tls_minimum_version: &'a [&'static SupportedProtocolVersion],
-    catalog: Arc<Catalog>, // Added to pass to ClusterManagementServerImpl
+    catalog: Arc<Catalog>,
+    object_store: Arc<dyn ObjectStore>, // Added for RebalanceOrchestrator
 }
 
 impl Server<'_> {
@@ -186,7 +191,13 @@ pub async fn serve(
     let distributed_query_grpc_service = DistributedQueryServiceServer::new(distributed_query_server_impl);
 
     // Create Cluster Management service
-    let cluster_management_server_impl = ClusterManagementServerImpl::new(Arc::clone(&server.catalog));
+    // For now, using a placeholder NodeInfoProvider. A real one would be part of server config/state.
+    let node_info_provider: Arc<dyn NodeInfoProvider> = Arc::new(ServerMockNodeInfoProvider::default());
+    let cluster_management_server_impl = ClusterManagementServerImpl::new(
+        Arc::clone(&server.catalog),
+        Arc::clone(&server.object_store),
+        node_info_provider.clone(), // Use the same provider instance for TLS and non-TLS
+    );
     let cluster_management_grpc_service = ClusterManagementServiceServer::new(cluster_management_server_impl);
 
 
@@ -273,7 +284,12 @@ pub async fn serve(
             .await?;
     } else {
         // Non-TLS setup
-        let cluster_management_server_impl_no_tls = ClusterManagementServerImpl::new(Arc::clone(&server.catalog));
+        // node_info_provider is already defined above and can be reused.
+        let cluster_management_server_impl_no_tls = ClusterManagementServerImpl::new(
+            Arc::clone(&server.catalog),
+            Arc::clone(&server.object_store),
+            node_info_provider, // Reuse the same node_info_provider
+        );
         let cluster_management_grpc_service_no_tls = ClusterManagementServiceServer::new(cluster_management_server_impl_no_tls);
 
 

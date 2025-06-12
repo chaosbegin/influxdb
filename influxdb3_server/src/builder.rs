@@ -212,6 +212,19 @@ impl
         let persister = Arc::clone(&self.persister.0);
         let authorizer = Arc::clone(&self.authorizer);
         let processing_engine = Arc::clone(&self.processing_engine.0);
+        let query_executor_arc = Arc::clone(&self.query_executor.0);
+
+        // Downcast QueryExecutor to QueryExecutorImpl to access the `exec` field for object store
+        let query_executor_impl = query_executor_arc
+            .as_any()
+            .downcast_ref::<crate::query_executor::QueryExecutorImpl>()
+            .expect("QueryExecutor should be QueryExecutorImpl for object store access");
+
+        let object_store = query_executor_impl
+            .exec() // Assuming exec() provides Arc<Executor>
+            .object_store(None) // Get default object store
+            .expect("Default object store not found in Executor");
+
 
         Arc::clone(&processing_engine)
             .start_triggers()
@@ -226,7 +239,7 @@ impl
             self.common_state.clone(),
             Arc::clone(&self.time_provider.0),
             Arc::clone(&self.write_buffer.0),
-            Arc::clone(&self.query_executor.0),
+            query_executor_arc, // Use the original Arc<dyn QueryExecutor> here
             processing_engine,
             self.max_request_size,
             Arc::clone(&authorizer),
@@ -240,6 +253,7 @@ impl
             persister,
             authorizer,
             listener: self.listener.0,
+            object_store, // Pass the retrieved object store
         }
     }
 }

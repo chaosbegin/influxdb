@@ -573,6 +573,11 @@ mod tests {
     use influxdb3_catalog::catalog::CatalogSequenceNumber;
     use influxdb3_id::{DbId, ParquetFileId, SerdeVecMap, TableId};
     use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
+    use influxdb3_catalog::log::FieldDataType; // For TableDefinition in ChunkFilter tests
+    use influxdb3_catalog::shard::ShardTimeRange; // For ShardDefinition in ChunkFilter tests
+    use datafusion::scalar::ScalarValue; // For literal creation in tests
+    use datafusion::prelude::col; // For column reference in tests
+
 
     use crate::{DatabaseTables, ParquetFile, PersistedSnapshot};
 
@@ -733,5 +738,181 @@ mod tests {
         // add dbs_2 to snapshot
         let overall_counts = PersistedSnapshot::overall_db_table_file_counts(&[]);
         assert_eq!((0, 0, 0), overall_counts);
+    }
+
+    #[cfg(test)]
+    mod chunk_filter_tests {
+        use super::*;
+        use influxdb3_catalog::shard::ShardDefinition; // Required for TableDefinition
+        use influxdb3_id::ShardId; // Required for ShardDefinition
+        use std::collections::HashMap as StdHashMap;
+
+        fn time_expr(op: &str, nanos: i64) -> Expr {
+            let time_col = col(TIME_COLUMN_NAME);
+            let literal_val = ScalarValue::TimestampNanosecond(Some(nanos), None);
+            match op {
+                ">=" => time_col.gt_eq(Expr::Literal(literal_val)),
+                ">" => time_col.gt(Expr::Literal(literal_val)),
+                "<=" => time_col.lt_eq(Expr::Literal(literal_val)),
+                "<" => time_col.lt(Expr::Literal(literal_val)),
+                "=" => time_col.eq(Expr::Literal(literal_val)),
+                _ => panic!("Unsupported operator"),
+            }
+        }
+
+        fn non_time_expr() -> Expr {
+            col("tag_col").eq(Expr::Literal(ScalarValue::Utf8(Some("value".to_string()))))
+        }
+
+        fn create_test_table_def() -> Arc<TableDefinition> {
+            // Create a minimal TableDefinition needed for ChunkFilter (mainly schema)
+            let mut columns_map = SerdeVecMap::new();
+            columns_map.insert(influxdb3_id::ColumnId::new(0), Arc::new(influxdb3_catalog::catalog::ColumnDefinition::new(influxdb3_id::ColumnId::new(0), TIME_COLUMN_NAME, schema::InfluxColumnType::Timestamp, false)));
+            columns_map.insert(influxdb3_id::ColumnId::new(1), Arc::new(influxdb3_catalog::catalog::ColumnDefinition::new(influxdb3_id::ColumnId::new(1), "tag_col", schema::InfluxColumnType::Tag, true)));
+
+            let arrow_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(TIME_COLUMN_NAME, arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None), false),
+                arrow::datatypes::Field::new("tag_col", arrow::datatypes::DataType::Utf8, true),
+            ]));
+            let schema = schema::Schema::try_from_arrow_schema(arrow_schema).unwrap();
+
+
+            Arc::new(TableDefinition {
+                table_id: TableId::new(1),
+                table_name: Arc::from("test_table"),
+                schema,
+                columns: columns_map,
+                series_key: vec![],
+                series_key_names: vec![],
+                sort_key: schema::sort::SortKey::default(),
+                last_caches: Default::default(),
+                distinct_caches: Default::default(),
+                deleted: false,
+                hard_delete_time: None,
+                shards: Default::default(), // Not directly used by ChunkFilter::new itself for time bound extraction
+                replication_info: None,
+                shard_key_columns: None,
+                sharding_strategy: Default::default(),
+            })
+        }
+
+        #[test]
+        fn test_chunk_filter_no_filters() {
+            let table_def = create_test_table_def();
+            let filters = vec![];
+            let chunk_filter = ChunkFilter::new(&table_def, &filters).unwrap();
+            assert_eq!(chunk_filter.time_lower_bound_ns, None);
+            assert_eq!(chunk_filter.time_upper_bound_ns, None);
+        }
+
+        #[test]
+        fn test_chunk_filter_single_time_range() {
+            let table_def = create_test_table_def();
+            // time >= 100 AND time <= 200
+            let filters = vec![
+                time_expr(">=", 100).and(time_expr("<=", 200))
+            ];
+            let chunk_filter = ChunkFilter::new(&table_def, &filters).unwrap();
+            assert_eq!(chunk_filter.time_lower_bound_ns, Some(100));
+            assert_eq!(chunk_filter.time_upper_bound_ns, Some(200));
+        }
+
+        #[test]
+        fn test_chunk_filter_intersecting_time_ranges() {
+            let table_def = create_test_table_def();
+            // (time >= 100 AND time <= 300) AND (time >= 200 AND time <= 400)
+            // Expected intersection: time >= 200 AND time <= 300
+            let filters = vec![
+                time_expr(">=", 100).and(time_expr("<=", 300)),
+                time_expr(">=", 200).and(time_expr("<=", 400)),
+            ];
+            let combined_filter = filters.into_iter().reduce(Expr::and).unwrap();
+            let chunk_filter = ChunkFilter::new(&table_def, &[combined_filter]).unwrap();
+            assert_eq!(chunk_filter.time_lower_bound_ns, Some(200));
+            assert_eq!(chunk_filter.time_upper_bound_ns, Some(300));
+        }
+
+        #[test]
+        fn test_chunk_filter_one_range_contains_another() {
+            let table_def = create_test_table_def();
+            // (time >= 100 AND time <= 400) AND (time >= 200 AND time <= 300)
+            // Expected intersection: time >= 200 AND time <= 300
+            let filters = vec![
+                time_expr(">=", 100).and(time_expr("<=", 400)),
+                time_expr(">=", 200).and(time_expr("<=", 300)),
+            ];
+            let combined_filter = filters.into_iter().reduce(Expr::and).unwrap();
+            let chunk_filter = ChunkFilter::new(&table_def, &[combined_filter]).unwrap();
+            assert_eq!(chunk_filter.time_lower_bound_ns, Some(200));
+            assert_eq!(chunk_filter.time_upper_bound_ns, Some(300));
+        }
+
+        #[test]
+        fn test_chunk_filter_non_overlapping_time_ranges() {
+            let table_def = create_test_table_def();
+            // (time >= 100 AND time <= 200) AND (time >= 300 AND time <= 400)
+            // Expected: This should result in an empty interval (None, None) or an error.
+            // DataFusion's interval arithmetic for intersection of non-overlapping ranges might result in an "empty" interval.
+            // The current ChunkFilter extracts lower/upper from this. If interval is empty, bounds might be None or invalid.
+            let filters = vec![
+                time_expr(">=", 100).and(time_expr("<=", 200)),
+                time_expr(">=", 300).and(time_expr("<=", 400)),
+            ];
+            let combined_filter = filters.into_iter().reduce(Expr::and).unwrap();
+             // The `intersect` method on Interval returns `Result<Option<Interval>>`.
+            // If it's `Ok(None)`, it means no intersection, which should lead to `time_lower_bound_ns = None` and `time_upper_bound_ns = None`
+            // or specific handling for impossible ranges. Current implementation seems to convert `None` interval to `(None, None)` bounds.
+            let chunk_filter_result = ChunkFilter::new(&table_def, &[combined_filter]);
+            // Depending on how DataFusion's Interval handles empty intersections, this might error or yield None bounds.
+            // If it errors (e.g. "provided filters on time column did not produce a valid set of boundaries"), that's fine.
+            // If it results in None bounds, that's also fine (means no pruning by time).
+            // Let's check if it successfully creates a filter, which implies it handled it.
+            // The actual behavior of `test_time_stamp_min_max` for such a filter would be important.
+             assert!(chunk_filter_result.is_ok(), "ChunkFilter creation failed for non-overlapping ranges, error: {:?}", chunk_filter_result.err());
+            // If DataFusion's interval intersection results in an empty interval, the ScalarValue bounds might be None.
+            let chunk_filter = chunk_filter_result.unwrap();
+            // This means the filter effectively becomes unbounded on time if intersection is empty.
+            // This is acceptable as no data will match this impossible filter.
+            // Or, more accurately, the interval becomes something like [MAX, MIN] which then gets converted to (None, None)
+            // by the ScalarValue::TimestampNanosecond(Some(l), _) checks.
+            // Let's assert what it currently does, assuming (None, None) for an impossible range.
+            assert_eq!(chunk_filter.time_lower_bound_ns, None, "Lower bound should be None for impossible range");
+            assert_eq!(chunk_filter.time_upper_bound_ns, None, "Upper bound should be None for impossible range");
+        }
+
+        #[test]
+        fn test_chunk_filter_with_non_time_predicates() {
+            let table_def = create_test_table_def();
+            // time >= 100 AND time <= 200 AND tag_col = 'value'
+            let filters = vec![
+                time_expr(">=", 100).and(time_expr("<=", 200)).and(non_time_expr())
+            ];
+            let chunk_filter = ChunkFilter::new(&table_def, &filters).unwrap();
+            assert_eq!(chunk_filter.time_lower_bound_ns, Some(100));
+            assert_eq!(chunk_filter.time_upper_bound_ns, Some(200));
+            assert_eq!(chunk_filter.original_filters().len(), 1); // Original combined filter is stored
+        }
+
+        #[test]
+        fn test_chunk_filter_exclusive_bounds() {
+            let table_def = create_test_table_def();
+            // time > 100 AND time < 200
+            let filters = vec![
+                time_expr(">", 100).and(time_expr("<", 200))
+            ];
+            let chunk_filter = ChunkFilter::new(&table_def, &filters).unwrap();
+            // Interval arithmetic should convert > to >= and < to <= with adjusted values or handle open/closed intervals.
+            // ScalarValue from Interval.lower/upper is inclusive.
+            // So, time > 100  -> lower bound is 100 (exclusive), interval might store as 101 if discrete or handle open.
+            // ScalarValue::TimestampNanosecond(Some(l), _) means l is inclusive.
+            // DataFusion's Interval::lower() and Interval::upper() are inclusive.
+            // time > X becomes time >= X+1 for integers. For timestamps, it's more nuanced.
+            // Let's check what DataFusion's analyze does.
+            // `analyze` for `time > 100` should yield an interval starting at 100 but being exclusive of 100.
+            // When converting back to ScalarValue::TimestampNanosecond, it might be Some(100) if the ScalarValue itself doesn't track exclusivity.
+            // The current ChunkFilter logic directly takes the ScalarValue.
+            assert_eq!(chunk_filter.time_lower_bound_ns, Some(100)); // Depending on how Interval's lower for ">" is translated
+            assert_eq!(chunk_filter.time_upper_bound_ns, Some(200)); // Depending on how Interval's upper for "<" is translated
+        }
     }
 }

@@ -63,19 +63,27 @@ impl NodeInfoProvider for ServerMockNodeInfoProvider {
 }
 
 
+use object_store::ObjectStore; // For Arc<dyn ObjectStore>
+
 #[derive(Debug)]
 pub struct ClusterManagementServerImpl {
     cluster_manager: Arc<ClusterManager>,
     rebalance_orchestrator: Arc<RebalanceOrchestrator>,
+    // object_store is not directly used by ClusterManager RPCs, but passed to RebalanceOrchestrator
 }
 
 impl ClusterManagementServerImpl {
-    pub fn new(catalog: Arc<Catalog>) -> Self {
-        let node_info_provider: Arc<dyn NodeInfoProvider> = Arc::new(ServerMockNodeInfoProvider::default());
+    pub fn new(
+        catalog: Arc<Catalog>,
+        object_store: Arc<dyn ObjectStore>, // Added object_store
+        node_info_provider: Arc<dyn NodeInfoProvider>, // Added to make it explicit
+    ) -> Self {
+        // let node_info_provider: Arc<dyn NodeInfoProvider> = Arc::new(ServerMockNodeInfoProvider::default());
+        // NodeInfoProvider should be passed in from server setup for real implementation.
 
         Self {
             cluster_manager: Arc::new(ClusterManager::new(Arc::clone(&catalog))),
-            rebalance_orchestrator: Arc::new(RebalanceOrchestrator::new(catalog, node_info_provider)),
+            rebalance_orchestrator: Arc::new(RebalanceOrchestrator::new(catalog, node_info_provider, object_store)),
         }
     }
 }
@@ -164,11 +172,12 @@ mod tests {
          // using a MockCatalog. Here, we will test the gRPC service layer by providing a real Catalog
          // that can be pre-populated, and real ClusterManager/RebalanceOrchestrator.
 
-        // Revert to using real ClusterManager and RebalanceOrchestrator with a MockCatalog for more integrated test
-        let node_info_provider: Arc<dyn NodeInfoProvider> = Arc::new(ServerMockNodeInfoProvider::default());
+        let node_info_provider: Arc<dyn NodeInfoProvider> = Arc::new(MockNodeInfoProvider::default()); // Use the test one
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new()); // Test object store
+
         ClusterManagementServerImpl {
             cluster_manager: Arc::new(ClusterManager::new(mock_catalog.clone() as Arc<dyn Catalog>)),
-            rebalance_orchestrator: Arc::new(RebalanceOrchestrator::new(mock_catalog as Arc<dyn Catalog>, node_info_provider)),
+            rebalance_orchestrator: Arc::new(RebalanceOrchestrator::new(mock_catalog as Arc<dyn Catalog>, node_info_provider, object_store)),
         }
     }
 
@@ -191,10 +200,12 @@ mod tests {
     async fn test_add_node_rpc() {
         let mut mock_catalog = MockCatalog::new();
         mock_catalog.expect_add_node().times(1).returning(|_| Ok(()));
-        mock_catalog.expect_next_node_id().return_const(CatalogNodeId::new(1));
+        mock_catalog.expect_next_node_id().return_const(CatalogNodeId::new(1)); // Ensure next_node_id is mocked if new() calls it.
 
-
-        let server = ClusterManagementServerImpl::new(Arc::new(mock_catalog));
+        let server = create_server_with_mocks(Arc::new(mock_catalog),
+            Arc::new(MockClusterManager::new(Arc::new(MockCatalog::new()))), // Dummy CM, not directly used by AddNode gRPC
+            Arc::new(MockRebalanceOrchestrator::new()) // Dummy RO
+        );
 
         let node_def_msg = NodeDefinitionMessage {
             id: 0, // Let catalog assign
@@ -220,7 +231,10 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let server = ClusterManagementServerImpl::new(Arc::new(mock_catalog));
+        let server = create_server_with_mocks(Arc::new(mock_catalog),
+            Arc::new(MockClusterManager::new(Arc::new(MockCatalog::new()))),
+            Arc::new(MockRebalanceOrchestrator::new())
+        );
         let request = Request::new(RemoveNodeRequest { node_id: Some(NodeIdMessage { id: 1 }) });
         let response = server.remove_node(request).await.unwrap().into_inner();
         assert!(response.success);
@@ -237,7 +251,10 @@ mod tests {
             .times(1)
             .returning(move || Ok(nodes_to_return.clone()));
 
-        let server = ClusterManagementServerImpl::new(Arc::new(mock_catalog));
+        let server = create_server_with_mocks(Arc::new(mock_catalog),
+            Arc::new(MockClusterManager::new(Arc::new(MockCatalog::new()))),
+            Arc::new(MockRebalanceOrchestrator::new())
+        );
         let request = Request::new(ListNodesRequest {});
         let response = server.list_nodes(request).await.unwrap().into_inner();
 

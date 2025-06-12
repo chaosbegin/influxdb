@@ -117,6 +117,11 @@ impl QueryExecutorImpl {
             current_node_id, // Store new field
         }
     }
+
+    // Accessor for the internal Executor, needed by ServerBuilder
+    pub fn exec(&self) -> Arc<Executor> {
+        Arc::clone(&self.exec)
+    }
 }
 
 #[async_trait]
