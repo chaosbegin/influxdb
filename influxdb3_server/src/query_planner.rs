@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc, collections::HashMap, fmt::Debug}; // Added HashMap, Debug
+use std::{any::Any, sync::Arc, collections::HashMap, fmt::Debug};
 
 use arrow_schema::{SchemaRef, Schema as ArrowSchema, ArrowError};
 use bytes::Bytes;
@@ -10,10 +10,13 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
         coalesce_batches::CoalesceBatchesExec, union::UnionExec, PhysicalPlanner, common,
     },
-    logical_expr::LogicalPlan as DFLogicalPlan, // Aliased to avoid clash
-    datasource::physical_plan::TableScan, // Assuming we might construct this
+    logical_expr::LogicalPlan as DFLogicalPlan,
+    datasource::physical_plan::TableScan,
+    physical_optimizer::PhysicalOptimizerRule, // Added for rewriter
+    config::ConfigOptions, // Added for rewriter
+    common::tree_node::{TreeNode, TreeNodeRewriter, Transformed}, // Added for rewriter
 };
-use datafusion::prelude::SessionContext; // For creating plans
+use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use influxdb_influxql_parser::statement::Statement;
 use iox_query::{exec::IOxSessionContext, frontend::sql::SqlQueryPlanner, physical_optimizer::PhysicalOptimizer, Optimizer};
@@ -21,30 +24,21 @@ use iox_query_influxql::frontend::planner::InfluxQLQueryPlanner;
 use iox_query_params::StatementParams;
 
 use influxdb3_catalog::catalog::Catalog;
-use influxdb3_id::NodeId as InfluxNodeId; // Using the ID type from influxdb3_id
+use influxdb3_id::NodeId as InfluxNodeId;
 use crate::distributed_query_client::GrpcDistributedQueryClient;
-// GrpcExecuteQueryFragmentRequest is used by RemoteRecordBatchStream, not directly here anymore for SQL.
-// use influxdb3_distributed_query_protos::influxdb3::internal::query::v1::{
-// ExecuteQueryFragmentRequest as GrpcExecuteQueryFragmentRequest,
-// };
-use arrow_flight::utils::flight_data_stream_to_arrow_stream;
-// physical_plan_to_bytes is not used for SQL fragments.
-// use datafusion_proto::physical_plan::{physical_plan_to_bytes, from_physical_plan_bytes};
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::TableSource;
-use crate::expr_to_sql; // For converting DataFusion Expr to SQL
-use chrono::{DateTime, Utc}; // For formatting timestamps
+use crate::expr_to_sql;
+use chrono::{DateTime, Utc};
 
 
 type Result<T, E = DataFusionError> = std::result::Result<T, E>;
 
 /// Provides information about other nodes in the cluster.
 pub trait NodeInfoProvider: Send + Sync + Debug {
-    /// Returns the gRPC address for distributed query execution for a given node ID.
     fn get_node_query_rpc_address(&self, node_id: &InfluxNodeId) -> Option<String>;
 }
 
-// A mock implementation for testing
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct MockNodeInfoProvider {
@@ -66,23 +60,264 @@ impl NodeInfoProvider for MockNodeInfoProvider {
     }
 }
 
-
-pub(crate) struct Planner {
-    ctx: IOxSessionContext,
+// --- DistributedQueryRewriter ---
+#[derive(Debug)]
+pub struct DistributedQueryRewriter {
     catalog: Arc<Catalog>,
     current_node_id: Arc<str>,
-    node_info_provider: Arc<dyn NodeInfoProvider>, // Added
+    node_info_provider: Arc<dyn NodeInfoProvider>,
+    session_ctx: Arc<IOxSessionContext>, // Changed to Arc<IOxSessionContext> for create_physical_plan
+    db_name: Arc<str>, // Database context for the current query
+}
+
+impl DistributedQueryRewriter {
+    pub fn new(
+        catalog: Arc<Catalog>,
+        current_node_id: Arc<str>,
+        node_info_provider: Arc<dyn NodeInfoProvider>,
+        session_ctx: Arc<IOxSessionContext>,
+        db_name: Arc<str>,
+    ) -> Self {
+        Self {
+            catalog,
+            current_node_id,
+            node_info_provider,
+            session_ctx,
+            db_name,
+        }
+    }
+
+    // This method will contain the core logic previously in Planner::generate_distributed_physical_plan
+    // but focused on a single TableScan physical node.
+    async fn generate_distributed_plan_for_scan(
+        &self,
+        original_phys_table_scan: &TableScan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table_name = original_phys_table_scan.table_name(); // This is a TableReference
+        let table_name_str = table_name.table(); // Get the actual table name string
+
+        observability_deps::tracing::debug!(db_name = %self.db_name, table_name = %table_name_str, "Rewriter: Checking table for sharding");
+
+        if let Some(db_schema) = self.catalog.db_schema(&self.db_name) {
+            if let Some(table_def) = db_schema.table_definition(table_name_str) {
+                if !table_def.shards.is_empty() {
+                    observability_deps::tracing::info!(
+                        db_name = %self.db_name, table_name = %table_name_str, num_shards=%table_def.shards.len(),
+                        "Rewriter: Table is sharded, generating distributed plan components."
+                    );
+
+                    let mut sub_plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
+                    let current_node_id_parsed = self.current_node_id.parse::<u64>().ok();
+
+                    for shard_def_arc in table_def.shards.resource_iter() {
+                        let shard_def = shard_def_arc.as_ref();
+
+                        // Check for shard pruning based on shard key predicates
+                        if table_def.sharding_strategy == influxdb3_catalog::shard::ShardingStrategy::TimeAndKey {
+                            if let (Some(key_cols), Some(hash_range)) = (&table_def.shard_key_columns, shard_def.hash_key_range) {
+                                let mut shard_key_values = Vec::new();
+                                let mut all_keys_found = true;
+                                for key_col_name in key_cols {
+                                    let mut found_key_predicate = false;
+                                    for filter in original_phys_table_scan.filters() {
+                                        if let datafusion::logical_expr::Expr::BinaryExpr(be) = filter {
+                                            if be.op == datafusion::logical_expr::Operator::Eq {
+                                                if let datafusion::logical_expr::Expr::Column(c) = be.left.as_ref() {
+                                                    if c.name == *key_col_name {
+                                                        if let datafusion::logical_expr::Expr::Literal(datafusion::scalar::ScalarValue::Utf8(Some(val))) = be.right.as_ref() {
+                                                            shard_key_values.push(val.clone());
+                                                            found_key_predicate = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !found_key_predicate {
+                                        all_keys_found = false;
+                                        break;
+                                    }
+                                }
+
+                                if all_keys_found {
+                                    let hash = influxdb3_write::sharding_utils::calculate_hash(
+                                        &shard_key_values.iter().map(|s|s.as_str()).collect::<Vec<&str>>()
+                                    );
+                                    if !(hash >= hash_range.0 && hash <= hash_range.1) {
+                                        observability_deps::tracing::info!(
+                                            shard_id = %shard_def.id.get(), table=%table_name_str, calculated_hash=%hash, shard_hash_range=?hash_range,
+                                            "Rewriter: Pruning remote shard due to hash key mismatch."
+                                        );
+                                        continue; // Skip this shard
+                                    }
+                                }
+                            }
+                        }
+
+
+                        let generate_sql_for_shard_inner = |sd: &influxdb3_catalog::shard::ShardDefinition|
+                            -> Result<Bytes, DataFusionError> {
+                            let projected_columns_str = match original_phys_table_scan.projection() {
+                                Some(indices) => indices.iter().map(|i| original_phys_table_scan.table_schema().field(*i).name().as_str()).collect::<Vec<&str>>().join(", "),
+                                None => "*".to_string(),
+                            };
+                            let qualified_table_name_str = format!("\"{}\".\"{}\"", self.db_name, table_name_str);
+                            let mut sql_filters: Vec<String> = Vec::new();
+                            let shard_time_range = sd.time_range;
+                            let start_time_str = DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDateTime::from_timestamp_opt(shard_time_range.start_time / 1_000_000_000, (shard_time_range.start_time % 1_000_000_000) as u32).unwrap_or_default(), Utc).to_rfc3339();
+                            let end_time_str = DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDateTime::from_timestamp_opt(shard_time_range.end_time / 1_000_000_000, (shard_time_range.end_time % 1_000_000_000) as u32).unwrap_or_default(), Utc).to_rfc3339();
+                            sql_filters.push(format!("\"time\" >= TIMESTAMP '{}'", start_time_str));
+                            sql_filters.push(format!("\"time\" <= TIMESTAMP '{}'", end_time_str));
+                            for filter_expr in original_phys_table_scan.filters() { // Using filters from physical TableScan
+                                match expr_to_sql::expr_to_sql(filter_expr) {
+                                    Ok(sql_pred) => sql_filters.push(sql_pred),
+                                    Err(e) => { observability_deps::tracing::warn!("Failed to convert filter to SQL: {}", e); }
+                                }
+                            }
+                            let sql_query = if sql_filters.is_empty() {
+                                format!("SELECT {} FROM {}", projected_columns_str, qualified_table_name_str)
+                            } else {
+                                format!("SELECT {} FROM {} WHERE {}", projected_columns_str, qualified_table_name_str, sql_filters.join(" AND "))
+                            };
+                            Ok(Bytes::from(sql_query.into_bytes()))
+                        };
+
+                        let mut plans_for_this_shard_instance: Vec<Arc<dyn ExecutionPlan>> = vec![];
+
+                        for owner_node_id in &shard_def.node_ids {
+                            if Some(owner_node_id.get()) == current_node_id_parsed {
+                                let local_plan = self.create_local_shard_physical_plan(original_phys_table_scan, shard_def, table_name_str).await?;
+                                plans_for_this_shard_instance.push(local_plan);
+                            } else {
+                                if let Some(addr) = self.node_info_provider.get_node_query_rpc_address(owner_node_id) {
+                                    let sql_bytes = generate_sql_for_shard_inner(shard_def)?;
+                                    plans_for_this_shard_instance.push(Arc::new(RemoteScanExec::new(addr, self.db_name.to_string(), sql_bytes, original_phys_table_scan.schema())));
+                                } else { observability_deps::tracing::warn!("No addr for owner {}", owner_node_id.get()); }
+                            }
+                        }
+
+                        if let Some(influxdb3_catalog::shard::ShardMigrationStatus::MigratingOutTo(targets)) = &shard_def.migration_status {
+                            for target_node_id in targets {
+                                if !shard_def.node_ids.contains(target_node_id) {
+                                    if let Some(addr) = self.node_info_provider.get_node_query_rpc_address(target_node_id) {
+                                        observability_deps::tracing::info!("Shard {} migrating to {}. Adding scan for target.", shard_def.id.get(), target_node_id.get());
+                                        let sql_bytes = generate_sql_for_shard_inner(shard_def)?;
+                                        plans_for_this_shard_instance.push(Arc::new(RemoteScanExec::new(addr, self.db_name.to_string(), sql_bytes, original_phys_table_scan.schema())));
+                                    } else { observability_deps::tracing::warn!("No addr for target {}", target_node_id.get());}
+                                }
+                            }
+                        }
+                        sub_plans.extend(plans_for_this_shard_instance);
+                    }
+
+                    return if sub_plans.is_empty() {
+                        observability_deps::tracing::warn!(%self.db_name, %table_name_str, "Sharded table resulted in no scannable shards after pruning.");
+                        Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(original_phys_table_scan.schema()))) // Return EmptyExec with original schema
+                    } else if sub_plans.len() == 1 {
+                        Ok(sub_plans.remove(0))
+                    } else {
+                        Ok(Arc::new(UnionExec::new(sub_plans)))
+                    };
+                }
+            }
+        }
+        // If not a TableScan, or not sharded, or no shards defined, return the original plan
+        Ok(Arc::clone(original_phys_table_scan)) // Needs to be Arc<dyn ExecutionPlan>
+    }
+     // Helper to create a shard-specific logical plan for local execution
+    async fn create_local_shard_physical_plan(
+        &self,
+        original_table_scan_physical: &TableScan,
+        shard_def: &influxdb3_catalog::shard::ShardDefinition,
+        table_name: &str, // table_name_str from caller
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let mut local_filters: Vec<datafusion::logical_expr::Expr> = Vec::new();
+        let time_col = datafusion::logical_expr::col("time");
+
+        let start_lit = datafusion::logical_expr::lit(datafusion::scalar::ScalarValue::TimestampNanosecond(Some(shard_def.time_range.start_time), None));
+        let end_lit = datafusion::logical_expr::lit(datafusion::scalar::ScalarValue::TimestampNanosecond(Some(shard_def.time_range.end_time), None));
+
+        local_filters.push(time_col.clone().gt_eq(start_lit));
+        local_filters.push(time_col.lt_eq(end_lit));
+        local_filters.extend(original_table_scan_physical.filters().to_vec());
+
+        let combined_filter_opt = local_filters.into_iter().reduce(datafusion::logical_expr::Expr::and);
+        let final_filters = combined_filter_opt.map_or_else(Vec::new, |f| vec![f]);
+
+        let new_logical_scan = DFLogicalPlan::TableScan(datafusion::logical_expr::TableScan::try_new(
+            datafusion::logical_expr::TableReference::partial(self.db_name.as_ref(), table_name),
+            Arc::clone(original_table_scan_physical.source()),
+            original_table_scan_physical.projection().cloned(),
+            final_filters,
+            original_table_scan_physical.fetch(),
+        )?);
+
+        self.session_ctx.create_physical_plan(&new_logical_scan).await
+    }
+}
+
+impl PhysicalOptimizerRule for DistributedQueryRewriter {
+    fn name(&self) -> &str { "DistributedQueryRewriter" }
+
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        // Use a temporary runtime to run the async generate_distributed_plan_for_scan
+        // This is not ideal for a sync trait method. A full solution might involve making
+        // the optimizer rule async or using a more complex executor setup.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .map_err(|e| DataFusionError::Execution(format!("Failed to create Tokio runtime for rewriter: {}", e)))?;
+
+        plan.transform_up(&|sub_plan| {
+            if let Some(phys_table_scan) = sub_plan.as_any().downcast_ref::<TableScan>() {
+                 // Determine db_name. If TableReference is Bare, use session default.
+                let table_ref_name = phys_table_scan.table_name().to_string(); // Gets full "catalog.schema.table" or "schema.table" or "table"
+                let parts: Vec<&str> = table_ref_name.split('.').collect();
+                let (inferred_db_name, actual_table_name) = match parts.len() {
+                    1 => (self.db_name.as_ref(), parts[0]), // Assumes bare reference is in current db_name
+                    2 => (parts[0], parts[1]), // schema.table
+                    3 => (parts[1], parts[2]), // catalog.schema.table (schema is db_name)
+                    _ => return Ok(Transformed::no(sub_plan)), // Or error
+                };
+
+                // Ensure inferred_db_name matches self.db_name passed to rewriter for consistency
+                if inferred_db_name != self.db_name.as_ref() {
+                     observability_deps::tracing::warn!(
+                        "TableScan db_name '{}' does not match rewriter's db_name context '{}'. Skipping rewrite for this scan.",
+                        inferred_db_name, self.db_name
+                    );
+                    return Ok(Transformed::no(sub_plan));
+                }
+
+
+                // Run the async method on the temporary runtime
+                let new_distributed_plan_for_this_scan = rt.block_on(
+                    self.generate_distributed_plan_for_scan(phys_table_scan)
+                )?;
+                Ok(Transformed::yes(new_distributed_plan_for_this_scan))
+            } else {
+                Ok(Transformed::no(sub_plan))
+            }
+        })
+    }
+}
+
+
+pub(crate) struct Planner {
+    ctx: IOxSessionContext, // This is Arc<IOxSessionContextInner>
+    catalog: Arc<Catalog>,
+    current_node_id: Arc<str>,
+    node_info_provider: Arc<dyn NodeInfoProvider>,
 }
 
 impl Planner {
     pub(crate) fn new(
-        ctx: &IOxSessionContext,
+        ctx: &IOxSessionContext, // Actually Arc<IOxSessionContextInner>
         catalog: Arc<Catalog>,
         current_node_id: Arc<str>,
-        node_info_provider: Arc<dyn NodeInfoProvider>, // Added
+        node_info_provider: Arc<dyn NodeInfoProvider>,
     ) -> Self {
         Self {
-            ctx: ctx.child_ctx("rest_api_query_planner"),
+            ctx: ctx.child_ctx("planner_for_rewrite"), // Create a child context for the planner instance
             catalog,
             current_node_id,
             node_info_provider,
@@ -96,11 +331,21 @@ impl Planner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planner = SqlQueryPlanner::new();
         let query = query.as_ref();
-        let ctx = self.ctx.child_ctx("rest_api_query_planner_sql");
+        // Use self.ctx which is already a child context
 
-        let logical_plan = planner.query_to_logical_plan(query, &ctx).await?;
-        let initial_physical_plan = ctx.create_physical_plan(&logical_plan).await?;
-        self.generate_distributed_physical_plan(initial_physical_plan, ctx.default_database_name().as_str()).await
+        let logical_plan = planner.query_to_logical_plan(query, &self.ctx).await?;
+        let initial_physical_plan = self.ctx.create_physical_plan(&logical_plan).await?;
+
+        let rewriter = DistributedQueryRewriter::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.current_node_id),
+            Arc::clone(&self.node_info_provider),
+            Arc::clone(&self.ctx.inner()), // Pass Arc<IOxSessionContextInner>
+            Arc::from(self.ctx.default_database_name().as_str()),
+        );
+        let distributed_physical_plan = rewriter.optimize(initial_physical_plan, self.ctx.inner().state().config())?;
+
+        Ok(distributed_physical_plan)
     }
 
     pub(crate) async fn influxql(
@@ -108,13 +353,20 @@ impl Planner {
         statement: Statement,
         params: impl Into<StatementParams> + Send,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let ctx = self.ctx.child_ctx("rest_api_query_planner_influxql");
+        // Use self.ctx which is already a child context
 
-        let logical_plan = InfluxQLQueryPlanner::statement_to_plan(statement, params, &ctx).await?;
-        let initial_physical_plan = ctx.create_physical_plan(&logical_plan).await?;
-        let distributed_physical_plan = self.generate_distributed_physical_plan(initial_physical_plan, ctx.default_database_name().as_str()).await?;
+        let logical_plan = InfluxQLQueryPlanner::statement_to_plan(statement, params, &self.ctx).await?;
+        let initial_physical_plan = self.ctx.create_physical_plan(&logical_plan).await?;
 
-        // Preserve metadata from logical plan if needed (SchemaExec wrapper)
+        let rewriter = DistributedQueryRewriter::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.current_node_id),
+            Arc::clone(&self.node_info_provider),
+            Arc::clone(&self.ctx.inner()),
+            Arc::from(self.ctx.default_database_name().as_str()),
+        );
+        let distributed_physical_plan = rewriter.optimize(initial_physical_plan, self.ctx.inner().state().config())?;
+
         let input_schema = distributed_physical_plan.schema();
         let mut md = input_schema.metadata().clone();
         md.extend(logical_plan.schema().metadata().clone());
@@ -126,177 +378,54 @@ impl Planner {
         Ok(Arc::new(SchemaExec::new(distributed_physical_plan, final_schema)))
     }
 
+    // The old generate_distributed_physical_plan is now refactored into DistributedQueryRewriter::generate_distributed_plan_for_scan
+    // and Planner::create_local_shard_logical_plan (which is also called by the rewriter's method)
+    // This method is kept for now to make create_local_shard_logical_plan belong to Planner
+    // but it's not directly called by sql/influxql anymore.
+    #[allow(dead_code)]
     async fn generate_distributed_physical_plan(
         &self,
-        physical_plan: Arc<dyn ExecutionPlan>,
-        db_name: &str,
+        _physical_plan: Arc<dyn ExecutionPlan>, // Parameter not used anymore due to refactor
+        _db_name: &str, // Parameter not used anymore
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if let Some(table_scan) = physical_plan.as_any().downcast_ref::<TableScan>() {
-            let table_name = table_scan.table_name();
-            observability_deps::tracing::debug!(%db_name, %table_name, "Checking table for sharding in physical plan");
-
-            if let Some(db_schema) = self.catalog.db_schema(db_name) {
-                if let Some(table_def) = db_schema.table_definition(table_name) {
-                    if !table_def.shards.is_empty() {
-                        observability_deps::tracing::info!(
-                            %db_name, %table_name, num_shards=%table_def.shards.len(),
-                            "Table is sharded, generating distributed plan components."
-                        );
-
-                        let mut sub_plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
-                        let current_node_id_parsed = self.current_node_id.parse::<u64>().ok();
-
-                        for shard_def_arc in table_def.shards.resource_iter() {
-                            let shard_def = shard_def_arc.as_ref();
-
-                            let generate_sql_for_shard = |sd: &influxdb3_catalog::shard::ShardDefinition|
-                                -> Result<Bytes, DataFusionError> {
-                                let projected_columns_str = match table_scan.projection() {
-                                    Some(indices) => indices
-                                        .iter()
-                                        .map(|i| table_scan.table_schema().field(*i).name().as_str())
-                                        .collect::<Vec<&str>>()
-                                        .join(", "),
-                                    None => "*".to_string(),
-                                };
-                                let qualified_table_name_str = format!("\"{}\".\"{}\"", db_name, table_name);
-                                let mut sql_filters: Vec<String> = Vec::new();
-                                let shard_time_range = sd.time_range;
-                                let start_time_str = DateTime::<Utc>::from_naive_utc_and_offset(
-                                    chrono::NaiveDateTime::from_timestamp_opt(shard_time_range.start_time / 1_000_000_000, (shard_time_range.start_time % 1_000_000_000) as u32).unwrap_or_default(), Utc
-                                ).to_rfc3339();
-                                let end_time_str = DateTime::<Utc>::from_naive_utc_and_offset(
-                                    chrono::NaiveDateTime::from_timestamp_opt(shard_time_range.end_time / 1_000_000_000, (shard_time_range.end_time % 1_000_000_000) as u32).unwrap_or_default(), Utc
-                                ).to_rfc3339();
-                                sql_filters.push(format!("\"time\" >= TIMESTAMP '{}'", start_time_str));
-                                sql_filters.push(format!("\"time\" <= TIMESTAMP '{}'", end_time_str));
-                                for filter_expr in table_scan.filters() {
-                                    match expr_to_sql::expr_to_sql(filter_expr) {
-                                        Ok(sql_pred) => sql_filters.push(sql_pred),
-                                        Err(e) => {
-                                            observability_deps::tracing::warn!(
-                                                "Failed to convert filter expression to SQL, skipping filter: {:?}. Error: {}",
-                                                filter_expr, e
-                                            );
-                                        }
-                                    }
-                                }
-                                let sql_query = if sql_filters.is_empty() {
-                                    format!("SELECT {} FROM {}", projected_columns_str, qualified_table_name_str)
-                                } else {
-                                    format!("SELECT {} FROM {} WHERE {}", projected_columns_str, qualified_table_name_str, sql_filters.join(" AND "))
-                                };
-                                observability_deps::tracing::debug!(%sql_query, shard_id = %sd.id.get(), "Generated SQL query for shard fragment");
-                                Ok(Bytes::from(sql_query.into_bytes()))
-                            };
-
-                            let mut plans_for_this_shard_instance: Vec<Arc<dyn ExecutionPlan>> = vec![];
-
-                            for owner_node_id in &shard_def.node_ids {
-                                let is_owner_local = Some(owner_node_id.get()) == current_node_id_parsed;
-                                if is_owner_local {
-                                    let local_shard_logical_plan = self.create_local_shard_logical_plan(
-                                        table_scan,
-                                        shard_def,
-                                        db_name,
-                                        table_name,
-                                    )?;
-                                    let local_shard_physical_plan = self.ctx.create_physical_plan(&local_shard_logical_plan).await?;
-                                    plans_for_this_shard_instance.push(local_shard_physical_plan);
-                                } else {
-                                    if let Some(target_node_address) = self.node_info_provider.get_node_query_rpc_address(owner_node_id) {
-                                        observability_deps::tracing::info!(shard_id = %shard_def.id.get(), target_node=%target_node_address, "Planning remote scan for current owner of shard.");
-                                        let sql_query_bytes = generate_sql_for_shard(shard_def)?;
-                                        let remote_scan = RemoteScanExec::new(
-                                            target_node_address,
-                                            db_name.to_string(),
-                                            sql_query_bytes,
-                                            table_scan.schema(),
-                                        );
-                                        plans_for_this_shard_instance.push(Arc::new(remote_scan));
-                                    } else {
-                                        observability_deps::tracing::warn!("No RPC address for current owner {} of shard {}", owner_node_id.get(), shard_def.id.get());
-                                    }
-                                }
-                            }
-
-                            if let Some(influxdb3_catalog::shard::ShardMigrationStatus::MigratingOutTo(targets)) = &shard_def.migration_status {
-                                for target_node_id in targets {
-                                    if !shard_def.node_ids.contains(target_node_id) {
-                                        if let Some(target_node_address) = self.node_info_provider.get_node_query_rpc_address(target_node_id) {
-                                            observability_deps::tracing::info!(
-                                                shard_id = %shard_def.id.get(),
-                                                target_node=%target_node_address,
-                                                migrating_to_node=%target_node_id.get(),
-                                                "Shard is migrating. Adding scan for target node to query plan."
-                                            );
-                                            let sql_query_bytes = generate_sql_for_shard(shard_def)?;
-                                            let remote_scan = RemoteScanExec::new(
-                                                target_node_address,
-                                                db_name.to_string(),
-                                                sql_query_bytes,
-                                                table_scan.schema(),
-                                            );
-                                            plans_for_this_shard_instance.push(Arc::new(remote_scan));
-                                        } else {
-                                            observability_deps::tracing::warn!("No RPC address for migration target {} of shard {}", target_node_id.get(), shard_def.id.get());
-                                        }
-                                    }
-                                }
-                            }
-                            sub_plans.extend(plans_for_this_shard_instance);
-                        }
-
-                        if sub_plans.is_empty() {
-                            observability_deps::tracing::warn!(%db_name, %table_name, "Sharded table resulted in no scannable shards.");
-                            return Ok(physical_plan);
-                        } else if sub_plans.len() == 1 {
-                            return Ok(sub_plans.remove(0));
-                        } else {
-                            return Ok(Arc::new(UnionExec::new(sub_plans)));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(physical_plan)
+        // This entire method's core logic has been moved to DistributedQueryRewriter::generate_distributed_plan_for_scan
+        // and Planner::create_local_shard_logical_plan.
+        // The Planner's sql() and influxql() methods now use the rewriter.
+        // This method could be removed if create_local_shard_logical_plan is moved to the rewriter or a shared location.
+        unimplemented!("This method is deprecated; logic moved to DistributedQueryRewriter");
     }
 
     // Helper to create a shard-specific logical plan for local execution
-    fn create_local_shard_logical_plan(
-        &self,
-        original_table_scan_physical: &TableScan, // The original physical TableScan node
+    // This is called by DistributedQueryRewriter::generate_distributed_plan_for_scan
+    // It needs access to self.ctx for create_physical_plan if we were to return physical plan from here.
+    // But it returns a logical plan.
+    pub(crate) fn create_local_shard_logical_plan(
+        &self, // Does not need &self if ctx is passed or not used for logical plan part
+        original_table_scan_physical: &TableScan,
         shard_def: &influxdb3_catalog::shard::ShardDefinition,
         db_name: &str,
         table_name: &str,
     ) -> Result<DFLogicalPlan, DataFusionError> {
-        observability_deps::tracing::debug!(shard_id = %shard_def.id.get(), "Creating logical plan for local shard.");
+        observability_deps::tracing::debug!(shard_id = %shard_def.id.get(), "Planner: Creating logical plan for local shard.");
 
         let mut local_filters: Vec<datafusion::logical_expr::Expr> = Vec::new();
-        let time_col = datafusion::logical_expr::col("time"); // Assuming "time" is the standard time column name
+        let time_col = datafusion::logical_expr::col("time");
 
-        // Time Range Filter from ShardDefinition
         let start_lit = datafusion::logical_expr::lit(datafusion::scalar::ScalarValue::TimestampNanosecond(Some(shard_def.time_range.start_time), None));
         let end_lit = datafusion::logical_expr::lit(datafusion::scalar::ScalarValue::TimestampNanosecond(Some(shard_def.time_range.end_time), None));
 
         local_filters.push(time_col.clone().gt_eq(start_lit));
         local_filters.push(time_col.lt_eq(end_lit));
-
-        // Original Predicates from the physical TableScan (which holds logical Exprs)
         local_filters.extend(original_table_scan_physical.filters().to_vec());
 
-        // Combine all filters with AND
         let combined_filter_opt = local_filters.into_iter().reduce(datafusion::logical_expr::Expr::and);
         let final_filters = combined_filter_opt.map_or_else(Vec::new, |f| vec![f]);
 
-        // Create New Filtered Logical TableScan for Local Shard
-        // We need to use the original table schema, not the projected schema from the physical plan,
-        // as filters apply to the base table schema.
         let new_logical_scan = DFLogicalPlan::TableScan(datafusion::logical_expr::TableScan::try_new(
-            datafusion::logical_expr::TableReference::partial(db_name, table_name), // Use partial for db.table
+            datafusion::logical_expr::TableReference::partial(db_name, table_name),
             Arc::clone(original_table_scan_physical.source()),
-            original_table_scan_physical.projection().cloned(), // Projection from original physical scan
-            final_filters, // Use combined filter
+            original_table_scan_physical.projection().cloned(),
+            final_filters,
             original_table_scan_physical.fetch(),
         )?);
 
@@ -305,7 +434,7 @@ impl Planner {
 }
 
 // --- RemoteScanExec: For distributed query fragment execution ---
-use crate::remote_stream::RemoteRecordBatchStream; // Added for RemoteScanExec
+use crate::remote_stream::RemoteRecordBatchStream;
 
 #[derive(Debug)]
 struct RemoteScanExec {
@@ -504,7 +633,7 @@ mod tests {
     use std::io::Write;
     use influxdb3_catalog::shard::{ShardDefinition, ShardId, ShardTimeRange, ShardingStrategy as CatalogShardingStrategy};
     use influxdb3_catalog::log::FieldDataType;
-    use datafusion::logical_expr::Operator; // For test_create_local_shard_logical_plan_filters
+    use datafusion::logical_expr::Operator;
 
 
     #[tokio::test]
@@ -579,7 +708,14 @@ mod tests {
         let logical_plan = planner.ctx.table(table_name).await?.to_logical_plan()?;
         let initial_physical_plan = planner.ctx.create_physical_plan(&logical_plan).await?;
 
-        let distributed_plan = planner.generate_distributed_physical_plan(initial_physical_plan.clone(), db_name).await?;
+        let rewriter = DistributedQueryRewriter::new(
+            Arc::clone(&catalog),
+            planner.current_node_id.clone(),
+            planner.node_info_provider.clone(),
+            planner.ctx.inner(),
+            Arc::from(db_name)
+        );
+        let distributed_plan = rewriter.optimize(initial_physical_plan.clone(), planner.ctx.inner().state().config())?;
 
         assert_eq!(format!("{:?}", distributed_plan), format!("{:?}", initial_physical_plan), "Plan should not change for non-sharded table");
         Ok(())
@@ -600,7 +736,15 @@ mod tests {
         let logical_plan = planner.ctx.table(table_name).await?.to_logical_plan()?;
         let initial_physical_plan = planner.ctx.create_physical_plan(&logical_plan).await?;
 
-        let distributed_plan = planner.generate_distributed_physical_plan(initial_physical_plan.clone(), db_name).await?;
+        let rewriter = DistributedQueryRewriter::new(
+            Arc::clone(&catalog),
+            planner.current_node_id.clone(),
+            planner.node_info_provider.clone(),
+            planner.ctx.inner(),
+            Arc::from(db_name)
+        );
+        let distributed_plan = rewriter.optimize(initial_physical_plan.clone(), planner.ctx.inner().state().config())?;
+
 
         assert_ne!(format!("{:?}", distributed_plan), format!("{:?}", initial_physical_plan), "Plan should change for remote sharded table");
         assert!(distributed_plan.as_any().is::<UnionExec>(), "Plan should be a UnionExec");
@@ -642,17 +786,22 @@ mod tests {
         catalog.create_table(db_name, table_name, &["host"], &[("cpu_usage", FieldDataType::Float)]).await.unwrap();
         catalog.update_table_sharding_strategy(db_name, table_name, CatalogShardingStrategy::Time, None).await.unwrap();
 
-        let shard1_time_range = ShardTimeRange{start_time: 0, end_time: 1000};
-        let shard2_time_range = ShardTimeRange{start_time: 1001, end_time: 2000};
-        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), shard1_time_range, vec![InfluxNodeId::new(0)], None)).await.unwrap();
-        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(2), shard2_time_range, vec![InfluxNodeId::new(0)], None)).await.unwrap();
+        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), ShardTimeRange{start_time: 0, end_time: 1000}, vec![InfluxNodeId::new(0)], None)).await.unwrap();
+        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(2), ShardTimeRange{start_time: 1001, end_time: 2000}, vec![InfluxNodeId::new(0)], None)).await.unwrap();
 
         let logical_plan = planner.ctx.table(table_name).await?
             .filter(datafusion::logical_expr::col("host").eq(datafusion::logical_expr::lit("server1")))?
             .to_logical_plan()?;
         let initial_physical_plan = planner.ctx.create_physical_plan(&logical_plan).await?;
 
-        let distributed_plan = planner.generate_distributed_physical_plan(initial_physical_plan.clone(), db_name).await?;
+        let rewriter = DistributedQueryRewriter::new(
+            Arc::clone(&catalog),
+            planner.current_node_id.clone(),
+            planner.node_info_provider.clone(),
+            planner.ctx.inner(),
+            Arc::from(db_name)
+        );
+        let distributed_plan = rewriter.optimize(initial_physical_plan.clone(), planner.ctx.inner().state().config())?;
 
         assert!(distributed_plan.as_any().is::<UnionExec>(), "Plan should be a UnionExec for multiple local shards");
         assert_eq!(distributed_plan.children().len(), 2, "UnionExec should have 2 children (local shards)");
@@ -676,14 +825,20 @@ mod tests {
         catalog.create_table(db_name, table_name, &["host"], &[("cpu_usage", FieldDataType::Float)]).await.unwrap();
         catalog.update_table_sharding_strategy(db_name, table_name, CatalogShardingStrategy::Time, None).await.unwrap();
 
-        let local_shard_time_range = ShardTimeRange{start_time: 0, end_time: 1000};
-        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), local_shard_time_range, vec![InfluxNodeId::new(0)], None)).await.unwrap();
+        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), ShardTimeRange{start_time: 0, end_time: 1000}, vec![InfluxNodeId::new(0)], None)).await.unwrap();
         catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(2), ShardTimeRange{start_time: 1001, end_time: 2000}, vec![InfluxNodeId::new(1)], None)).await.unwrap();
 
         let logical_plan = planner.ctx.table(table_name).await?.to_logical_plan()?;
         let initial_physical_plan = planner.ctx.create_physical_plan(&logical_plan).await?;
 
-        let distributed_plan = planner.generate_distributed_physical_plan(initial_physical_plan.clone(), db_name).await?;
+        let rewriter = DistributedQueryRewriter::new(
+            Arc::clone(&catalog),
+            planner.current_node_id.clone(),
+            planner.node_info_provider.clone(),
+            planner.ctx.inner(),
+            Arc::from(db_name)
+        );
+        let distributed_plan = rewriter.optimize(initial_physical_plan.clone(), planner.ctx.inner().state().config())?;
 
         assert!(distributed_plan.as_any().is::<UnionExec>(), "Plan should be a UnionExec for mixed shards");
         assert_eq!(distributed_plan.children().len(), 2, "UnionExec should have 2 children (local + remote)");
@@ -728,7 +883,14 @@ mod tests {
 
         let initial_physical_plan = planner.ctx.create_physical_plan(&logical_plan).await?;
 
-        let distributed_plan = planner.generate_distributed_physical_plan(initial_physical_plan.clone(), db_name).await?;
+        let rewriter = DistributedQueryRewriter::new(
+            Arc::clone(&catalog),
+            planner.current_node_id.clone(),
+            planner.node_info_provider.clone(),
+            planner.ctx.inner(),
+            Arc::from(db_name)
+        );
+        let distributed_plan = rewriter.optimize(initial_physical_plan.clone(), planner.ctx.inner().state().config())?;
 
         assert!(distributed_plan.as_any().is::<RemoteScanExec>(), "Plan should be a RemoteScanExec");
         let remote_exec = distributed_plan.as_any().downcast_ref::<RemoteScanExec>().unwrap();
@@ -778,7 +940,7 @@ mod tests {
         mock_node_info.add_node(target_node_id_a, "http://node-2:8082".to_string());
         mock_node_info.add_node(target_node_id_b, "http://node-3:8082".to_string());
 
-        let planner_with_mock_nodes = Planner::new(
+        let planner_with_mock_nodes = Planner::new( // Re-create planner with the specific mock_node_info for this test
             &planner.ctx,
             Arc::clone(&catalog),
             Arc::from("0"),
@@ -788,7 +950,14 @@ mod tests {
         let logical_plan = planner_with_mock_nodes.ctx.table(table_name).await?.to_logical_plan()?;
         let initial_physical_plan = planner_with_mock_nodes.ctx.create_physical_plan(&logical_plan).await?;
 
-        let distributed_plan = planner_with_mock_nodes.generate_distributed_physical_plan(initial_physical_plan.clone(), db_name).await?;
+        let rewriter = DistributedQueryRewriter::new(
+            Arc::clone(&catalog),
+            planner_with_mock_nodes.current_node_id.clone(),
+            planner_with_mock_nodes.node_info_provider.clone(),
+            planner_with_mock_nodes.ctx.inner(),
+            Arc::from(db_name)
+        );
+        let distributed_plan = rewriter.optimize(initial_physical_plan.clone(), planner_with_mock_nodes.ctx.inner().state().config())?;
 
         assert!(distributed_plan.as_any().is::<UnionExec>(), "Plan should be a UnionExec");
         let union_exec = distributed_plan.as_any().downcast_ref::<UnionExec>().unwrap();
