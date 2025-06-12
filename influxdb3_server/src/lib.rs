@@ -18,7 +18,8 @@ mod http;
 pub mod query_executor;
 mod query_planner;
 pub mod replication_service;
-pub mod distributed_query_service; // Added module
+pub mod distributed_query_service;
+pub mod node_data_management_service; // Added module
 mod service;
 mod system_tables;
 
@@ -26,7 +27,8 @@ use crate::grpc::make_flight_server;
 use crate::http::HttpApi;
 use crate::http::route_request;
 use crate::replication_service::{ReplicationServerImpl, ReplicationServiceServer};
-use crate::distributed_query_service::{DistributedQueryServerImpl, DistributedQueryServiceServer}; // Added
+use crate::distributed_query_service::{DistributedQueryServerImpl, DistributedQueryServiceServer};
+use crate::node_data_management_service::{NodeDataManagementServerImpl, NodeDataManagementServiceServer}; // Added
 use crate::query_executor::QueryExecutorImpl; // For concrete type
 
 use authz::Authorizer;
@@ -185,14 +187,20 @@ pub async fn serve(
     let replication_grpc_service = ReplicationServiceServer::new(replication_server_impl);
 
     // Create DistributedQuery service
-    let distributed_query_server_impl = DistributedQueryServerImpl::new(server.http.query_executor_impl()); // Uses Arc<QueryExecutorImpl>
+    let distributed_query_server_impl = DistributedQueryServerImpl::new(server.http.query_executor_impl());
     let distributed_query_grpc_service = DistributedQueryServiceServer::new(distributed_query_server_impl);
+
+    // Create NodeDataManagement service
+    let catalog_for_ndms = server.http.write_buffer().catalog(); // Get Arc<Catalog>
+    let node_data_management_impl = NodeDataManagementServerImpl::new(catalog_for_ndms);
+    let node_data_management_grpc_service = NodeDataManagementServiceServer::new(node_data_management_impl);
 
     // Combine gRPC services
     let combined_grpc_router = tonic::transport::Server::builder()
         .add_service(flight_service_impl)
         .add_service(replication_grpc_service)
-        .add_service(distributed_query_grpc_service) // Added service
+        .add_service(distributed_query_grpc_service)
+        .add_service(node_data_management_grpc_service) // Added service
         .into_router();
 
     let grpc_service = grpc_trace_layer.layer(combined_grpc_router);
@@ -281,10 +289,16 @@ pub async fn serve(
         let distributed_query_server_impl_no_tls = DistributedQueryServerImpl::new(server.http.query_executor_impl());
         let distributed_query_grpc_service_no_tls = DistributedQueryServiceServer::new(distributed_query_server_impl_no_tls);
 
+        // Create NodeDataManagement service for non-TLS path
+        let catalog_for_ndms_no_tls = server.http.write_buffer().catalog();
+        let node_data_management_impl_no_tls = NodeDataManagementServerImpl::new(catalog_for_ndms_no_tls);
+        let node_data_management_grpc_service_no_tls = NodeDataManagementServiceServer::new(node_data_management_impl_no_tls);
+
         let combined_grpc_router = tonic::transport::Server::builder()
             .add_service(flight_service_impl)
             .add_service(replication_grpc_service)
-            .add_service(distributed_query_grpc_service_no_tls) // Added service
+            .add_service(distributed_query_grpc_service_no_tls)
+            .add_service(node_data_management_grpc_service_no_tls) // Added service
             .into_router();
 
         let grpc_service = grpc_trace_layer.layer(combined_grpc_router);

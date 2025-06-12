@@ -3,6 +3,9 @@ pub mod error;
 pub mod membership;
 pub mod migrator; // Added migrator module
 
+#[cfg(any(test, feature = "test_utils"))]
+pub mod node_data_client_mock; // Added mock client module
+
 pub use rebalance::initiate_shard_move_conceptual;
 // Re-exporting all conceptual steps for potential individual use or testing
 pub use rebalance::{

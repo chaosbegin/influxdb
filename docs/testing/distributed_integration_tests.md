@@ -88,24 +88,37 @@ These tests verify that data is correctly placed according to consistent hashing
             -   Query data directly from Node A (bypassing distributed planner, e.g., via direct node API if available, or specific query flags). Verify Node A *only* contains data for hash partitions 0 and 1.
             -   Inspect WAL files or (if possible) Parquet files created on Node A. There should be evidence of separate handling/batching for data belonging to partition 0 vs. partition 1 if they were processed as distinct local `WriteBatch`es.
         -   **Remote Data (Conceptual Forwarding Check):**
-            -   Check logs on Node A for `WARN` messages indicating lines targeting Node B (for partition 2) and stating "True forwarding not implemented."
-            -   Query data from Node B. It should *not* have the data for partition 2 yet (as true forwarding is not implemented).
-        -   The `BufferedWriteRequest` returned by the `write_lp` call on Node A should include `WriteLineError`s for lines that targeted Node B.
+            -   Check logs on Node A for `WARN` messages indicating lines targeting Node B (for partition 2) and stating "True forwarding not implemented." This is for the case where the `cfg(not(test))` path for forwarding is taken, which logs and returns errors.
+            -   Query data from Node B. It should *not* have the data for partition 2.
+        -   The `BufferedWriteRequest` returned by the `write_lp` call on Node A should include `WriteLineError`s for lines that targeted Node B (again, reflecting the "forwarding not implemented" path for production, or actual simulated client errors in test builds).
 
--   **Test Write Forwarding (Full Conceptual Verification - requires more mature mock/controllable services):**
-    -   **Setup:** Similar to above, but with a mechanism to simulate or observe behavior on the "remote" target node (Node B).
-        -   Table with shard keys, `num_hash_partitions > 1`.
-        -   A specific hash partition (e.g., HP2) is assigned to Node B (remote primary).
-        -   Node A is the ingesting node.
-    -   **Action:** Write data to Node A where some lines hash to HP2 (owned by Node B).
-    -   **Verification:**
-        -   **Source Node (Node A):**
-            -   Logs should show `DEBUG` or `INFO` messages indicating an attempt to forward writes for HP2 to Node B (even if it's just the conceptual gRPC call to `ReplicateWalOp` via `execute_replication_to_node`).
-            -   If `accept_partial=false`, and the conceptual forwarding fails (e.g., mock client returns error), the entire write on Node A should fail.
-            -   If `accept_partial=true`, local writes (if any) on Node A should succeed, and errors for forwarded writes should be in `BufferedWriteRequest`.
-        -   **Target Node (Node B - simulated/mocked):**
-            -   If a mock `ReplicationService` is used on Node B, verify it received a `ReplicateWalOpRequest` containing the data for HP2.
-            -   Logs on Node B should indicate it applied a replicated WAL op.
+-   **New Sub-Scenario: Verifying Write Forwarding Logic (Client-Side in `WriteBufferImpl`)**
+    -   This scenario specifically tests the `#[cfg(test)]` path in `WriteBufferImpl::write_lp` where the `MockReplicationClient` is used to simulate forwarding.
+    -   **Setup:**
+        -   Table sharded by hash key (e.g., `tag_rk`) with `num_hash_partitions = 2`.
+        -   Hash partition 0 assigned to `local_node_id`.
+        -   Hash partition 1 assigned to `remote_node_id`.
+        -   InfluxDB 3 server running with `current_node_id` corresponding to `local_node_id`.
+        -   `MockReplicationClient` instance available in `WriteBufferImpl` (via test setup).
+    -   **Action:**
+        -   Client writes a batch of data containing:
+            -   Line L1: `tag_rk` value that hashes to partition 0 (local).
+            -   Line L2: `tag_rk` value that hashes to partition 1 (remote).
+    -   **Verification (Source Node - the one running `WriteBufferImpl`):**
+        -   Logs should show grouping of L1 for local processing and L2 for forwarding to `remote_node_id`.
+        -   A `WriteBatch` for L1 should be created and passed to the local WAL.
+        -   For L2, a `WriteBatch` should be created, serialized, and a `ReplicateWalOpRequest` should be constructed.
+        -   This `ReplicateWalOpRequest` for L2 should be "sent" via `self.mock_replication_client.replicate_wal_op(...)` (or the `execute_replication_to_node` test path that uses it).
+        -   The test should capture or verify the arguments passed to the mock client, ensuring `originating_node_id` is correct, `wal_op_bytes` are present, and other metadata in the request matches L2's data.
+    -   **Error Handling (Still using `MockReplicationClient`):**
+        -   **`accept_partial=true`:**
+            -   Configure `MockReplicationClient` to simulate a failure for the forwarded write of L2.
+            -   Action: Perform the mixed write (L1 local, L2 remote).
+            -   Verification: Write of L1 to local WAL should succeed. `BufferedWriteRequest` should contain a `WriteLineError` for L2, indicating the simulated forwarding failure. Overall line count should reflect only L1.
+        -   **`accept_partial=false`:**
+            -   Configure `MockReplicationClient` to simulate a failure for the forwarded write of L2.
+            -   Action: Perform the mixed write.
+            -   Verification: The entire `write_lp` operation should fail (e.g., return `Err(Error::PartialWriteError)` or `Err(Error::ReplicationError)` depending on how mock failure is translated). No part of the write (neither L1 nor L2) should be committed to the local WAL.
 
 -   **Test Replication of Fine-Grained Local Batches:**
     -   **Setup:**
@@ -137,25 +150,43 @@ These tests verify that queries across sharded data are processed correctly.
     -   Verification (Conceptual):
         -   Based on query plan inspection (if available in tests) or node-level query execution logs/metrics, verify that only the nodes hosting the relevant shards are queried.
         -   Results should only contain data matching the shard key predicate.
+
 -   **Querying Across Hash Partitions:**
     -   **Setup:** Data written and distributed across multiple hash partitions on different nodes (as per "Test Data Placement" in section 2.5).
     -   **Action:** Execute queries (e.g., `SELECT COUNT(*) FROM table`, `SELECT AVG(field) FROM table GROUP BY non_shard_key_tag`) that do not filter on the shard key(s), thus requiring data aggregation from multiple hash partitions/nodes.
     -   **Verification:**
         -   Correct aggregated results are returned, matching the total dataset.
         -   (Advanced) If query plan introspection is possible in the test environment, verify the plan includes `RemoteScanExec` operators for shards on remote nodes and `UnionExec` (or equivalent) to combine results.
+
 -   **Queries Targeting Specific Hash Partitions (via Shard Key Predicates):**
     -   **Setup:** Same as "Querying Across Hash Partitions."
     -   **Action:** Execute queries with equality predicates on all components of the `shard_keys` (e.g., `WHERE tag_hash_key = 'specific_value'`).
     -   **Verification:**
         -   Correct, filtered results are returned.
         -   (Advanced) Check logs or metrics on nodes to confirm that only the node(s) responsible for the hash partition corresponding to `'specific_value'` executed query fragments. Other nodes should not see query activity for this request.
--   **`RemoteScanExec` Resilience (Conceptual):**
-    -   **Connection Failure:**
-        -   Action: Attempt a distributed query where one of the target remote nodes (for a `RemoteScanExec`) is down or its address is misconfigured.
-        -   Verification: The query should fail with a `DataFusionError::Execution` error clearly indicating a connection or client creation failure for the specific remote node.
-    -   **Error Mid-Stream:**
-        -   Action: Simulate a scenario where a `DistributedQueryService` on a remote node successfully starts streaming results for a `RemoteScanExec`, but then encounters an error and terminates the stream prematurely (e.g., by sending a gRPC error status mid-stream).
-        -   Verification: The overall query on the coordinator node should fail, propagating the error from the remote execution. The error message should ideally indicate the source of the error (remote node and the error it encountered). Partial results should generally not be returned unless the system is explicitly designed for such behavior under specific conditions.
+
+-   **New Sub-Scenario: Verifying `RemoteScanExec` Client Call and `DistributedQueryService` Interaction**
+    -   **Setup:** Data distributed across multiple nodes/shards. One shard (e.g., ShardX on NodeR) is remote relative to the querying/coordinating node (NodeC).
+    -   **Action:** Execute a query on NodeC that requires scanning data from ShardX on NodeR. This should trigger a `RemoteScanExec` on NodeC targeting NodeR.
+    -   **Verification:**
+        -   **Calling Node (NodeC):**
+            -   Logs on NodeC for `RemoteScanExec` should show:
+                -   Attempt to connect to NodeR's gRPC service address.
+                -   Successful connection (or specific connection error if simulating failure).
+                -   Preparation of `ExecuteQueryFragmentRequest`. Log should confirm `db_name` and that `query_fragment` (bytes) is being sent with `fragment_type="SerializedDataFusionLogicalPlan"`.
+            -   If connection/call to NodeR fails, verify NodeC's query fails with a `DataFusionError::Execution` indicating the gRPC communication issue (e.g., "Failed to connect", "Remote query fragment execution failed").
+        -   **Target Node (NodeR - running `DistributedQueryService`):**
+            -   Logs on NodeR should show:
+                -   Reception of `ExecuteQueryFragmentRequest` (log database, fragment type, fragment length).
+                -   Successful deserialization of the `LogicalPlan` from `query_fragment` bytes. If deserialization fails, service should return `Status::invalid_argument`.
+                -   Attempt to create a `SessionContext` for the specified `db_name`. If DB doesn't exist on NodeR, service should return `Status::not_found`.
+                -   Attempt to create a physical plan from the `LogicalPlan`. If this fails (e.g., plan references tables/columns not in NodeR's catalog for that DB), service should return `Status::invalid_argument` or `Status::internal`.
+                -   Attempt to execute the physical plan. If this fails to start, service should return `Status::internal`.
+                -   If execution starts, logs should show `RecordBatch`es being serialized to Arrow IPC and sent.
+            -   **Error Propagation from Target Node (NodeR) to Calling Node (NodeC):**
+                -   If `DistributedQueryService` on NodeR returns an error status (e.g., `InvalidArgument` for bad plan, `NotFound` for DB, `Internal` for execution error), verify that `RemoteScanExec` on NodeC receives this status and translates it into a `DataFusionError::Execution` that fails the overall query on NodeC. The error message on NodeC should ideally include context from the gRPC status received from NodeR.
+                -   If the gRPC stream from NodeR to NodeC encounters an error *after* sending some data batches (e.g., NodeR crashes mid-stream), verify the query on NodeC fails with an error indicating stream interruption or gRPC error.
+
 -   **Node Failure during Query:**
     -   Setup: Query spanning multiple shards on different nodes.
     -   Action: While the query is executing, simulate failure of one node involved in the query.
@@ -225,20 +256,26 @@ These tests directly target the functionality of the cluster management HTTP API
         1.  Trigger a conceptual shard migration for `sh1` from Node S to Node T using the `POST /api/v3/cluster/shards/move` endpoint. This invokes `ShardMigrator::run_migration_job`.
     -   **Verification (Observe logs and catalog state changes):**
         1.  **Initiation:** Shard `sh1` status in catalog changes to `MigratingSnapshot`. Log on `ShardMigrator` indicates "Starting migration job..." and "Job ... Initiated. Status: MigratingSnapshot."
-        2.  **Snapshot Phase (Conceptual RPCs):**
-            -   Log on `ShardMigrator`: "Conceptually calling PrepareShardSnapshot on source node S".
-            -   Log on `ShardMigrator`: "Conceptually calling ApplyShardSnapshot on target node T".
-        3.  **Snapshot Complete:** Shard `sh1` status changes to `MigratingWAL`. Log on `ShardMigrator`: "Snapshot transfer complete. Status: MigratingWAL." Log indicates conceptual WAL streaming is active.
-        4.  **WAL Sync Phase (Conceptual RPCs):**
-            -   Log on `ShardMigrator`: "Conceptually calling SignalWalStreamProcessed on target node T".
-            -   Log on `ShardMigrator`: "Conceptually calling LockShardWrites on source node S".
+        2.  **Snapshot Phase (RPC Stubs):**
+            -   Log on `ShardMigrator` for *mock client call* (if test mode) or *conceptual call* (if prod mode) to `PrepareShardSnapshot` on source Node S.
+            -   Log on Node S (from `NodeDataManagementServerImpl` stub): "Received PrepareShardSnapshot request...".
+            -   Log on `ShardMigrator` for *mock client call* / *conceptual call* to `ApplyShardSnapshot` on target Node T.
+            -   Log on Node T (stub): "Received ApplyShardSnapshot request...".
+        3.  **Snapshot Complete:** Shard `sh1` status changes to `MigratingWAL`. Log on `ShardMigrator`: "Snapshot transfer complete. Status: MigratingWAL." Log indicates conceptual WAL streaming.
+        4.  **WAL Sync Phase (RPC Stubs):**
+            -   Log on `ShardMigrator` for *mock/conceptual call* to `SignalWalStreamProcessed` on Node T.
+            -   Log on Node T (stub): "Received SignalWalStreamProcessed request...".
+            -   Log on `ShardMigrator` for *mock/conceptual call* to `LockShardWrites` on Node S.
+            -   Log on Node S (stub): "Received LockShardWrites request...".
         5.  **WAL Sync Complete:** Shard `sh1` status changes to `AwaitingCutover`. Log on `ShardMigrator`: "WAL sync complete. Status: AwaitingCutover."
         6.  **Cutover:**
             -   Shard `sh1` `node_ids` in catalog updated to `[NodeT]`. Status changes to `Stable`.
             -   Log on `ShardMigrator`: "Cutover complete. Owner: NodeT. Status: Stable."
-            -   Log on `ShardMigrator`: "Conceptually calling UnlockShardWrites on target node T".
+            -   Log on `ShardMigrator` for *mock/conceptual call* to `UnlockShardWrites` on Node T.
+            -   Log on Node T (stub): "Received UnlockShardWrites request...".
         7.  **Cleanup:**
-            -   Log on `ShardMigrator`: "Conceptually calling DeleteShardData on source node S".
+            -   Log on `ShardMigrator` for *mock/conceptual call* to `DeleteShardData` on Node S.
+            -   Log on Node S (stub): "Received DeleteShardData request...".
             -   Shard `sh1` status changes to `Cleaned`. Log on `ShardMigrator`: "Cleanup complete on source S. Status: Cleaned."
         8.  **Post-Migration Data Access (Conceptual):**
             -   New writes for the data range covered by `sh1` should (conceptually) be routed to Node T.
@@ -327,5 +364,9 @@ Beyond specific scenarios, the overall testing strategy should incorporate:
     -   Test that critical management operations (e.g., triggering rebalancing, updating configurations) are idempotent where appropriate. Running the same API call multiple times should not lead to unintended side effects or errors after the first successful application.
 -   **Upgrade/Downgrade Path (Future):**
     -   Once the system is more mature, tests for rolling upgrades and downgrades of a distributed cluster will be essential, ensuring data compatibility and operational continuity.
+-   **Scope of "Productionized" in Tests:**
+    -   Clarify that "productionizing" these features for testing purposes means ensuring the code structure, logic for data handling (splitting, forwarding decisions, plan serialization, RPC call mechanics), and error propagation are robustly tested within a simulated or locally controlled multi-process/container environment. True distributed system properties like behavior under real network failures, consensus nuances under extreme conditions, etc., require more specialized testbeds (e.g., chaos engineering) which are a further step beyond these integration tests.
+-   **Arrow IPC Compatibility:**
+    -   Add a note to specifically verify that the Arrow IPC serialization format used by `DistributedQueryService` to send `RecordBatch`es is fully compatible with the deserialization logic in `RemoteScanExec` on the client side. This includes checking for consistent schema interpretation, data types, and handling of potential version differences or endianness if cross-platform scenarios were relevant.
 
 This document provides a starting point for designing a comprehensive distributed integration testing suite. Each scenario would need to be further detailed with specific steps, assertions, and configurations.

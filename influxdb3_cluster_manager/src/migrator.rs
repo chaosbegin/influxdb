@@ -1,7 +1,10 @@
 use influxdb3_catalog::catalog::Catalog;
-use influxdb3_catalog::shard::ShardId; // Corrected import
-use influxdb3_id::NodeId; // Corrected import
+use influxdb3_catalog::shard::ShardId;
+use influxdb3_id::NodeId;
 use std::sync::Arc;
+#[cfg(any(test, feature = "test_utils"))]
+use crate::node_data_client_mock::MockNodeDataManagementClient; // Test only
+use influxdb3_proto::influxdb3::internal::node_data_management::v1 as proto_ndm; // For proto types
 use crate::rebalance::{
     initiate_shard_move_conceptual,
     complete_shard_snapshot_transfer_conceptual,
@@ -24,11 +27,43 @@ pub struct ShardMigrationJob {
 
 pub struct ShardMigrator {
     catalog: Arc<Catalog>,
+    #[cfg(any(test, feature = "test_utils"))]
+    source_node_data_client_for_test: Option<Arc<MockNodeDataManagementClient>>,
+    #[cfg(any(test, feature = "test_utils"))]
+    target_node_data_client_for_test: Option<Arc<MockNodeDataManagementClient>>,
+}
+
+// Helper function to create ProtoShardIdentifier
+fn make_proto_shard_identifier(db_name: &str, table_name: &str, shard_id: ShardId) -> Option<proto_ndm::ShardIdentifier> {
+    Some(proto_ndm::ShardIdentifier {
+        db_name: db_name.to_string(),
+        table_name: table_name.to_string(),
+        shard_id: shard_id.get(),
+    })
 }
 
 impl ShardMigrator {
     pub fn new(catalog: Arc<Catalog>) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            #[cfg(any(test, feature = "test_utils"))]
+            source_node_data_client_for_test: None,
+            #[cfg(any(test, feature = "test_utils"))]
+            target_node_data_client_for_test: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test_utils"))]
+    pub fn new_for_test(
+        catalog: Arc<Catalog>,
+        source_node_data_client: Arc<MockNodeDataManagementClient>,
+        target_node_data_client: Arc<MockNodeDataManagementClient>,
+    ) -> Self {
+        Self {
+            catalog,
+            source_node_data_client_for_test: Some(source_node_data_client),
+            target_node_data_client_for_test: Some(target_node_data_client),
+        }
     }
 
     pub async fn run_migration_job(&self, job: ShardMigrationJob) -> Result<(), ClusterManagerError> {
@@ -61,13 +96,32 @@ impl ShardMigrator {
         );
 
         // Conceptual RPC calls for snapshot phase
-        tracing::info!("Job {:?}: Conceptually calling PrepareShardSnapshot on source node {}", job.shard_id, job.source_node_id.get());
-        // Actual client.prepare_shard_snapshot(...) would go here.
-        tracing::info!("Job {:?}: Conceptual PrepareShardSnapshot succeeded on source.", job.shard_id);
+        let proto_shard_id = make_proto_shard_identifier(&job.db_name, &job.table_name, job.shard_id);
 
-        tracing::info!("Job {:?}: Conceptually calling ApplyShardSnapshot on target node {}", job.shard_id, job.target_node_id.get());
-        // Actual client.apply_shard_snapshot(...) would go here.
-        tracing::info!("Job {:?}: Conceptual ApplyShardSnapshot succeeded on target.", job.shard_id);
+        #[cfg(any(test, feature = "test_utils"))]
+        {
+            if let Some(client) = &self.source_node_data_client_for_test {
+                let req = proto_ndm::PrepareShardSnapshotRequest { shard_identifier: proto_shard_id.clone() };
+                client.prepare_shard_snapshot(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
+                tracing::info!("Job {:?}: Mock PrepareShardSnapshot called on source node {}.", job.shard_id, job.source_node_id.get());
+            } else {
+                tracing::warn!("Job {:?}: Source node data client not available for test (PrepareShardSnapshot).", job.shard_id);
+            }
+            if let Some(client) = &self.target_node_data_client_for_test {
+                 let req = proto_ndm::ApplyShardSnapshotRequest { shard_identifier: proto_shard_id.clone() };
+                 client.apply_shard_snapshot(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
+                 tracing::info!("Job {:?}: Mock ApplyShardSnapshot called on target node {}.", job.shard_id, job.target_node_id.get());
+            } else {
+                tracing::warn!("Job {:?}: Target node data client not available for test (ApplyShardSnapshot).", job.shard_id);
+            }
+        }
+        #[cfg(not(any(test, feature = "test_utils")))]
+        {
+            tracing::info!("Job {:?}: Conceptually calling PrepareShardSnapshot on source node {}", job.shard_id, job.source_node_id.get());
+            tracing::info!("Job {:?}: Conceptual PrepareShardSnapshot succeeded on source.", job.shard_id);
+            tracing::info!("Job {:?}: Conceptually calling ApplyShardSnapshot on target node {}", job.shard_id, job.target_node_id.get());
+            tracing::info!("Job {:?}: Conceptual ApplyShardSnapshot succeeded on target.", job.shard_id);
+        }
 
         // 2. Complete snapshot transfer (set status to MigratingWAL)
         complete_shard_snapshot_transfer_conceptual(
@@ -106,15 +160,28 @@ impl ShardMigrator {
         );
 
         // Conceptual RPC calls for cutover preparation
-        tracing::info!("Job {:?}: Conceptually calling SignalWalStreamProcessed on target node {}.", job.shard_id, job.target_node_id.get());
-        // Actual client.signal_wal_stream_processed(...) would go here.
-
-        tracing::info!("Job {:?}: Conceptually calling LockShardWrites on source node {}.", job.shard_id, job.source_node_id.get());
-        // Actual client.lock_shard_writes(...) on source would go here.
-        // Potentially also lock on target for new writes if it's a complex cutover:
-        // tracing::info!("Job {:?}: Conceptually calling LockShardWrites on target node {}.", job.shard_id, job.target_node_id.get());
-        // Actual client.lock_shard_writes(...) on target would go here.
-
+        #[cfg(any(test, feature = "test_utils"))]
+        {
+            if let Some(client) = &self.target_node_data_client_for_test { // Assuming target signals/is signaled
+                let req = proto_ndm::SignalWalStreamProcessedRequest { shard_identifier: proto_shard_id.clone() };
+                client.signal_wal_stream_processed(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
+                tracing::info!("Job {:?}: Mock SignalWalStreamProcessed called on target node {}.", job.shard_id, job.target_node_id.get());
+            } else {
+                tracing::warn!("Job {:?}: Target node data client not available for test (SignalWalStreamProcessed).", job.shard_id);
+            }
+            if let Some(client) = &self.source_node_data_client_for_test {
+                let req = proto_ndm::LockShardWritesRequest { shard_identifier: proto_shard_id.clone() };
+                client.lock_shard_writes(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
+                tracing::info!("Job {:?}: Mock LockShardWrites called on source node {}.", job.shard_id, job.source_node_id.get());
+            } else {
+                tracing::warn!("Job {:?}: Source node data client not available for test (LockShardWrites).", job.shard_id);
+            }
+        }
+        #[cfg(not(any(test, feature = "test_utils")))]
+        {
+            tracing::info!("Job {:?}: Conceptually calling SignalWalStreamProcessed on target node {}.", job.shard_id, job.target_node_id.get());
+            tracing::info!("Job {:?}: Conceptually calling LockShardWrites on source node {}.", job.shard_id, job.source_node_id.get());
+        }
 
         // 4. Complete cutover (update shard owner to target_node_id, set status to Stable)
         complete_shard_cutover_conceptual(
@@ -136,8 +203,20 @@ impl ShardMigrator {
         );
 
         // Conceptual RPC call for unlocking writes on target
-        tracing::info!("Job {:?}: Conceptually calling UnlockShardWrites on target node {}.", job.shard_id, job.target_node_id.get());
-        // Actual client.unlock_shard_writes(...) on target would go here.
+        #[cfg(any(test, feature = "test_utils"))]
+        {
+            if let Some(client) = &self.target_node_data_client_for_test {
+                let req = proto_ndm::UnlockShardWritesRequest { shard_identifier: proto_shard_id.clone() };
+                client.unlock_shard_writes(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
+                tracing::info!("Job {:?}: Mock UnlockShardWrites called on target node {}.", job.shard_id, job.target_node_id.get());
+            } else {
+                tracing::warn!("Job {:?}: Target node data client not available for test (UnlockShardWrites).", job.shard_id);
+            }
+        }
+        #[cfg(not(any(test, feature = "test_utils")))]
+        {
+            tracing::info!("Job {:?}: Conceptually calling UnlockShardWrites on target node {}.", job.shard_id, job.target_node_id.get());
+        }
 
         // 5. Complete cleanup on source node (set status to Cleaned)
         complete_shard_cleanup_conceptual(
@@ -159,8 +238,20 @@ impl ShardMigrator {
         );
 
         // Conceptual RPC call for deleting data on source
-        tracing::info!("Job {:?}: Conceptually calling DeleteShardData on source node {}.", job.shard_id, job.source_node_id.get());
-        // Actual client.delete_shard_data(...) on source would go here.
+        #[cfg(any(test, feature = "test_utils"))]
+        {
+            if let Some(client) = &self.source_node_data_client_for_test {
+                 let req = proto_ndm::DeleteShardDataRequest { shard_identifier: proto_shard_id.clone() };
+                 client.delete_shard_data(req).await.map_err(|e| ClusterManagerError::Internal(format!("Mock client error: {}",e)))?;
+                 tracing::info!("Job {:?}: Mock DeleteShardData called on source node {}.", job.shard_id, job.source_node_id.get());
+            } else {
+                tracing::warn!("Job {:?}: Source node data client not available for test (DeleteShardData).", job.shard_id);
+            }
+        }
+        #[cfg(not(any(test, feature = "test_utils")))]
+        {
+            tracing::info!("Job {:?}: Conceptually calling DeleteShardData on source node {}.", job.shard_id, job.source_node_id.get());
+        }
 
         tracing::info!(
             db_name = %job.db_name,
@@ -181,7 +272,11 @@ mod tests {
     use iox_time::MockProvider;
     use object_store::memory::InMemory;
     use std::sync::Arc;
-    use tokio::sync::Mutex; // For mocking error returns
+    // Remove Mutex import if not used elsewhere, MockNodeDataManagementClient uses its own Mutex
+    // use tokio::sync::Mutex;
+    use crate::node_data_client_mock::{MockNodeDataManagementClient, ExpectedNodeCall}; // For tests
+    use influxdb3_proto::influxdb3::internal::node_data_management::v1 as proto_ndm_test;
+
 
     // Helper to setup a basic catalog for tests
     async fn setup_test_catalog() -> Arc<Catalog> {
@@ -231,8 +326,15 @@ mod tests {
             target_node_id,
         };
 
-        let migrator = ShardMigrator::new(Arc::clone(&catalog));
-        let result = migrator.run_migration_job(job).await;
+        let source_mock_client = Arc::new(MockNodeDataManagementClient::new());
+        let target_mock_client = Arc::new(MockNodeDataManagementClient::new());
+
+        let migrator = ShardMigrator::new_for_test(
+            Arc::clone(&catalog),
+            Arc::clone(&source_mock_client),
+            Arc::clone(&target_mock_client),
+        );
+        let result = migrator.run_migration_job(job.clone()).await; // Clone job for assertions later
 
         assert!(result.is_ok(), "Migration job failed: {:?}", result.err());
 
@@ -244,7 +346,59 @@ mod tests {
         assert_eq!(final_shard_def.status, "Cleaned");
         assert_eq!(final_shard_def.node_ids, vec![target_node_id]); // Owner should be target
         assert!(final_shard_def.updated_at_ts.unwrap() > 0); // Timestamp updated
+
+        // Verify mock client calls
+        let expected_proto_shard_id = Some(proto_ndm_test::ShardIdentifier {
+            db_name: job.db_name.clone(),
+            table_name: job.table_name.clone(),
+            shard_id: job.shard_id.get(),
+        });
+
+        let source_calls = source_mock_client.calls.lock().unwrap();
+        assert_eq!(source_calls.len(), 3); // PrepareSnapshot, LockShardWrites, DeleteShardData
+        assert!(matches!(source_calls[0], ExpectedNodeCall::PrepareShardSnapshot(_)));
+        assert_eq!(source_calls[0].clone().prepare_shard_snapshot_request().unwrap().shard_identifier, expected_proto_shard_id);
+
+        assert!(matches!(source_calls[1], ExpectedNodeCall::LockShardWrites(_)));
+        assert_eq!(source_calls[1].clone().lock_shard_writes_request().unwrap().shard_identifier, expected_proto_shard_id);
+
+        assert!(matches!(source_calls[2], ExpectedNodeCall::DeleteShardData(_)));
+        assert_eq!(source_calls[2].clone().delete_shard_data_request().unwrap().shard_identifier, expected_proto_shard_id);
+
+        let target_calls = target_mock_client.calls.lock().unwrap();
+        assert_eq!(target_calls.len(), 3); // ApplySnapshot, SignalWalStreamProcessed, UnlockShardWrites
+        assert!(matches!(target_calls[0], ExpectedNodeCall::ApplyShardSnapshot(_)));
+        assert_eq!(target_calls[0].clone().apply_shard_snapshot_request().unwrap().shard_identifier, expected_proto_shard_id);
+
+        assert!(matches!(target_calls[1], ExpectedNodeCall::SignalWalStreamProcessed(_)));
+        assert_eq!(target_calls[1].clone().signal_wal_stream_processed_request().unwrap().shard_identifier, expected_proto_shard_id);
+
+        assert!(matches!(target_calls[2], ExpectedNodeCall::UnlockShardWrites(_)));
+        assert_eq!(target_calls[2].clone().unlock_shard_writes_request().unwrap().shard_identifier, expected_proto_shard_id);
     }
+
+    // Helper methods to extract requests from ExpectedNodeCall for assertions
+    impl ExpectedNodeCall {
+        fn prepare_shard_snapshot_request(self) -> Option<proto_ndm_test::PrepareShardSnapshotRequest> {
+            match self { ExpectedNodeCall::PrepareShardSnapshot(req) => Some(req), _ => None }
+        }
+        fn apply_shard_snapshot_request(self) -> Option<proto_ndm_test::ApplyShardSnapshotRequest> {
+            match self { ExpectedNodeCall::ApplyShardSnapshot(req) => Some(req), _ => None }
+        }
+        fn signal_wal_stream_processed_request(self) -> Option<proto_ndm_test::SignalWalStreamProcessedRequest> {
+            match self { ExpectedNodeCall::SignalWalStreamProcessed(req) => Some(req), _ => None }
+        }
+        fn lock_shard_writes_request(self) -> Option<proto_ndm_test::LockShardWritesRequest> {
+            match self { ExpectedNodeCall::LockShardWrites(req) => Some(req), _ => None }
+        }
+        fn unlock_shard_writes_request(self) -> Option<proto_ndm_test::UnlockShardWritesRequest> {
+            match self { ExpectedNodeCall::UnlockShardWrites(req) => Some(req), _ => None }
+        }
+        fn delete_shard_data_request(self) -> Option<proto_ndm_test::DeleteShardDataRequest> {
+            match self { ExpectedNodeCall::DeleteShardData(req) => Some(req), _ => None }
+        }
+    }
+
 
     // MockableCatalog for error propagation tests
     // This is a simplified mock. A more robust solution might use a mocking library or trait.

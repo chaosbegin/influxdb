@@ -41,86 +41,124 @@ impl DistributedQueryService for DistributedQueryServerImpl {
         &self,
         request: Request<ExecuteQueryFragmentRequest>,
     ) -> Result<Response<Self::ExecuteQueryFragmentStream>, Status> {
-        let req = request.into_inner();
-        let db_name = req.db_name.clone(); // Clone for use in async block
-        let query_fragment_bytes = req.query_fragment.clone(); // Clone for use in async block
-        let fragment_type = req.fragment_type.clone(); // Clone for use in async block
-
-        tracing::info!(
-            database_name = %db_name,
-            fragment_type = %fragment_type,
-            fragment_len = %query_fragment_bytes.len(),
-            "Received ExecuteQueryFragment request"
+        let req_ref = request.get_ref(); // Get a reference first for logging before consuming
+        tracing::debug!(
+            database = %req_ref.db_name,
+            fragment_type = %req_ref.fragment_type,
+            "Executing distributed query fragment. Conceptual: Apply resource limits from session/request here."
         );
 
-        // Removed the premature check for "RawSql" only.
-        // The if/else if block below handles different fragment_types.
+        let req = request.into_inner();
+        let db_name = req.db_name.clone();
+        let query_fragment_bytes = req.query_fragment.clone();
+        let fragment_type = req.fragment_type.clone();
 
         let record_batch_stream_result = if fragment_type == "RawSql" {
+            // This path is less likely with the new architecture but kept for robustness.
             let sql_query = String::from_utf8(query_fragment_bytes)
                 .map_err(|e| Status::invalid_argument(format!("Failed to decode RawSql fragment: {}", e)))?;
 
-            let span_ctx = SpanContext::new_current_trace_id();
+            let span_ctx = SpanContext::new_current_trace_id(); // Or propagate from request if available
             self.query_executor
                 .query_sql(&db_name, &sql_query, None, Some(span_ctx), None)
                 .await
         } else if fragment_type == "SerializedDataFusionLogicalPlan" {
             let logical_plan: LogicalPlan = deserialize_logical_plan(&query_fragment_bytes)
-                .map_err(|e| Status::internal(format!("Failed to deserialize LogicalPlan: {}", e)))?;
+                .map_err(|e| {
+                    tracing::error!("Failed to deserialize LogicalPlan for db {}: {}", db_name, e);
+                    Status::invalid_argument(format!("Failed to deserialize LogicalPlan: {}", e))
+                })?;
 
-            // Obtain a new SessionContext configured for the target database.
-            // This assumes QueryExecutorImpl can provide such a context.
-            // The context needs the correct catalog (for the given db_name) registered.
-            let session_ctx = self.query_executor.new_df_session_context(&db_name); // Conceptual method
+            let session_ctx = self.query_executor.new_df_session_context(&db_name)
+                .map_err(|e| { // Assuming new_df_session_context now returns Result
+                    tracing::error!("Failed to create session context for db {}: {}", db_name, e);
+                    // Map QueryExecutorError to tonic::Status
+                    match e {
+                        QueryExecutorError::DatabaseNotFound { db_name: e_db_name } => Status::not_found(format!("Database {} not found: {}", e_db_name, e)),
+                        _ => Status::internal(format!("Failed to create session context for db {}: {}", db_name, e)),
+                    }
+                })?;
 
+            // Conceptual: The SessionContext (session_ctx) should be configured with appropriate memory pools
+            // and resource limits (e.g., from a global pool or limits passed via the request) to constrain this fragment execution.
             let physical_plan = session_ctx.create_physical_plan(&logical_plan).await
-                .map_err(|e| Status::internal(format!("Failed to create physical plan: {}", e)))?;
+                .map_err(|e: DataFusionError| {
+                    tracing::error!("Failed to create physical plan for db {}: {}", db_name, e);
+                    // Determine if it's an invalid plan or an internal error
+                    if matches!(e, DataFusionError::Plan(_)) {
+                        Status::invalid_argument(format!("Failed to create physical plan from logical plan fragment for db {}: {}", db_name, e))
+                    } else {
+                        Status::internal(format!("Internal error during physical planning for db {}: {}", db_name, e))
+                    }
+                })?;
 
             session_ctx.execute_stream(physical_plan).await
-                .map_err(|e| Status::internal(format!("Failed to execute physical plan: {}", e)))
+                .map_err(|e: DataFusionError| {
+                    tracing::error!("Failed to start execution of physical plan fragment for db {}: {}", db_name, e);
+                    Status::internal(format!("Failed to start execution of physical plan fragment for db {}: {}", db_name, e))
+                })
         } else {
+            tracing::warn!("Unsupported fragment type received: {}", fragment_type);
             return Err(Status::unimplemented(format!(
                 "Fragment type '{}' not supported.",
                 fragment_type
             )));
         };
 
-        let record_batch_stream = match record_batch_stream_result {
+        let mut record_batch_stream = match record_batch_stream_result {
             Ok(stream) => stream,
-            Err(QueryExecutorError::DatabaseNotFound { db_name: e_db_name }) => { // This error comes from query_sql
-                tracing::warn!("Database '{}' not found for query fragment execution", e_db_name);
+            Err(QueryExecutorError::DatabaseNotFound { db_name: e_db_name }) => {
+                tracing::warn!("Database '{}' not found for query fragment execution (from query_sql path)", e_db_name);
                 return Err(Status::not_found(format!("Database '{}' not found", e_db_name)));
             }
-            Err(QueryExecutorError::DataFusionError(e)) => { // This error comes from query_sql or execute_stream
-                 tracing::error!("DataFusion error during query fragment execution for db '{}': {}", db_name, e);
+            Err(QueryExecutorError::DataFusionError(e)) => { // Should be caught by specific steps above for SerializedPlan
+                 tracing::error!("DataFusion error during query fragment execution for db '{}' (from query_sql path): {}", db_name, e);
                  return Err(Status::internal(format!("DataFusion execution error: {}", e)));
             }
-            Err(e) => { // Other QueryExecutorErrors
-                tracing::error!("Generic error during query fragment execution for db '{}': {}", db_name, e);
+            Err(e) => { // Other QueryExecutorErrors from query_sql path
+                tracing::error!("Generic error during query fragment execution for db '{}' (from query_sql path): {}", db_name, e);
                 return Err(Status::internal(format!("Fragment execution failed: {}", e)));
             }
         };
 
-        let response_stream = record_batch_stream.map_err(|df_err: DataFusionError| {
-            Status::internal(format!("Error processing RecordBatch stream: {}", df_err))
-        }).and_then(|batch: RecordBatch| async move {
-            // Serialize RecordBatch to Arrow IPC format
-            let mut stream_writer = StreamWriter::try_new(Vec::new(), &batch.schema(), None)
-                .map_err(|e| Status::internal(format!("Failed to create IPC StreamWriter: {}", e)))?;
+        let response_stream = async_stream::try_stream! {
+            while let Some(batch_result) = record_batch_stream.next().await {
+                match batch_result {
+                    Ok(batch) => {
+                        let options = IpcWriteOptions::default(); // Consider custom options if needed
+                        let mut stream_writer = StreamWriter::try_new(Vec::new(), &batch.schema(), Some(options))
+                            .map_err(|e| {
+                                tracing::error!("Failed to create IPC StreamWriter for db {}: {}", db_name, e);
+                                Status::internal(format!("Failed to create IPC StreamWriter: {}", e))
+                            })?;
 
-            stream_writer.write(&batch)
-                .map_err(|e| Status::internal(format!("Failed to write RecordBatch to IPC: {}", e)))?;
+                        stream_writer.write(&batch).map_err(|e| {
+                            tracing::error!("Failed to write RecordBatch to IPC for db {}: {}", db_name, e);
+                            Status::internal(format!("Failed to write RecordBatch to IPC: {}", e))
+                        })?;
 
-            stream_writer.finish()
-                .map_err(|e| Status::internal(format!("Failed to finish IPC stream: {}", e)))?;
+                        stream_writer.finish().map_err(|e| {
+                            tracing::error!("Failed to finish IPC stream for db {}: {}", db_name, e);
+                            Status::internal(format!("Failed to finish IPC stream: {}", e))
+                        })?;
 
-            let buffer = stream_writer.into_inner()
-                .map_err(|e| Status::internal(format!("Failed to get buffer from IPC StreamWriter: {}", e)))?;
+                        let buffer = stream_writer.into_inner().map_err(|e| {
+                            tracing::error!("Failed to get buffer from IPC StreamWriter for db {}: {}", db_name, e);
+                            Status::internal(format!("Failed to get buffer from IPC StreamWriter: {}", e))
+                        })?;
 
-            Ok(ExecuteQueryFragmentResponse {
-                record_batch_bytes: Bytes::from(buffer),
-            })
-        });
+                        yield ExecuteQueryFragmentResponse {
+                            record_batch_bytes: Bytes::from(buffer),
+                        };
+                    }
+                    Err(e) => {
+                        tracing::error!("Error executing query fragment stream for db {}: {}", db_name, e);
+                        Err(Status::internal(format!("Error during remote fragment execution: {}", e)))?;
+                    }
+                }
+            }
+            tracing::debug!(database = %db_name, "Finished executing distributed query fragment. Conceptual: Release/record resources used.");
+        };
 
         Ok(Response::new(Box::pin(response_stream) as Self::ExecuteQueryFragmentStream))
     }
@@ -266,4 +304,95 @@ mod tests {
         // EmptyTable provider for "test_table_for_plan" will result in an empty stream of batches.
         assert!(received_batches.is_empty() || received_batches.iter().all(|rb| rb.num_rows() == 0), "Expected no data or only empty batches from EmptyTable, got: {:?}", received_batches);
     }
+
+    #[tokio::test]
+    async fn test_execute_query_fragment_deserialization_error() {
+        let catalog = Arc::new(Catalog::new_in_memory("test_cat_deserialize_err").await.unwrap());
+        let query_executor = create_test_query_executor(catalog).await;
+        let server_impl = DistributedQueryServerImpl::new(query_executor);
+
+        let request_payload = ExecuteQueryFragmentRequest {
+            db_name: "any_db".to_string(),
+            query_fragment: Bytes::from("invalid bytes that are not a plan"),
+            fragment_type: "SerializedDataFusionLogicalPlan".to_string(),
+        };
+        let tonic_request = Request::new(request_payload);
+
+        let response_result = server_impl.execute_query_fragment(tonic_request).await;
+        assert!(response_result.is_err());
+        let status = response_result.err().unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("Failed to deserialize LogicalPlan"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_query_fragment_db_not_found_error() {
+        let catalog = Arc::new(Catalog::new_in_memory("test_cat_db_not_found").await.unwrap());
+        // DO NOT create the database "non_existent_db" in the catalog
+        let query_executor = create_test_query_executor(catalog).await;
+        let server_impl = DistributedQueryServerImpl::new(query_executor);
+
+        // A valid plan, but DB won't be found
+        let test_arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new("id", ArrowDataType::Int64, false)]));
+        let logical_plan = LogicalPlanBuilder::empty(false).unwrap().build().unwrap(); // Simplest plan
+        let serialized_plan = serialize_logical_plan(&logical_plan).unwrap();
+
+        let request_payload = ExecuteQueryFragmentRequest {
+            db_name: "non_existent_db".to_string(),
+            query_fragment: Bytes::from(serialized_plan),
+            fragment_type: "SerializedDataFusionLogicalPlan".to_string(),
+        };
+        let tonic_request = Request::new(request_payload);
+
+        let response_result = server_impl.execute_query_fragment(tonic_request).await;
+        assert!(response_result.is_err());
+        let status = response_result.err().unwrap();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(status.message().contains("Database non_existent_db not found"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_query_fragment_physical_plan_error() {
+        let catalog = Arc::new(Catalog::new_in_memory("test_cat_phys_plan_err").await.unwrap());
+        catalog.create_database("test_db_for_plan_err").await.unwrap();
+        // Table "table_in_plan_but_not_catalog" is NOT created in catalog, or has different schema.
+        // This should cause an error when DataFusion tries to create a physical plan if it
+        // resolves tables/columns against the catalog during that phase via the SessionContext.
+
+        let query_executor = create_test_query_executor(catalog).await;
+        let server_impl = DistributedQueryServerImpl::new(query_executor);
+
+        // Plan references "table_in_plan_but_not_catalog" which isn't in the catalog used by SessionContext.
+        let test_arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new("id", ArrowDataType::Int64, false)]));
+        let logical_plan = LogicalPlanBuilder::scan("table_in_plan_but_not_catalog", test_arrow_schema, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let serialized_plan = serialize_logical_plan(&logical_plan).unwrap();
+
+        let request_payload = ExecuteQueryFragmentRequest {
+            db_name: "test_db_for_plan_err".to_string(),
+            query_fragment: Bytes::from(serialized_plan),
+            fragment_type: "SerializedDataFusionLogicalPlan".to_string(),
+        };
+        let tonic_request = Request::new(request_payload);
+
+        let response_result = server_impl.execute_query_fragment(tonic_request).await;
+        assert!(response_result.is_err());
+        let status = response_result.err().unwrap();
+        // DataFusion often returns Internal for planning errors if not specifically mapped.
+        // Or InvalidArgument if it's clearly a bad plan input.
+        assert!(
+            status.code() == tonic::Code::Internal || status.code() == tonic::Code::InvalidArgument,
+            "Unexpected status code: {:?}", status.code()
+        );
+        assert!(
+            status.message().contains("Failed to create physical plan") || status.message().contains("table_in_plan_but_not_catalog")
+        );
+    }
+
+    // Test for stream execution error is harder without deeper mocking of DataFusion execution.
+    // For now, the above tests cover plan creation and input validation errors.
+    // A stream error would typically manifest as an error item within the returned stream,
+    // which the `async_stream::try_stream!` block is designed to handle by converting it to `Status::internal`.
 }
