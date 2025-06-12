@@ -804,6 +804,89 @@ impl Bufferer for WriteBufferImpl {
         }
         // --- END REPLICATION LOGIC ---
 
+        // --- START FORWARDING WRITE TO MIGRATION TARGETS ---
+        if let Some(main_table_id) = first_line_table_id { // Should be the same as first_line_table_id_for_rep
+            if let Some(main_table_def) = db_schema.table_definition_by_id(&main_table_id) {
+                if let Some(main_shard_id) = determined_shard_id {
+                    if let Some(primary_shard_def) = main_table_def.shards.get_by_id(&main_shard_id) {
+                        if let Some(influxdb3_catalog::shard::ShardMigrationStatus::MigratingOutTo(targets)) = &primary_shard_def.migration_status {
+                            if !targets.is_empty() {
+                                info!(
+                                    shard_id = %main_shard_id.get(),
+                                    db_name = %db_schema.name,
+                                    table_name = %main_table_def.table_name,
+                                    migration_targets = ?targets,
+                                    "Shard is migrating. Forwarding write to target(s)."
+                                );
+                                // wal_op was defined earlier and written to local WAL.
+                                // We need its serialized form for forwarding.
+                                match bitcode::serialize(&wal_op) {
+                                    Ok(op_bytes_for_forward) => {
+                                        let mut forward_join_set = JoinSet::new();
+                                        for target_node_id_obj in targets {
+                                            let target_node_id_str = target_node_id_obj.get().to_string();
+                                            let client_factory_clone = Arc::clone(&self.replication_client_factory);
+                                            let request_bytes_clone = op_bytes_for_forward.clone();
+                                            let db_name_clone = db_schema.name.to_string();
+                                            let table_name_clone = main_table_def.table_name.to_string();
+                                            let current_node_id_clone = self.current_node_id.to_string();
+                                            let shard_id_val_clone = Some(main_shard_id.get());
+
+                                            forward_join_set.spawn(async move {
+                                                match client_factory_clone(&target_node_id_str).await {
+                                                    Ok(mut client) => {
+                                                        let forward_request = crate::ReplicateWalOpRequest {
+                                                            wal_op_bytes: request_bytes_clone,
+                                                            originating_node_id: current_node_id_clone,
+                                                            database_name: db_name_clone,
+                                                            table_name: table_name_clone,
+                                                            shard_id: shard_id_val_clone,
+                                                        };
+                                                        if let Err(e) = client.replicate_wal_op(forward_request).await {
+                                                            warn!(
+                                                                shard_id = %main_shard_id.get(),
+                                                                target_node_id = %target_node_id_str,
+                                                                error = %e,
+                                                                "Failed to forward write for migrating shard (client error)."
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            shard_id = %main_shard_id.get(),
+                                                            target_node_id = %target_node_id_str,
+                                                            error = %e,
+                                                            "Failed to create client for forwarding write to migrating shard target."
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        // Spawn a task to await these forwarded writes, but don't block the main write path.
+                                        // Errors are logged within the spawned tasks.
+                                        tokio::spawn(async move {
+                                            while let Some(join_result) = forward_join_set.join_next().await {
+                                                if let Err(e) = join_result {
+                                                    error!("Error joining write forwarding task: {:?}", e);
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            shard_id = %main_shard_id.get(),
+                                            error = %e,
+                                            "Failed to serialize WalOp for forwarding write to migrating shard. Write not forwarded."
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // --- END FORWARDING WRITE TO MIGRATION TARGETS ---
 
         if !no_sync {
             self.wal.sync().await?;
@@ -1140,6 +1223,10 @@ mod tests {
     use parquet_file::storage::{ParquetStorage, StorageId};
     use pretty_assertions::assert_eq;
     use influxdb3_catalog::replication::{ReplicationFactor, ReplicationInfo};
+    use influxdb3_catalog::shard::ShardMigrationStatus; // For migration status
+    use crate::replication_client::ReplicationClient; // For trait
+    use tokio::sync::Mutex as TokioMutex; // For async mutex in mock client state
+
 
     // Helper to create a basic IOxExecutor for tests
     fn make_exec() -> Arc<IOxExecutor> {
@@ -1348,5 +1435,206 @@ mod tests {
         } else {
             panic!("Expected validator::Error::ParseError with WriteLineError for missing shard key, got {:?}", write_result4);
         }
+    }
+
+    // --- Test for write forwarding during shard migration ---
+
+    #[derive(Debug, Clone)]
+    struct CapturingReplicationClient {
+        target_node_id: String,
+        // Store (request_payload_for_assertion, should_succeed_bool)
+        // Using payload as String for easier assertion, assuming WalOp can be stringified for test.
+        // In real test, compare actual ReplicateWalOpRequest.
+        requests_received: Arc<TokioMutex<Vec<String>>>,
+        fail_for_target: Option<String>, // If this client's target_node_id matches, it will error.
+    }
+
+    #[async_trait]
+    impl ReplicationClient for CapturingReplicationClient {
+        async fn replicate_wal_op(&mut self, request: crate::ReplicateWalOpRequest) -> Result<crate::ReplicateWalOpResponse, ReplicationClientError> {
+            let mut requests = self.requests_received.lock().await;
+            // Store a simplified representation for assertion
+            let op_summary = format!(
+                "target={},db={},tbl={},shard={:?}",
+                self.target_node_id, request.database_name, request.table_name, request.shard_id
+            );
+            requests.push(op_summary);
+
+            if let Some(fail_target_id) = &self.fail_for_target {
+                if *fail_target_id == self.target_node_id {
+                    return Err(ReplicationClientError::RpcError(tonic::Status::unavailable("Simulated forward error")));
+                }
+            }
+            Ok(crate::ReplicateWalOpResponse { success: true, error_message: None })
+        }
+    }
+
+    fn capturing_replication_client_factory(
+        shared_requests_log: Arc<TokioMutex<Vec<String>>>,
+        fail_for_target_node: Option<String>,
+    ) -> ReplicationClientFactory {
+        let shared_log_for_factory = Arc::clone(&shared_requests_log);
+        let fail_target_clone = fail_for_target_node.clone();
+        Box::new(move |target_node_id_str| {
+            let client = CapturingReplicationClient {
+                target_node_id: target_node_id_str.to_string(),
+                requests_received: Arc::clone(&shared_log_for_factory),
+                fail_for_target: fail_target_clone.clone(),
+            };
+            let fut = async move { Ok(Box::new(client) as Box<dyn ReplicationClient>) };
+            Box::pin(fut)
+        })
+    }
+
+    #[tokio::test]
+    async fn test_write_lp_forwarding_on_migration() {
+        let current_node_id_str = "node_self";
+        let (write_buffer, catalog) = setup_basic_write_buffer(current_node_id_str).await;
+
+        let db_name_str = "migration_test_db";
+        let table_name_str = "mig_table";
+        let db_name_ns = NamespaceName::new(db_name_str).unwrap();
+
+        let original_owner_node_id = CatalogNodeId::new(1);
+        let migration_target_node_id = CatalogNodeId::new(2);
+        let other_replica_node_id = CatalogNodeId::new(3);
+
+
+        // Setup Catalog
+        catalog.create_database(db_name_str).await.unwrap();
+        catalog.create_table(db_name_str, table_name_str, &["tag"], &[("value", FieldDataType::Float)]).await.unwrap();
+
+        let table_def_arc = catalog.db_schema(db_name_str).await.unwrap().unwrap().table_definition(table_name_str).unwrap();
+        let mut table_def_mut = Arc::try_unwrap(table_def_arc).unwrap(); // To modify shards and replication_info
+
+        table_def_mut.replication_info = Some(ReplicationInfo::new(ReplicationFactor::new(2).unwrap()));
+
+        let shard_id = ShardId::new(100);
+        let mut shard_def = ShardDefinition::new(
+            shard_id,
+            ShardTimeRange { start_time: 0, end_time: 1_000_000_000_000 },
+            vec![original_owner_node_id, other_replica_node_id], // Original owners
+            None
+        );
+        shard_def.migration_status = Some(ShardMigrationStatus::MigratingOutTo(vec![migration_target_node_id]));
+        table_def_mut.shards.insert(shard_id, Arc::new(shard_def)).unwrap();
+
+        // Update the table in the catalog (this part is a bit hacky without a direct update_table method)
+        // We'll re-apply a CreateTableLog with the modified definition conceptually.
+        // For a real test, ensure catalog reflects this state.
+        // The key is that when WriteBufferImpl::write_lp fetches this table_def, it sees the migrating shard.
+        // This test relies on setup_basic_write_buffer's catalog being the one it uses.
+        // To ensure the catalog used by write_buffer has this modified table_def, we'd ideally
+        // have a method to update it post-setup, or setup the catalog before creating write_buffer.
+        // For now, we assume `catalog.db_schema_by_id` inside `write_lp` will see this if we modify the Arc<Catalog> content.
+        // This is not ideal. A better way is to configure catalog before WriteBufferImpl::new.
+        // Let's re-create WriteBufferImpl with a pre-configured catalog for this test.
+
+        let test_time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let test_metric_registry = Arc::new(MetricRegistry::new());
+        let test_current_node_id = Arc::from(current_node_id_str);
+        let (_obj_store_cached, pq_cache) = test_cached_obj_store_and_oracle(
+            Arc::new(InMemory::new()), Arc::clone(&test_time_provider), Arc::clone(&test_metric_registry)
+        );
+        let test_persister = Arc::new(Persister::new(
+            _obj_store_cached, test_current_node_id.as_ref(), Arc::clone(&test_time_provider) as _, DEFAULT_ROW_GROUP_WRITE_SIZE
+        ));
+        // Create a new catalog and pre-populate it for this test
+        let test_catalog = Arc::new(
+            Catalog::new_with_args(
+                Arc::clone(&test_current_node_id), Arc::clone(&test_persister.object_store()),
+                Arc::clone(&test_time_provider), Default::default(), Default::default(), Default::default(),
+            ).await.unwrap()
+        );
+        test_catalog.create_database(db_name_str).await.unwrap();
+        // Create table directly in test_catalog
+        let create_table_log = influxdb3_catalog::log::CreateTableLog {
+            database_id: test_catalog.db_name_to_id(db_name_str).unwrap(),
+            database_name: Arc::from(db_name_str),
+            table_name: Arc::from(table_name_str),
+            table_id: TableId::new(1), // Assign a known ID
+            field_definitions: vec![
+                influxdb3_catalog::log::FieldDefinition::new(ColumnId::new(0), "tag", FieldDataType::Tag),
+                influxdb3_catalog::log::FieldDefinition::new(ColumnId::new(1), "value", FieldDataType::Float),
+                influxdb3_catalog::log::FieldDefinition::new(ColumnId::new(2), "time", FieldDataType::Timestamp),
+            ],
+            key: vec![ColumnId::new(0)], // "tag" as series key
+            shard_key_columns: None, sharding_strategy: Some(CatalogShardingStrategy::Time)
+        };
+        let db_batch = influxdb3_catalog::log::DatabaseBatch {
+            time_ns: 0, database_id: test_catalog.db_name_to_id(db_name_str).unwrap(), database_name: Arc::from(db_name_str),
+            ops: vec![influxdb3_catalog::log::DatabaseCatalogOp::CreateTable(create_table_log)],
+        };
+        test_catalog.apply_ordered_catalog_batch(&influxdb3_catalog::log::OrderedCatalogBatch::new(
+            influxdb3_catalog::log::CatalogBatch::Database(db_batch), CatalogSequenceNumber::new(1)
+        ), &mut CatalogSequenceNumber::new(0)).unwrap(); // Manually apply to mock catalog state
+
+        // Now update the table with replication and shard info
+        let table_id_for_update = test_catalog.db_schema(db_name_str).await.unwrap().unwrap().table_name_to_id(table_name_str).unwrap();
+        let set_replication_log = influxdb3_catalog::log::SetReplicationLog {
+            db_id: test_catalog.db_name_to_id(db_name_str).unwrap(), table_id: table_id_for_update, table_name: Arc::from(table_name_str),
+            replication_info: ReplicationInfo::new(ReplicationFactor::new(2).unwrap())
+        };
+        let create_shard_log = influxdb3_catalog::log::CreateShardLog {
+            db_id: test_catalog.db_name_to_id(db_name_str).unwrap(), table_id: table_id_for_update, table_name: Arc::from(table_name_str),
+            shard_definition: shard_def // defined above with migration status
+        };
+         let db_batch_update = influxdb3_catalog::log::DatabaseBatch {
+            time_ns: 1, database_id: test_catalog.db_name_to_id(db_name_str).unwrap(), database_name: Arc::from(db_name_str),
+            ops: vec![
+                influxdb3_catalog::log::DatabaseCatalogOp::SetReplication(set_replication_log),
+                influxdb3_catalog::log::DatabaseCatalogOp::CreateShard(create_shard_log),
+            ],
+        };
+        test_catalog.apply_ordered_catalog_batch(&influxdb3_catalog::log::OrderedCatalogBatch::new(
+            influxdb3_catalog::log::CatalogBatch::Database(db_batch_update), CatalogSequenceNumber::new(2)
+        ), &mut CatalogSequenceNumber::new(1)).unwrap();
+
+
+        let requests_log = Arc::new(TokioMutex::new(Vec::new()));
+        let factory = capturing_replication_client_factory(Arc::clone(&requests_log), Some(migration_target_node_id.get().to_string()));
+
+        let write_buffer_for_test = WriteBufferImpl::new(WriteBufferImplArgs {
+            persister: test_persister,
+            catalog: test_catalog, // Use pre-configured catalog
+            last_cache: LastCacheProvider::new_no_op(),
+            distinct_cache: DistinctCacheProvider::new_no_op(),
+            time_provider: test_time_provider,
+            executor: make_exec(),
+            wal_config: WalConfig::test_config(),
+            parquet_cache: pq_cache,
+            metric_registry: test_metric_registry,
+            snapshotted_wal_files_to_keep: 10,
+            query_file_limit: None,
+            shutdown: ShutdownManager::new_testing().register(),
+            wal_replay_concurrency_limit: None,
+            current_node_id: test_current_node_id,
+            max_snapshots_to_load_on_start: Some(10),
+            replication_client_factory: factory,
+        })
+        .await
+        .unwrap();
+
+        let lp_data = format!("{},tag=v1 value=100.0 100", table_name_str); // time 100ns, fits shard
+        let write_result = write_buffer_for_test.write_lp(
+            db_name_ns, &lp_data, Time::from_timestamp_nanos(100), false, Precision::Nanosecond, false
+        ).await;
+
+        assert!(write_result.is_ok(), "Main write_lp failed: {:?}", write_result.err()); // Forwarding failure should not fail main write
+
+        let captured_requests = requests_log.lock().await;
+        assert_eq!(captured_requests.len(), 2, "Expected 2 replication/forwarding calls, got: {:?}", captured_requests);
+
+        let expected_original_replica_target = format!("target={},db={},tbl={},shard=Some(100)", other_replica_node_id.get(), db_name_str, table_name_str);
+        let expected_migration_target = format!("target={},db={},tbl={},shard=Some(100)", migration_target_node_id.get(), db_name_str, table_name_str);
+
+        assert!(
+            captured_requests.contains(&expected_original_replica_target),
+            "Missing replication to original owner {}. Got: {:?}", other_replica_node_id.get(), captured_requests
+        );
+        assert!(
+            captured_requests.contains(&expected_migration_target),
+            "Missing forwarded write to migration target {}. Got: {:?}", migration_target_node_id.get(), captured_requests
+        );
     }
 }

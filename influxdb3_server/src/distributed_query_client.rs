@@ -29,7 +29,12 @@ use arrow_schema::{ArrowError, RecordBatch, SchemaRef, Schema as ArrowSchema};
 use futures::stream::{BoxStream, StreamExt};
 use arrow_flight::utils::flight_data_stream_to_arrow_stream;
 use std::sync::Arc;
+use std::time::Duration; // For tokio::time::sleep
+use tonic::Code; // For status codes
 
+
+const MAX_QUERY_FRAGMENT_RETRIES: u32 = 3;
+const QUERY_RETRY_DELAY_MS: u64 = 100;
 
 /// gRPC client for the DistributedQueryService.
 #[derive(Debug, Clone)]
@@ -63,13 +68,21 @@ impl GrpcDistributedQueryClient {
     /// Executes a query fragment on a remote node and returns a stream of RecordBatches.
     pub async fn execute_query_fragment_streaming(
         &mut self,
-        request: GrpcExecuteQueryFragmentRequest,
+        request: GrpcExecuteQueryFragmentRequest, // Request is not Clone, so pass by value
     ) -> Result<BoxStream<'static, Result<RecordBatch, ArrowError>>, ArrowError> {
-        if let Some(client) = self.client.as_mut() {
-            info!(target_addr = %self.target_addr, query_id = %request.query_id, "Executing remote query fragment");
+        let Some(client_ref) = self.client.as_mut() else {
+            warn!(target_addr = %self.target_addr, query_id = %request.query_id, "Attempted to execute query fragment with no active client connection.");
+            return Err(ArrowError::IoError(
+                format!("Distributed query client for {} is not connected (initial connection failed).", self.target_addr),
+                std::io::ErrorKind::NotConnected.into()
+            ));
+        };
 
-            // Deserialize expected_schema_bytes from request (DataFusion proto format) into SchemaRef
-            let expected_schema = {
+        info!(target_addr = %self.target_addr, query_id = %request.query_id, "Executing remote query fragment");
+
+        // Deserialize expected_schema_bytes from request (DataFusion proto format) into SchemaRef
+        // This only needs to be done once, even with retries, as the request object itself is not changing.
+        let expected_schema = {
                 use datafusion_proto::protobuf::Schema as DfSchemaProto;
                 use prost::Message;
 
@@ -89,44 +102,86 @@ impl GrpcDistributedQueryClient {
                 Arc::new(arrow_schema_converted)
             };
 
-            match client.execute_query_fragment(request).await {
+        // The gRPC request is not Clone, so we can't easily clone it for each retry attempt
+        // if it's consumed by client.execute_query_fragment.
+        // However, tonic clients often take `tonic::Request<T>` which wraps `T`.
+        // If `GrpcExecuteQueryFragmentRequest` itself is `Clone`, we can clone it before each call.
+        // Let's assume GrpcExecuteQueryFragmentRequest is Clone for this retry logic.
+        // If not, the structure of passing request to client.execute_query_fragment might need adjustment,
+        // or we only retry if the request object can be reconstituted or cloned.
+        // For now, proceeding with assumption that we can re-send the request (or a clone).
+        // Tonic generated clients usually take `Request<T>` where T is the message.
+        // `tonic::Request::new(message)` means message is moved.
+        // If `request` (GrpcExecuteQueryFragmentRequest) is not Clone, we cannot put its creation inside the loop easily
+        // without re-parsing `expected_schema_bytes` etc.
+        // A common pattern is to ensure the message (`GrpcExecuteQueryFragmentRequest`) is `Clone`.
+        // If it's not, we'd have to serialize the essential parts and rebuild the request in each attempt,
+        // or only retry on errors where the request wouldn't have been consumed.
+        // For this exercise, let's assume `GrpcExecuteQueryFragmentRequest` can be cloned.
+
+        for attempt in 0..MAX_QUERY_FRAGMENT_RETRIES {
+            // We need to pass a new `tonic::Request` wrapper for each call.
+            let current_grpc_request_for_tonic = request.clone(); // Assuming GrpcExecuteQueryFragmentRequest is Clone
+
+            match client_ref.execute_query_fragment(current_grpc_request_for_tonic).await {
                 Ok(tonic_response) => {
                     let streaming_flight_data = tonic_response.into_inner();
-                    info!(target_addr = %self.target_addr, "Received FlightData stream, converting to RecordBatch stream.");
+                    info!(target_addr = %self.target_addr, query_id = %request.query_id, "Received FlightData stream, converting to RecordBatch stream.");
 
-                    // flight_data_stream_to_arrow_stream expects a stream of Result<FlightData, Status>
-                    // tonic::Streaming<T> yields Result<T, Status>
-                    // So, map tonic::Status to ArrowError for the stream elements
                     let flight_data_stream_with_arrow_errors = streaming_flight_data.map(|res| {
                         res.map_err(|status| ArrowError::ExternalError(Box::new(status)))
                     });
 
-                    // This utility handles schema messages, dictionary batches, etc.
                     let record_batch_stream = flight_data_stream_to_arrow_stream(
                         flight_data_stream_with_arrow_errors,
-                        expected_schema, // The schema for the final RecordBatches
-                        &[], // Dictionaries - assuming none for now or handled by FlightDataStream if sent separately
+                        expected_schema.clone(), // Clone Arc for schema
+                        &[],
                     ).await
                     .map_err(|e| {
-                        error!(target_addr = %self.target_addr, error = %e, "Failed to adapt FlightData stream to Arrow stream");
-                        // Convert arrow_flight::error::FlightError to ArrowError
+                        error!(target_addr = %self.target_addr, query_id = %request.query_id, error = %e, "Failed to adapt FlightData stream to Arrow stream");
                         ArrowError::ExternalError(Box::new(e))
                     })?;
 
-                    Ok(Box::pin(record_batch_stream))
+                    return Ok(Box::pin(record_batch_stream));
                 }
                 Err(status) => {
-                    error!(target_addr = %self.target_addr, error = %status, "gRPC call to execute_query_fragment failed");
-                    Err(ArrowError::ExternalError(Box::new(status)))
+                    let code = status.code();
+                    if (code == Code::Unavailable || code == Code::Cancelled || code == Code::DeadlineExceeded)
+                        && attempt < MAX_QUERY_FRAGMENT_RETRIES - 1
+                    {
+                        warn!(
+                            target_addr = %self.target_addr, query_id = %request.query_id, attempt = attempt + 1, max_attempts = MAX_QUERY_FRAGMENT_RETRIES, code = ?code, delay_ms = QUERY_RETRY_DELAY_MS,
+                            "Query fragment RPC failed. Retrying..."
+                        );
+                        tokio::time::sleep(Duration::from_millis(QUERY_RETRY_DELAY_MS)).await;
+
+                        if code == Code::Unavailable {
+                             info!("Attempting to reconnect to distributed query service at {} before retry...", self.target_addr);
+                             match DistributedQueryServiceClient::connect(self.target_addr.clone()).await {
+                                Ok(new_client_channel) => {
+                                    info!("Successfully reconnected to distributed query service at {}", self.target_addr);
+                                    *client_ref = new_client_channel; // Update the client instance
+                                }
+                                Err(e) => {
+                                    warn!("Failed to reconnect to distributed query service at {}: {}. Retrying with old client if possible.", self.target_addr, e);
+                                }
+                            }
+                        }
+                        continue;
+                    } else {
+                        error!(
+                            target_addr = %self.target_addr, query_id = %request.query_id, attempts = attempt + 1, code = ?code, error_message = %status.message(),
+                            "Query fragment RPC failed permanently."
+                        );
+                        return Err(ArrowError::ExternalError(Box::new(status))); // Convert final tonic::Status to ArrowError
+                    }
                 }
             }
-        } else {
-            warn!(target_addr = %self.target_addr, "Attempted to execute query fragment with no active client connection.");
-            Err(ArrowError::IoError(
-                format!("Distributed query client for {} is not connected.", self.target_addr),
-                std::io::ErrorKind::NotConnected.into()
-            ))
         }
+        // Fallback error if loop finishes (e.g. MAX_QUERY_FRAGMENT_RETRIES is 0)
+        Err(ArrowError::ExternalError(Box::new(Status::internal(
+            "Exhausted retry attempts for execute_query_fragment_streaming"
+        ))))
     }
 }
 

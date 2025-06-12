@@ -131,8 +131,6 @@ impl Planner {
         physical_plan: Arc<dyn ExecutionPlan>,
         db_name: &str,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // This is a simplified traversal and replacement.
-        // A full implementation would use a PhysicalPlanRewriter.
         if let Some(table_scan) = physical_plan.as_any().downcast_ref::<TableScan>() {
             let table_name = table_scan.table_name();
             observability_deps::tracing::debug!(%db_name, %table_name, "Checking table for sharding in physical plan");
@@ -146,151 +144,163 @@ impl Planner {
                         );
 
                         let mut sub_plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
-                        let current_node_id_parsed = self.current_node_id.parse::<u64>().ok(); // Assuming NodeId is u64
+                        let current_node_id_parsed = self.current_node_id.parse::<u64>().ok();
 
-                        for shard_def in table_def.shards.resource_iter() {
-                            // TODO: Check shard_def.migration_status. If migrating, query may need to be routed to old owner, new owner, or both, and results merged, depending on phase.
-                            // E.g., if MigratingOutTo(targets), might query source AND targets.
-                            // If MigratingInFrom(source), might query target (which should have data) or source (if target not ready).
-                            // This simplified planner currently only considers current node_ids.
+                        for shard_def_arc in table_def.shards.resource_iter() {
+                            let shard_def = shard_def_arc.as_ref();
 
-                            let is_local = shard_def.node_ids.iter().any(|id| Some(id.get()) == current_node_id_parsed);
-
-                            if is_local {
-                                // CONCEPTUAL: Create a local scan for this specific shard.
-                                // This requires TableProvider to accept shard_id or specific file lists.
-                                // For now, if any shard is local, we might execute the original plan locally,
-                                // or a more refined local plan for that shard.
-                                // Simplified: Re-use original plan for local portion if it covers the local shard.
-                                // This is not ideal as it doesn't isolate the scan to *only* the local shard's data.
-                                // A true implementation needs to filter the scan to the specific shard's data.
-                                // For this conceptual step, let's assume the original plan can be used if one shard is local.
-                                // If multiple local shards, this simple model breaks down without proper filtering.
-                                observability_deps::tracing::info!(shard_id = %shard_def.id.get(), "Planning local scan for shard.");
-                                // Placeholder: create a scan for *this* shard.
-                                // This might involve creating a new LogicalPlan::TableScan with filters for the shard,
-                                // then planning it. For now, we'll clone the input plan as a placeholder for a local shard scan.
-                                // This is NOT CORRECT for filtering to a single shard, but demonstrates structure.
-                                sub_plans.push(physical_plan.clone()); // Placeholder for actual local shard scan
-                            } else {
-                                // Remote shard: pick a target node
-                                if let Some(target_node_id_obj) = shard_def.node_ids.first() {
-                                    if let Some(target_node_address) = self.node_info_provider.get_node_query_rpc_address(target_node_id_obj) {
-                                        observability_deps::tracing::info!(shard_id = %shard_def.id.get(), target_node=%target_node_address, "Planning remote scan for shard.");
-
-                                        // Create a simplified logical plan for the remote scan (scan the whole table)
-                                        // A real implementation would push down filters relevant to this shard.
-                                        let remote_logical_plan = DFLogicalPlan::TableScan(datafusion::logical_expr::TableScan {
-                                            table_name: datafusion::logical_expr::TableReference::bare(table_name.to_string()),
-                                            source: provider_as_source(Arc::clone(table_scan.source())), // Simplified
-                                            projection: table_scan.projection().cloned(),
-                                            filters: table_scan.filters().to_vec(), // Send original filters
-                                            fetch: table_scan.fetch(),
-                                            table_schema: Arc::clone(table_scan.table_schema()),
-                                            projected_schema: table_scan.schema(), // Schema of this scan node
-                                        });
-
-                                        // Serialize this logical plan (or a physical plan derived from it)
-                                        // For simplicity, let's try to serialize the logical plan if datafusion-proto supports it easily,
-                                        // otherwise, create a physical plan from it first.
-                                        // datafusion_proto focuses on physical plans, so we'll make a dummy physical plan.
-                                        // This is highly conceptual as the remote node needs to be able to execute it.
-                                        // A more robust way is to define a specific "remote shard scan" message.
-
-                                        // Create a minimal physical plan for serialization.
-                                        // This is a placeholder for what would be a meaningful sub-plan.
-                                        // Here, we use the original table_scan's schema.
-                                        // 1. Construct SQL Projection
-                                        let projected_columns_str = match table_scan.projection() {
-                                            Some(indices) => indices
-                                                .iter()
-                                                .map(|i| table_scan.table_schema().field(*i).name().as_str())
-                                                .collect::<Vec<&str>>()
-                                                .join(", "),
-                                            None => "*".to_string(),
-                                        };
-
-                                        // 2. Construct SQL Table Name (fully qualified)
-                                        // Assuming db_name and table_name do not need special quoting here,
-                                        // or that downstream SQL execution handles it.
-                                        // Standard SQL quoting would be `"<name>"`.
-                                        let qualified_table_name_str = format!("\"{}\".\"{}\"", db_name, table_name);
-
-
-                                        // 3. Construct SQL Filters
-                                        let mut sql_filters: Vec<String> = Vec::new();
-
-                                        // Time Range Filter from ShardDefinition
-                                        let shard_time_range = shard_def.time_range; // ShardTimeRange is not Option
-                                        let start_time_str = DateTime::<Utc>::from_naive_utc_and_offset(
-                                            chrono::NaiveDateTime::from_timestamp_opt(shard_time_range.start_time / 1_000_000_000, (shard_time_range.start_time % 1_000_000_000) as u32).unwrap_or_default(), Utc
-                                        ).to_rfc3339();
-                                        let end_time_str = DateTime::<Utc>::from_naive_utc_and_offset(
-                                            chrono::NaiveDateTime::from_timestamp_opt(shard_time_range.end_time / 1_000_000_000, (shard_time_range.end_time % 1_000_000_000) as u32).unwrap_or_default(), Utc
-                                        ).to_rfc3339();
-
-                                        // Assuming 'time' is the standard time column name.
-                                        sql_filters.push(format!("\"time\" >= TIMESTAMP '{}'", start_time_str));
-                                        sql_filters.push(format!("\"time\" <= TIMESTAMP '{}'", end_time_str));
-
-
-                                        // Original Predicates from TableScan
-                                        for filter_expr in table_scan.filters() {
-                                            match expr_to_sql::expr_to_sql(filter_expr) {
-                                                Ok(sql_pred) => sql_filters.push(sql_pred),
-                                                Err(e) => {
-                                                    observability_deps::tracing::warn!(
-                                                        "Failed to convert filter expression to SQL, skipping filter: {:?}. Error: {}",
-                                                        filter_expr, e
-                                                    );
-                                                    // Depending on policy, we might want to error out here
-                                                    // return Err(DataFusionError::Plan(format!("Unsupported filter for SQL conversion: {}", e)));
-                                                }
-                                            }
+                            let generate_sql_for_shard = |sd: &influxdb3_catalog::shard::ShardDefinition|
+                                -> Result<Bytes, DataFusionError> {
+                                let projected_columns_str = match table_scan.projection() {
+                                    Some(indices) => indices
+                                        .iter()
+                                        .map(|i| table_scan.table_schema().field(*i).name().as_str())
+                                        .collect::<Vec<&str>>()
+                                        .join(", "),
+                                    None => "*".to_string(),
+                                };
+                                let qualified_table_name_str = format!("\"{}\".\"{}\"", db_name, table_name);
+                                let mut sql_filters: Vec<String> = Vec::new();
+                                let shard_time_range = sd.time_range;
+                                let start_time_str = DateTime::<Utc>::from_naive_utc_and_offset(
+                                    chrono::NaiveDateTime::from_timestamp_opt(shard_time_range.start_time / 1_000_000_000, (shard_time_range.start_time % 1_000_000_000) as u32).unwrap_or_default(), Utc
+                                ).to_rfc3339();
+                                let end_time_str = DateTime::<Utc>::from_naive_utc_and_offset(
+                                    chrono::NaiveDateTime::from_timestamp_opt(shard_time_range.end_time / 1_000_000_000, (shard_time_range.end_time % 1_000_000_000) as u32).unwrap_or_default(), Utc
+                                ).to_rfc3339();
+                                sql_filters.push(format!("\"time\" >= TIMESTAMP '{}'", start_time_str));
+                                sql_filters.push(format!("\"time\" <= TIMESTAMP '{}'", end_time_str));
+                                for filter_expr in table_scan.filters() {
+                                    match expr_to_sql::expr_to_sql(filter_expr) {
+                                        Ok(sql_pred) => sql_filters.push(sql_pred),
+                                        Err(e) => {
+                                            observability_deps::tracing::warn!(
+                                                "Failed to convert filter expression to SQL, skipping filter: {:?}. Error: {}",
+                                                filter_expr, e
+                                            );
                                         }
+                                    }
+                                }
+                                let sql_query = if sql_filters.is_empty() {
+                                    format!("SELECT {} FROM {}", projected_columns_str, qualified_table_name_str)
+                                } else {
+                                    format!("SELECT {} FROM {} WHERE {}", projected_columns_str, qualified_table_name_str, sql_filters.join(" AND "))
+                                };
+                                observability_deps::tracing::debug!(%sql_query, shard_id = %sd.id.get(), "Generated SQL query for shard fragment");
+                                Ok(Bytes::from(sql_query.into_bytes()))
+                            };
 
-                                        // 4. Combine into final SQL query string
-                                        let sql_query = if sql_filters.is_empty() {
-                                            format!("SELECT {} FROM {}", projected_columns_str, qualified_table_name_str)
-                                        } else {
-                                            format!("SELECT {} FROM {} WHERE {}", projected_columns_str, qualified_table_name_str, sql_filters.join(" AND "))
-                                        };
+                            let mut plans_for_this_shard_instance: Vec<Arc<dyn ExecutionPlan>> = vec![];
 
-                                        observability_deps::tracing::debug!(%sql_query, shard_id = %shard_def.id.get(), "Generated SQL query for remote shard");
-
-                                        // 5. Convert SQL string to Bytes
-                                        let sql_query_bytes = Bytes::from(sql_query.into_bytes());
-
+                            for owner_node_id in &shard_def.node_ids {
+                                let is_owner_local = Some(owner_node_id.get()) == current_node_id_parsed;
+                                if is_owner_local {
+                                    let local_shard_logical_plan = self.create_local_shard_logical_plan(
+                                        table_scan,
+                                        shard_def,
+                                        db_name,
+                                        table_name,
+                                    )?;
+                                    let local_shard_physical_plan = self.ctx.create_physical_plan(&local_shard_logical_plan).await?;
+                                    plans_for_this_shard_instance.push(local_shard_physical_plan);
+                                } else {
+                                    if let Some(target_node_address) = self.node_info_provider.get_node_query_rpc_address(owner_node_id) {
+                                        observability_deps::tracing::info!(shard_id = %shard_def.id.get(), target_node=%target_node_address, "Planning remote scan for current owner of shard.");
+                                        let sql_query_bytes = generate_sql_for_shard(shard_def)?;
                                         let remote_scan = RemoteScanExec::new(
                                             target_node_address,
-                                            db_name.to_string(), // db_name is still useful for context on the remote node
+                                            db_name.to_string(),
                                             sql_query_bytes,
-                                            table_scan.schema(), // Expected schema from this remote operation (schema of original TableScan)
+                                            table_scan.schema(),
                                         );
-                                        sub_plans.push(Arc::new(remote_scan));
+                                        plans_for_this_shard_instance.push(Arc::new(remote_scan));
                                     } else {
-                                        observability_deps::tracing::warn!(shard_id = %shard_def.id.get(), node_id = %target_node_id_obj.get(), "No RPC address found for remote node.");
+                                        observability_deps::tracing::warn!("No RPC address for current owner {} of shard {}", owner_node_id.get(), shard_def.id.get());
                                     }
                                 }
                             }
+
+                            if let Some(influxdb3_catalog::shard::ShardMigrationStatus::MigratingOutTo(targets)) = &shard_def.migration_status {
+                                for target_node_id in targets {
+                                    if !shard_def.node_ids.contains(target_node_id) {
+                                        if let Some(target_node_address) = self.node_info_provider.get_node_query_rpc_address(target_node_id) {
+                                            observability_deps::tracing::info!(
+                                                shard_id = %shard_def.id.get(),
+                                                target_node=%target_node_address,
+                                                migrating_to_node=%target_node_id.get(),
+                                                "Shard is migrating. Adding scan for target node to query plan."
+                                            );
+                                            let sql_query_bytes = generate_sql_for_shard(shard_def)?;
+                                            let remote_scan = RemoteScanExec::new(
+                                                target_node_address,
+                                                db_name.to_string(),
+                                                sql_query_bytes,
+                                                table_scan.schema(),
+                                            );
+                                            plans_for_this_shard_instance.push(Arc::new(remote_scan));
+                                        } else {
+                                            observability_deps::tracing::warn!("No RPC address for migration target {} of shard {}", target_node_id.get(), shard_def.id.get());
+                                        }
+                                    }
+                                }
+                            }
+                            sub_plans.extend(plans_for_this_shard_instance);
                         }
 
                         if sub_plans.is_empty() {
-                            // No shards could be planned (e.g., no node addresses)
                             observability_deps::tracing::warn!(%db_name, %table_name, "Sharded table resulted in no scannable shards.");
-                            return Ok(physical_plan); // Return original plan or an empty plan
+                            return Ok(physical_plan);
                         } else if sub_plans.len() == 1 {
                             return Ok(sub_plans.remove(0));
                         } else {
-                            // Combine with UnionExec. Ensure schemas are compatible (should be, as they originate from the same TableScan)
                             return Ok(Arc::new(UnionExec::new(sub_plans)));
                         }
                     }
                 }
             }
         }
-        // If not a TableScan we can handle, or not sharded, return original plan
         Ok(physical_plan)
+    }
+
+    // Helper to create a shard-specific logical plan for local execution
+    fn create_local_shard_logical_plan(
+        &self,
+        original_table_scan_physical: &TableScan, // The original physical TableScan node
+        shard_def: &influxdb3_catalog::shard::ShardDefinition,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<DFLogicalPlan, DataFusionError> {
+        observability_deps::tracing::debug!(shard_id = %shard_def.id.get(), "Creating logical plan for local shard.");
+
+        let mut local_filters: Vec<datafusion::logical_expr::Expr> = Vec::new();
+        let time_col = datafusion::logical_expr::col("time"); // Assuming "time" is the standard time column name
+
+        // Time Range Filter from ShardDefinition
+        let start_lit = datafusion::logical_expr::lit(datafusion::scalar::ScalarValue::TimestampNanosecond(Some(shard_def.time_range.start_time), None));
+        let end_lit = datafusion::logical_expr::lit(datafusion::scalar::ScalarValue::TimestampNanosecond(Some(shard_def.time_range.end_time), None));
+
+        local_filters.push(time_col.clone().gt_eq(start_lit));
+        local_filters.push(time_col.lt_eq(end_lit));
+
+        // Original Predicates from the physical TableScan (which holds logical Exprs)
+        local_filters.extend(original_table_scan_physical.filters().to_vec());
+
+        // Combine all filters with AND
+        let combined_filter_opt = local_filters.into_iter().reduce(datafusion::logical_expr::Expr::and);
+        let final_filters = combined_filter_opt.map_or_else(Vec::new, |f| vec![f]);
+
+        // Create New Filtered Logical TableScan for Local Shard
+        // We need to use the original table schema, not the projected schema from the physical plan,
+        // as filters apply to the base table schema.
+        let new_logical_scan = DFLogicalPlan::TableScan(datafusion::logical_expr::TableScan::try_new(
+            datafusion::logical_expr::TableReference::partial(db_name, table_name), // Use partial for db.table
+            Arc::clone(original_table_scan_physical.source()),
+            original_table_scan_physical.projection().cloned(), // Projection from original physical scan
+            final_filters, // Use combined filter
+            original_table_scan_physical.fetch(),
+        )?);
+
+        Ok(new_logical_scan)
     }
 }
 
@@ -301,10 +311,9 @@ use crate::remote_stream::RemoteRecordBatchStream; // Added for RemoteScanExec
 struct RemoteScanExec {
     target_node_address: String,
     db_name: String,
-    plan_or_query_bytes: Bytes, // Changed from Vec<u8> to Bytes
+    plan_or_query_bytes: Bytes,
     expected_schema: SchemaRef,
     cache: PlanProperties,
-    // session_config could be added here if needed, or taken from TaskContext
 }
 
 impl RemoteScanExec {
@@ -312,7 +321,7 @@ impl RemoteScanExec {
     fn new(
         target_node_address: String,
         db_name: String,
-        plan_or_query_bytes: Bytes, // Changed from Vec<u8> to Bytes
+        plan_or_query_bytes: Bytes,
         expected_schema: SchemaRef,
     ) -> Self {
         let cache = PlanProperties::new(
@@ -329,8 +338,6 @@ impl RemoteScanExec {
         }
     }
 }
-
-// Removed serialize_schema helper, RemoteRecordBatchStream will handle its own needs.
 
 #[async_trait::async_trait]
 impl ExecutionPlan for RemoteScanExec {
@@ -350,7 +357,7 @@ impl ExecutionPlan for RemoteScanExec {
     fn execute(
         &self,
         _partition: usize,
-        context: Arc<TaskContext>, // TaskContext contains session_config
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         observability_deps::tracing::debug!(
             target_node = %self.target_node_address,
@@ -359,25 +366,12 @@ impl ExecutionPlan for RemoteScanExec {
             session_id = %context.session_id(),
             "Creating RemoteRecordBatchStream for RemoteScanExec"
         );
-
-        // Extract session config from TaskContext and convert to HashMap<String, String>
-        // For simplicity, creating an empty one for now as per prompt.
-        // A more complete version:
-        // let session_config_map = context
-        //     .session_config()
-        //     .config_options()
-        //     .iter()
-        //     .map(|(k, v)| (k.clone(), v.clone())) // Assuming k,v are String or easily convertible
-        //     .collect::<HashMap<String, String>>();
-        // However, ConfigOptions stores values as ConfigValue enum.
-        // So, a proper conversion is more involved.
         let session_config_map = HashMap::new();
-
 
         let stream = RemoteRecordBatchStream::new(
             self.target_node_address.clone(),
             self.db_name.clone(),
-            self.plan_or_query_bytes.clone(), // This is Bytes type now
+            self.plan_or_query_bytes.clone(),
             self.expected_schema.clone(),
             session_config_map,
         );
@@ -504,14 +498,13 @@ impl DisplayAs for SchemaExec {
 mod tests {
     use super::*;
     use datafusion::datasource::listing::ListingTableUrl;
-    // use datafusion::datasource::provider_as_source; // Already imported
     use datafusion::prelude::{CsvReadOptions, SessionContext};
-    // use datafusion_proto::physical_plan::{from_physical_plan_bytes, physical_plan_to_bytes}; // Already imported
     use std::path::Path;
     use tempfile::NamedTempFile;
     use std::io::Write;
     use influxdb3_catalog::shard::{ShardDefinition, ShardId, ShardTimeRange, ShardingStrategy as CatalogShardingStrategy};
     use influxdb3_catalog::log::FieldDataType;
+    use datafusion::logical_expr::Operator; // For test_create_local_shard_logical_plan_filters
 
 
     #[tokio::test]
@@ -537,10 +530,10 @@ mod tests {
         let original_schema_str = format!("{:?}", physical_plan_original.schema());
         let original_plan_str = format!("{:?}", physical_plan_original);
 
-        let plan_bytes = physical_plan_to_bytes(physical_plan_original.clone())
+        let plan_bytes = datafusion_proto::physical_plan::physical_plan_to_bytes(physical_plan_original.clone())
             .map_err(|e| DataFusionError::Execution(format!("Failed to serialize plan: {}", e)))?;
 
-        let physical_plan_deserialized = from_physical_plan_bytes(&plan_bytes, &ctx, ctx.runtime_env().as_ref())
+        let physical_plan_deserialized = datafusion_proto::physical_plan::from_physical_plan_bytes(&plan_bytes, &ctx, ctx.runtime_env().as_ref())
             .map_err(|e| DataFusionError::Execution(format!("Failed to deserialize plan: {}", e)))?;
 
         let deserialized_schema_str = format!("{:?}", physical_plan_deserialized.schema());
@@ -561,12 +554,8 @@ mod tests {
         Ok(())
     }
 
-    // Mock NodeInfoProvider for planner tests
     impl NodeInfoProvider for Arc<Catalog> {
         fn get_node_query_rpc_address(&self, node_id: &InfluxNodeId) -> Option<String> {
-            // In a real scenario, catalog would store node RPC addresses.
-            // For testing, we can hardcode or make catalog's NodeDefinition store this.
-            // For now, let's assume node_id.get() gives a u64, and we map it.
             Some(format!("http://node-{}:8082", node_id.get()))
         }
     }
@@ -574,9 +563,7 @@ mod tests {
     async fn create_test_planner_and_catalog() -> (Planner, Arc<Catalog>) {
         let catalog = Arc::new(Catalog::new_in_memory("test_planner_host").await.unwrap());
         let session_ctx = IOxSessionContext::new_default();
-        let current_node_id = Arc::from("0"); // Assume current node_id is "0" (as u64) for tests
-
-        // The catalog itself can act as a NodeInfoProvider for this test.
+        let current_node_id = Arc::from("0");
         let planner = Planner::new(&session_ctx, Arc::clone(&catalog), current_node_id, Arc::clone(&catalog) as Arc<dyn NodeInfoProvider>);
         (planner, catalog)
     }
@@ -605,9 +592,8 @@ mod tests {
         let table_name = "metrics_remote";
         catalog.create_database(db_name).await.unwrap();
         catalog.create_table(db_name, table_name, &["host"], &[("cpu_usage", FieldDataType::Float)]).await.unwrap();
-        catalog.update_table_sharding_strategy(db_name, table_name, CatalogShardingStrategy::Time, None).await.unwrap(); // Simple time based
+        catalog.update_table_sharding_strategy(db_name, table_name, CatalogShardingStrategy::Time, None).await.unwrap();
 
-        // Add two remote shards
         catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), ShardTimeRange{start_time: 0, end_time: 1000}, vec![InfluxNodeId::new(1)], None)).await.unwrap();
         catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(2), ShardTimeRange{start_time: 1001, end_time: 2000}, vec![InfluxNodeId::new(2)], None)).await.unwrap();
 
@@ -624,7 +610,7 @@ mod tests {
             assert!(child.as_any().is::<RemoteScanExec>(), "Child should be RemoteScanExec");
             let remote_exec = child.as_any().downcast_ref::<RemoteScanExec>().unwrap();
 
-            let expected_node_id = i + 1; // Shards were added for node 1 and node 2
+            let expected_node_id = i + 1;
             assert_eq!(remote_exec.target_node_address, format!("http://node-{}:8082", expected_node_id));
 
             let sql_query = String::from_utf8(remote_exec.plan_or_query_bytes.to_vec()).expect("SQL query bytes are not valid UTF-8");
@@ -632,13 +618,12 @@ mod tests {
 
             assert!(sql_query.contains(&format!("SELECT * FROM \"{}\".\"{}\"", db_name, table_name)), "SQL query does not contain correct SELECT and FROM clauses");
 
-            // Check for time filter based on shard definition
-            if expected_node_id == 1 { // Corresponds to ShardId(1) with time_range (0, 1000)
+            if expected_node_id == 1 {
                 let start_time_str = DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDateTime::from_timestamp_opt(0,0).unwrap_or_default(), Utc).to_rfc3339();
                 let end_time_str = DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDateTime::from_timestamp_opt(0,1000).unwrap_or_default(), Utc).to_rfc3339();
                 assert!(sql_query.contains(&format!("\"time\" >= TIMESTAMP '{}'", start_time_str)), "Missing start time filter for shard 1");
                 assert!(sql_query.contains(&format!("\"time\" <= TIMESTAMP '{}'", end_time_str)), "Missing end time filter for shard 1");
-            } else { // Corresponds to ShardId(2) with time_range (1001, 2000)
+            } else {
                 let start_time_str = DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDateTime::from_timestamp_opt(0,1001).unwrap_or_default(), Utc).to_rfc3339();
                 let end_time_str = DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDateTime::from_timestamp_opt(0,2000).unwrap_or_default(), Utc).to_rfc3339();
                 assert!(sql_query.contains(&format!("\"time\" >= TIMESTAMP '{}'", start_time_str)), "Missing start time filter for shard 2");
@@ -657,23 +642,26 @@ mod tests {
         catalog.create_table(db_name, table_name, &["host"], &[("cpu_usage", FieldDataType::Float)]).await.unwrap();
         catalog.update_table_sharding_strategy(db_name, table_name, CatalogShardingStrategy::Time, None).await.unwrap();
 
-        // Current node_id for planner is "0"
-        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), ShardTimeRange{start_time: 0, end_time: 1000}, vec![InfluxNodeId::new(0)], None)).await.unwrap();
-        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(2), ShardTimeRange{start_time: 1001, end_time: 2000}, vec![InfluxNodeId::new(0)], None)).await.unwrap();
+        let shard1_time_range = ShardTimeRange{start_time: 0, end_time: 1000};
+        let shard2_time_range = ShardTimeRange{start_time: 1001, end_time: 2000};
+        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), shard1_time_range, vec![InfluxNodeId::new(0)], None)).await.unwrap();
+        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(2), shard2_time_range, vec![InfluxNodeId::new(0)], None)).await.unwrap();
 
-        let logical_plan = planner.ctx.table(table_name).await?.to_logical_plan()?;
+        let logical_plan = planner.ctx.table(table_name).await?
+            .filter(datafusion::logical_expr::col("host").eq(datafusion::logical_expr::lit("server1")))?
+            .to_logical_plan()?;
         let initial_physical_plan = planner.ctx.create_physical_plan(&logical_plan).await?;
 
         let distributed_plan = planner.generate_distributed_physical_plan(initial_physical_plan.clone(), db_name).await?;
 
-        // Current simplified logic for local shards re-uses the original plan.
-        // If multiple local shards, it will be a Union of these cloned original plans.
         assert!(distributed_plan.as_any().is::<UnionExec>(), "Plan should be a UnionExec for multiple local shards");
         assert_eq!(distributed_plan.children().len(), 2, "UnionExec should have 2 children (local shards)");
-        for child in distributed_plan.children() {
-            // In this simplified version, children are clones of the original plan.
-            // A more accurate test would check if they are specific local shard scans.
-            assert_eq!(format!("{:?}", child), format!("{:?}", initial_physical_plan));
+
+        for child_plan in distributed_plan.children() {
+            assert_ne!(format!("{:?}", child_plan), format!("{:?}", initial_physical_plan), "Local shard plan should not be identical to original plan");
+            let plan_str = format!("{:?}", child_plan);
+            assert!(plan_str.contains("FilterExec") || plan_str.contains("CoalesceBatchesExec") || plan_str.contains("ProjectionExec"),
+                     "Local shard plan expected to contain FilterExec, CoalesceBatchesExec or ProjectionExec, but was: {}", plan_str);
         }
         Ok(())
     }
@@ -688,10 +676,8 @@ mod tests {
         catalog.create_table(db_name, table_name, &["host"], &[("cpu_usage", FieldDataType::Float)]).await.unwrap();
         catalog.update_table_sharding_strategy(db_name, table_name, CatalogShardingStrategy::Time, None).await.unwrap();
 
-        // Current node_id for planner is "0"
-        // Local Shard
-        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), ShardTimeRange{start_time: 0, end_time: 1000}, vec![InfluxNodeId::new(0)], None)).await.unwrap();
-        // Remote Shard
+        let local_shard_time_range = ShardTimeRange{start_time: 0, end_time: 1000};
+        catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), local_shard_time_range, vec![InfluxNodeId::new(0)], None)).await.unwrap();
         catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(2), ShardTimeRange{start_time: 1001, end_time: 2000}, vec![InfluxNodeId::new(1)], None)).await.unwrap();
 
         let logical_plan = planner.ctx.table(table_name).await?.to_logical_plan()?;
@@ -702,30 +688,21 @@ mod tests {
         assert!(distributed_plan.as_any().is::<UnionExec>(), "Plan should be a UnionExec for mixed shards");
         assert_eq!(distributed_plan.children().len(), 2, "UnionExec should have 2 children (local + remote)");
 
-        let mut found_local_placeholder = false;
+        let mut found_local_filtered_scan = false;
         let mut found_remote_scan = false;
 
         for child in distributed_plan.children() {
             if child.as_any().is::<RemoteScanExec>() {
                 found_remote_scan = true;
-                let remote_exec = child.as_any().downcast_ref::<RemoteScanExec>().unwrap();
-                assert_eq!(remote_exec.target_node_address, "http://node-1:8082");
-
-                let sql_query = String::from_utf8(remote_exec.plan_or_query_bytes.to_vec()).expect("SQL query bytes are not valid UTF-8");
-                observability_deps::tracing::info!(%sql_query, "Generated SQL for remote shard (mixed case)");
-                assert!(sql_query.contains(&format!("SELECT * FROM \"{}\".\"{}\"", db_name, table_name)));
-                // ShardId(2) has time_range (1001, 2000)
-                let start_time_str = DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDateTime::from_timestamp_opt(0,1001).unwrap_or_default(), Utc).to_rfc3339();
-                let end_time_str = DateTime::<Utc>::from_naive_utc_and_offset(chrono::NaiveDateTime::from_timestamp_opt(0,2000).unwrap_or_default(), Utc).to_rfc3339();
-                assert!(sql_query.contains(&format!("\"time\" >= TIMESTAMP '{}'", start_time_str)));
-                assert!(sql_query.contains(&format!("\"time\" <= TIMESTAMP '{}'", end_time_str)));
-
-            } else if format!("{:?}", child) == format!("{:?}", initial_physical_plan) {
-                // This identifies our placeholder local scan
-                found_local_placeholder = true;
+            } else {
+                found_local_filtered_scan = true;
+                assert_ne!(format!("{:?}", child), format!("{:?}", initial_physical_plan), "Local shard plan should not be identical to original plan");
+                 let plan_str = format!("{:?}", child);
+                 assert!(plan_str.contains("FilterExec") || plan_str.contains("CoalesceBatchesExec") || plan_str.contains("ProjectionExec"),
+                         "Local shard plan expected to contain FilterExec, CoalesceBatchesExec or ProjectionExec, but was: {}", plan_str);
             }
         }
-        assert!(found_local_placeholder, "Did not find placeholder for local shard scan");
+        assert!(found_local_filtered_scan, "Did not find filtered plan for local shard scan");
         assert!(found_remote_scan, "Did not find RemoteScanExec for remote shard");
 
         Ok(())
@@ -740,12 +717,10 @@ mod tests {
         catalog.create_table(db_name, table_name, &["host", "region"], &[("cpu_usage", FieldDataType::Float)]).await.unwrap();
         catalog.update_table_sharding_strategy(db_name, table_name, CatalogShardingStrategy::Time, None).await.unwrap();
 
-        // Remote Shard
         let shard_start_time_ns = 0;
         let shard_end_time_ns = 1000;
         catalog.create_shard(db_name, table_name, ShardDefinition::new(ShardId::new(1), ShardTimeRange{start_time: shard_start_time_ns, end_time: shard_end_time_ns}, vec![InfluxNodeId::new(1)], None)).await.unwrap();
 
-        // Logical plan with filters
         let logical_plan = planner.ctx.table(table_name).await?
             .filter(datafusion::logical_expr::col("host").eq(datafusion::logical_expr::lit("serverA")))?
             .filter(datafusion::logical_expr::col("cpu_usage").gt(datafusion::logical_expr::lit(0.5)))?
@@ -772,6 +747,132 @@ mod tests {
         assert!(sql_query.contains("(\"cpu_usage\") > (0.5)"));
         assert!(sql_query.contains(" AND "));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_distributed_plan_query_migrating_shard() -> Result<()> {
+        let (planner, catalog) = create_test_planner_and_catalog().await;
+        let db_name = "test_db_migrating";
+        let table_name = "metrics_migrating";
+
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["host"], &[("cpu_usage", FieldDataType::Float)]).await.unwrap();
+        catalog.update_table_sharding_strategy(db_name, table_name, CatalogShardingStrategy::Time, None).await.unwrap();
+
+        let source_node_id = InfluxNodeId::new(1);
+        let target_node_id_a = InfluxNodeId::new(2);
+        let target_node_id_b = InfluxNodeId::new(3);
+
+        let mut shard1_def = ShardDefinition::new(
+            ShardId::new(1),
+            ShardTimeRange{start_time: 0, end_time: 1000},
+            vec![source_node_id],
+            None
+        );
+        shard1_def.migration_status = Some(influxdb3_catalog::shard::ShardMigrationStatus::MigratingOutTo(vec![target_node_id_a, target_node_id_b]));
+        catalog.create_shard(db_name, table_name, shard1_def).await.unwrap();
+
+        let mut mock_node_info = MockNodeInfoProvider::new();
+        mock_node_info.add_node(source_node_id, "http://node-1:8082".to_string());
+        mock_node_info.add_node(target_node_id_a, "http://node-2:8082".to_string());
+        mock_node_info.add_node(target_node_id_b, "http://node-3:8082".to_string());
+
+        let planner_with_mock_nodes = Planner::new(
+            &planner.ctx,
+            Arc::clone(&catalog),
+            Arc::from("0"),
+            Arc::new(mock_node_info)
+        );
+
+        let logical_plan = planner_with_mock_nodes.ctx.table(table_name).await?.to_logical_plan()?;
+        let initial_physical_plan = planner_with_mock_nodes.ctx.create_physical_plan(&logical_plan).await?;
+
+        let distributed_plan = planner_with_mock_nodes.generate_distributed_physical_plan(initial_physical_plan.clone(), db_name).await?;
+
+        assert!(distributed_plan.as_any().is::<UnionExec>(), "Plan should be a UnionExec");
+        let union_exec = distributed_plan.as_any().downcast_ref::<UnionExec>().unwrap();
+        assert_eq!(union_exec.children().len(), 3, "UnionExec should have 3 children (1 original owner + 2 targets)");
+
+        let mut found_source_scan = false;
+        let mut found_target_a_scan = false;
+        let mut found_target_b_scan = false;
+
+        let expected_sql_query_part = format!("SELECT * FROM \"{}\".\"{}\"", db_name, table_name);
+
+        for child_plan in union_exec.children() {
+            assert!(child_plan.as_any().is::<RemoteScanExec>(), "Child plan should be RemoteScanExec");
+            let remote_exec = child_plan.as_any().downcast_ref::<RemoteScanExec>().unwrap();
+            let sql_query = String::from_utf8(remote_exec.plan_or_query_bytes.to_vec()).unwrap();
+            assert!(sql_query.contains(&expected_sql_query_part));
+
+            if remote_exec.target_node_address == "http://node-1:8082" {
+                found_source_scan = true;
+            } else if remote_exec.target_node_address == "http://node-2:8082" {
+                found_target_a_scan = true;
+            } else if remote_exec.target_node_address == "http://node-3:8082" {
+                found_target_b_scan = true;
+            }
+        }
+
+        assert!(found_source_scan, "Did not find RemoteScanExec for source node");
+        assert!(found_target_a_scan, "Did not find RemoteScanExec for target node A");
+        assert!(found_target_b_scan, "Did not find RemoteScanExec for target node B");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_local_shard_logical_plan_filters() -> Result<()> {
+        let (planner, catalog) = futures::executor::block_on(create_test_planner_and_catalog());
+        let db_name = "test_db_local_filters";
+        let table_name = "metrics_local_filters";
+
+        futures::executor::block_on(catalog.create_database(db_name)).unwrap();
+        futures::executor::block_on(catalog.create_table(db_name, table_name, &["host", "region"], &[("value", FieldDataType::Float)] )).unwrap();
+
+        let shard_time_range = ShardTimeRange { start_time: 100_000_000_000, end_time: 200_000_000_000 };
+        let shard_def = ShardDefinition::new(ShardId::new(1), shard_time_range, vec![InfluxNodeId::new(0)], None);
+
+        let session_ctx = SessionContext::new();
+        let dummy_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("time", DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None), false),
+            Field::new("host", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        let dummy_table_source = Arc::new(influxdb3_catalog::catalog::NoopTableSource::new(dummy_schema));
+
+        let logical_plan_orig = DFLogicalPlan::TableScan(datafusion::logical_expr::TableScan::try_new(
+            datafusion::logical_expr::TableReference::bare(table_name),
+            dummy_table_source,
+            None,
+            vec![datafusion::logical_expr::col("host").eq(datafusion::logical_expr::lit("serverX"))],
+            None,
+        )?);
+        let physical_plan_orig = futures::executor::block_on(session_ctx.create_physical_plan(&logical_plan_orig))?;
+        let table_scan_orig = physical_plan_orig.as_any().downcast_ref::<TableScan>().unwrap();
+
+        let local_shard_logical_plan = planner.create_local_shard_logical_plan(
+            table_scan_orig,
+            &shard_def,
+            db_name,
+            table_name
+        )?;
+
+        if let DFLogicalPlan::TableScan(local_scan_details) = local_shard_logical_plan {
+            assert_eq!(local_scan_details.filters.len(), 1, "Expected one combined filter expression, got: {:?}", local_scan_details.filters);
+            let combined_filter = &local_scan_details.filters[0];
+
+            let filter_str = format!("{:?}", combined_filter);
+            assert!(filter_str.contains("time >= TimestampNanosecond(100000000000, None)"), "Filter string: {}", filter_str);
+            assert!(filter_str.contains("time <= TimestampNanosecond(200000000000, None)"), "Filter string: {}", filter_str);
+            assert!(filter_str.contains("host = Utf8(\"serverX\")"), "Filter string: {}", filter_str);
+            assert!(filter_str.matches("AND").count() == 2, "Expected 2 ANDs for 3 conditions. Filter string: {}", filter_str);
+
+        } else {
+            panic!("Expected a TableScan logical plan");
+        }
         Ok(())
     }
 }

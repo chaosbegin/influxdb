@@ -757,6 +757,17 @@ impl TableProvider for QueryTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        // TODO: Future Enhancement for Shard-Aware QueryTable::scan
+        // Currently, this scan method fetches all chunks for the table and relies on
+        // DataFusion's FilterExec (from predicates potentially added by the Planner for local shards)
+        // to filter data.
+        // A more advanced implementation would make QueryTable::scan itself shard-aware.
+        // It could accept an optional `shard_id` or a list of `shard_ids` (perhaps via TaskContext or a specialized ScanConfig).
+        // If provided, `QueryTable::scan` (and subsequently `self.chunks()`) would then only
+        // fetch/return `QueryChunk`s that belong to those specific shard(s).
+        // This would prune data much earlier, potentially improving performance by avoiding unnecessary chunk processing.
+        // This change would also require `WriteBuffer::get_table_chunks` to accept shard_ids.
+
         // --- Sharding Awareness Point ---
         if !self.table_def.shards.is_empty() {
             debug!(

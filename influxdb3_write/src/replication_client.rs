@@ -57,43 +57,94 @@ impl GrpcReplicationClient {
     }
 }
 
+use std::time::Duration; // For tokio::time::sleep
+use tonic::Code; // For status codes
+
+const MAX_REPLICATION_RETRIES: u32 = 3;
+const RETRY_DELAY_MS: u64 = 100;
+
 #[async_trait]
 impl ReplicationClient for GrpcReplicationClient {
     async fn replicate_wal_op(
         &mut self,
         request: PlaceholderReplicateWalOpRequest,
     ) -> Result<Response<PlaceholderReplicateWalOpResponse>, Status> {
-        if let Some(mut client) = self.client.as_mut() { // Use as_mut() to get a mutable reference
-            // Convert placeholder request to generated gRPC request
-            let grpc_request = GrpcReplicateWalOpRequest {
-                wal_op_bytes: request.wal_op_bytes, // Assuming field name is the same
-                originating_node_id: request.originating_node_id,
-                shard_id: request.shard_id, // Pass through Option<u64>
-                database_name: request.database_name,
-                table_name: request.table_name,
-            };
+        let Some(client) = self.client.as_mut() else {
+            return Err(Status::unavailable(format!(
+                "Replication client for {} is not connected (initial connection failed).",
+                self.target_addr
+            )));
+        };
 
-            match client.replicate_wal_op(grpc_request).await {
+        // Convert placeholder request to generated gRPC request
+        // This can be done once outside the loop.
+        let grpc_request = GrpcReplicateWalOpRequest {
+            wal_op_bytes: request.wal_op_bytes,
+            originating_node_id: request.originating_node_id,
+            shard_id: request.shard_id,
+            database_name: request.database_name,
+            table_name: request.table_name,
+        };
+
+        for attempt in 0..MAX_REPLICATION_RETRIES {
+            // Clone the request if it's consumed by the call, or pass by reference if possible.
+            // tonic client methods usually take the request by value.
+            let current_grpc_request = grpc_request.clone();
+
+            match client.replicate_wal_op(current_grpc_request).await {
                 Ok(grpc_response_wrapper) => {
                     let grpc_response = grpc_response_wrapper.into_inner();
-                    // Convert generated gRPC response back to placeholder response
                     let placeholder_response = PlaceholderReplicateWalOpResponse {
                         success: grpc_response.success,
                         error_message: grpc_response.error_message,
                     };
-                    Ok(Response::new(placeholder_response))
+                    return Ok(Response::new(placeholder_response));
                 }
                 Err(status) => {
-                    warn!("gRPC call to {} for ReplicateWalOp failed: {}", self.target_addr, status);
-                    Err(status)
+                    let code = status.code();
+                    if (code == Code::Unavailable || code == Code::Cancelled || code == Code::DeadlineExceeded)
+                        && attempt < MAX_REPLICATION_RETRIES - 1
+                    {
+                        warn!(
+                            "Replication RPC to {} failed (attempt {}/{}), code: {:?}. Retrying in {}ms...",
+                            self.target_addr,
+                            attempt + 1,
+                            MAX_REPLICATION_RETRIES,
+                            code,
+                            RETRY_DELAY_MS
+                        );
+                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                        // Try to re-establish connection if client is broken
+                        if code == Code::Unavailable { // Typically indicates connection issue
+                            info!("Attempting to reconnect to replication service at {} before retry...", self.target_addr);
+                            match ReplicationServiceClient::connect(self.target_addr.clone()).await {
+                                Ok(client_channel) => {
+                                    info!("Successfully reconnected to replication service at {}", self.target_addr);
+                                    *client = client_channel; // Update the client instance
+                                }
+                                Err(e) => {
+                                    warn!("Failed to reconnect to replication service at {}: {}. Retrying with old client if possible, or will likely fail again.", self.target_addr, e);
+                                    // If reconnect fails, the next attempt will likely use a broken client or fail if client is None (though we checked Some earlier)
+                                }
+                            }
+                        }
+                        continue;
+                    } else {
+                        error!(
+                            "Replication RPC to {} failed permanently after {} attempts, code: {:?}. Error: {}",
+                            self.target_addr,
+                            attempt + 1,
+                            code,
+                            status.message()
+                        );
+                        return Err(status);
+                    }
                 }
             }
-        } else {
-            Err(Status::unavailable(format!(
-                "Replication client for {} is not connected.",
-                self.target_addr
-            )))
         }
+        // Should not be reached if MAX_REPLICATION_RETRIES > 0, as the loop will return.
+        // But as a fallback, or if MAX_REPLICATION_RETRIES is 0 (though not typical for retry logic).
+        Err(Status::internal("Exhausted retry attempts for replicate_wal_op"))
     }
 }
 
