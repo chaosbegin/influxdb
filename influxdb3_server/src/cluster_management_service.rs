@@ -80,6 +80,176 @@ impl ClusterManagementServerImpl {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use influxdb3_catalog::catalog::MockCatalog; // Assuming MockCatalog is accessible for setup
+    use influxdb3_cluster_manager::{ClusterManagerError, MockNodeInfoProvider}; // For orchestrator
+    use std::collections::HashMap;
+
+
+    // Mock ClusterManager
+    #[derive(Debug)]
+    struct MockClusterManager {
+        catalog: Arc<MockCatalog>, // Use the mock catalog for assertions if needed
+        // Use Mutex for interior mutability if methods need to record calls or change state
+        // For simplicity, we'll just have them return predefined results.
+        should_add_node_succeed: bool,
+        should_remove_node_succeed: bool,
+        should_update_node_status_succeed: bool,
+        nodes_to_list: Vec<Arc<CatalogNodeDefinition>>,
+        node_to_get: Option<Arc<CatalogNodeDefinition>>,
+    }
+
+    impl MockClusterManager {
+        fn new(catalog: Arc<MockCatalog>) -> Self {
+            Self {
+                catalog,
+                should_add_node_succeed: true,
+                should_remove_node_succeed: true,
+                should_update_node_status_succeed: true,
+                nodes_to_list: vec![],
+                node_to_get: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl influxdb3_cluster_manager::ClusterManagerTrait for MockClusterManager { // Assuming a trait exists
+        async fn add_node(&self, _node_def: CatalogNodeDefinition) -> influxdb3_cluster_manager::Result<()> {
+            if self.should_add_node_succeed { Ok(()) } else { Err(ClusterManagerError::Other("mock add_node error".to_string())) }
+        }
+        async fn remove_node(&self, _node_id: &CatalogNodeId) -> influxdb3_cluster_manager::Result<()> {
+            if self.should_remove_node_succeed { Ok(()) } else { Err(ClusterManagerError::Other("mock remove_node error".to_string())) }
+        }
+        async fn update_node_status(&self, _node_id: &CatalogNodeId, _status: CatalogNodeStatus) -> influxdb3_cluster_manager::Result<()> {
+            if self.should_update_node_status_succeed { Ok(()) } else { Err(ClusterManagerError::Other("mock update_node_status error".to_string())) }
+        }
+        async fn list_nodes(&self) -> influxdb3_cluster_manager::Result<Vec<Arc<CatalogNodeDefinition>>> {
+            Ok(self.nodes_to_list.clone())
+        }
+        async fn get_node(&self, _node_id: &CatalogNodeId) -> influxdb3_cluster_manager::Result<Option<Arc<CatalogNodeDefinition>>> {
+            Ok(self.node_to_get.clone())
+        }
+    }
+
+    // Mock RebalanceOrchestrator
+    #[derive(Debug)]
+    struct MockRebalanceOrchestrator {
+        should_rebalance_succeed: bool,
+    }
+
+    impl MockRebalanceOrchestrator {
+        fn new() -> Self { Self { should_rebalance_succeed: true } }
+    }
+
+    #[async_trait::async_trait]
+    impl influxdb3_cluster_manager::RebalanceOrchestratorTrait for MockRebalanceOrchestrator { // Assuming a trait
+        async fn initiate_rebalance(&self, _strategy: RebalanceStrategy) -> influxdb3_cluster_manager::Result<()> {
+            if self.should_rebalance_succeed { Ok(()) } else { Err(ClusterManagerError::Other("mock rebalance error".to_string())) }
+        }
+    }
+
+
+    // Helper to create ClusterManagementServerImpl with mocks
+    fn create_server_with_mocks(
+        mock_catalog: Arc<MockCatalog>, // Pass mock catalog to manager
+        mock_cluster_manager: Arc<MockClusterManager>, // Pass mock manager
+        mock_rebalance_orchestrator: Arc<MockRebalanceOrchestrator>
+    ) -> ClusterManagementServerImpl {
+         // The service impl takes concrete types, not traits directly.
+         // We need to adapt ClusterManager and RebalanceOrchestrator to allow mocking,
+         // or test the concrete types by controlling their dependency (Catalog).
+         // For now, let's assume ClusterManager and RebalanceOrchestrator are tested via their own unit tests
+         // using a MockCatalog. Here, we will test the gRPC service layer by providing a real Catalog
+         // that can be pre-populated, and real ClusterManager/RebalanceOrchestrator.
+
+        // Revert to using real ClusterManager and RebalanceOrchestrator with a MockCatalog for more integrated test
+        let node_info_provider: Arc<dyn NodeInfoProvider> = Arc::new(ServerMockNodeInfoProvider::default());
+        ClusterManagementServerImpl {
+            cluster_manager: Arc::new(ClusterManager::new(mock_catalog.clone() as Arc<dyn Catalog>)),
+            rebalance_orchestrator: Arc::new(RebalanceOrchestrator::new(mock_catalog as Arc<dyn Catalog>, node_info_provider)),
+        }
+    }
+
+    fn create_test_catalog_node_definition(id: u64, name: &str, status: CatalogNodeStatus) -> CatalogNodeDefinition {
+        CatalogNodeDefinition {
+            id: CatalogNodeId::new(id),
+            node_name: Arc::from(name),
+            instance_id: Arc::from(uuid::Uuid::new_v4().to_string()),
+            rpc_address: format!("{}:8082", name),
+            http_address: format!("{}:8080", name),
+            mode: vec![], // Assuming influxdb3_catalog::log::NodeMode if needed
+            core_count: 4,
+            status,
+            last_heartbeat: Some(chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()),
+        }
+    }
+
+
+    #[tokio::test]
+    async fn test_add_node_rpc() {
+        let mut mock_catalog = MockCatalog::new();
+        mock_catalog.expect_add_node().times(1).returning(|_| Ok(()));
+        mock_catalog.expect_next_node_id().return_const(CatalogNodeId::new(1));
+
+
+        let server = ClusterManagementServerImpl::new(Arc::new(mock_catalog));
+
+        let node_def_msg = NodeDefinitionMessage {
+            id: 0, // Let catalog assign
+            node_name: "test_node".to_string(),
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            rpc_address: "localhost:8082".to_string(),
+            http_address: "localhost:8080".to_string(),
+            core_count: 4,
+            status: NodeStatusMessage::NodeStatusJoining as i32,
+            last_heartbeat_ns: None,
+        };
+        let request = Request::new(AddNodeRequest { node_definition: Some(node_def_msg) });
+        let response = server.add_node(request).await.unwrap().into_inner();
+        assert!(response.success);
+        assert!(response.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_node_rpc() {
+        let mut mock_catalog = MockCatalog::new();
+        mock_catalog.expect_remove_node()
+            .with(eq(CatalogNodeId::new(1)))
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let server = ClusterManagementServerImpl::new(Arc::new(mock_catalog));
+        let request = Request::new(RemoveNodeRequest { node_id: Some(NodeIdMessage { id: 1 }) });
+        let response = server.remove_node(request).await.unwrap().into_inner();
+        assert!(response.success);
+    }
+
+    #[tokio::test]
+    async fn test_list_nodes_rpc() {
+        let mut mock_catalog = MockCatalog::new();
+        let node1 = Arc::new(create_test_catalog_node_definition(1, "node1", CatalogNodeStatus::Active));
+        let node2 = Arc::new(create_test_catalog_node_definition(2, "node2", CatalogNodeStatus::Joining));
+        let nodes_to_return = vec![node1.clone(), node2.clone()];
+
+        mock_catalog.expect_list_nodes()
+            .times(1)
+            .returning(move || Ok(nodes_to_return.clone()));
+
+        let server = ClusterManagementServerImpl::new(Arc::new(mock_catalog));
+        let request = Request::new(ListNodesRequest {});
+        let response = server.list_nodes(request).await.unwrap().into_inner();
+
+        assert_eq!(response.nodes.len(), 2);
+        assert_eq!(response.nodes[0].id, node1.id.get());
+        assert_eq!(response.nodes[0].node_name, node1.node_name.as_ref());
+        assert_eq!(response.nodes[1].id, node2.id.get());
+        assert_eq!(response.nodes[1].node_name, node2.node_name.as_ref());
+    }
+     // Add more tests for other RPCs: GetNode, UpdateNodeStatus, TriggerRebalance
+}
+
 // Helper to convert from proto NodeStatusMessage to catalog NodeStatus
 fn convert_proto_status_to_catalog(proto_status: i32) -> Result<CatalogNodeStatus, Status> {
     match NodeStatusMessage::try_from(proto_status) {

@@ -1016,8 +1016,8 @@ pub struct FinalizeShardMigrationOnSourceLog {
     pub table_id: TableId,
     pub table_name: Arc<str>,
     pub shard_id: ShardId,
+    pub source_node_id_to_remove: NodeId, // Explicitly state which source node is finalizing
     pub migrated_to_node_id: NodeId, // The target node the shard was successfully migrated to
-    // The source node is implicit from which node processes this log.
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
