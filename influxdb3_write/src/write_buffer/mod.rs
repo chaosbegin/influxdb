@@ -591,6 +591,10 @@ impl Bufferer for WriteBufferImpl {
                     }
                 })?;
 
+            // TODO: Check ShardDefinition.migration_status. If migrating, may need dual writes or redirect to new owner(s) based on migration phase.
+            // This check would need to happen for each potential shard identified below,
+            // or the sharding logic itself needs to be aware of migration status to select appropriate shard(s).
+
             match table_def.sharding_strategy {
                 ShardingStrategy::TimeAndKey => {
                     if let Some(ref key_columns) = table_def.shard_key_columns {

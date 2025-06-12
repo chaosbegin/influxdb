@@ -21,14 +21,14 @@ message ExecuteQueryFragmentRequest {
   // The name of the database to execute against.
   string database_name = 1;
 
-  // Serialized representation of the ExecutionPlan fragment.
+  // Serialized representation of the ExecutionPlan fragment or SQL query string.
   // The exact serialization format (e.g., DataFusion's internal, Substrait, custom JSON/binary)
-  // needs to be standardized across the cluster.
-  bytes plan_bytes = 2;
+  // needs to be standardized across the cluster if fragment_type is SERIALIZED_PLAN.
+  bytes fragment_payload_bytes = 2; // Renamed from plan_bytes
 
   // Optional ShardId if this query fragment is specific to a particular shard's data.
   // This helps the target node route the query to the correct local data partitions.
-  optional uint64 shard_id = 3;
+  optional uint64 shard_id = 3; // This field is more relevant for SERIALIZED_PLAN.
 
   // Session configuration settings relevant for executing this plan fragment.
   // (e.g., batch size, timezone, specific DataFusion config overrides).
@@ -37,9 +37,18 @@ message ExecuteQueryFragmentRequest {
   // Unique identifier for the overall query, for tracing and logging.
   string query_id = 5;
 
-  // Expected schema of the result, serialized (e.g. Arrow IPC Schema format)
+  // Expected schema of the result, serialized (e.g. Arrow IPC Schema format or Datafusion proto)
   // This helps in validation and potentially in how FlightData is structured.
   bytes expected_schema_bytes = 6;
+
+  // Type of fragment payload.
+  FragmentType fragment_type = 7;
+}
+
+// Defines the type of payload in ExecuteQueryFragmentRequest.
+enum FragmentType {
+    SERIALIZED_PLAN = 0; // Default, for backward compatibility if needed
+    SQL_QUERY = 1;
 }
 
 // Note: ExecuteQueryFragmentResponse is a stream of arrow.flight.protocol.FlightData.

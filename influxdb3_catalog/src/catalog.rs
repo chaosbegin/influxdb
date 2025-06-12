@@ -252,7 +252,14 @@ impl Catalog {
         Ok(())
     }
 
-    pub async fn finalize_shard_migration_on_source(&self, db_name: &str, table_name: &str, shard_id: &ShardId, migrated_to_node_id: NodeId) -> Result<()> {
+    pub async fn finalize_shard_migration_on_source(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        shard_id: &ShardId,
+        source_node_id_to_remove: NodeId, // Added this parameter
+        migrated_to_node_id: NodeId
+    ) -> Result<()> {
         let (db_id, table_id) = self.get_db_and_table_ids(db_name, table_name)?;
         self.catalog_update_with_retry(|| {
             let current_db_schema = self.db_schema_by_id(&db_id).ok_or_else(|| CatalogError::DatabaseNotFound(db_name.to_string()))?;
@@ -262,7 +269,12 @@ impl Catalog {
                 database_id: db_id,
                 database_name: current_db_schema.name.clone(),
                 ops: vec![DatabaseCatalogOp::FinalizeShardMigrationOnSource(FinalizeShardMigrationOnSourceLog{
-                    db_id, table_id, table_name: current_table_name, shard_id: *shard_id, migrated_to_node_id
+                    db_id,
+                    table_id,
+                    table_name: current_table_name,
+                    shard_id: *shard_id,
+                    source_node_id_to_remove, // Pass it to the log
+                    migrated_to_node_id
                 })]
             }))
         }).await?;
@@ -394,7 +406,34 @@ impl TableUpdate for UpdateTableShardingStrategyLog { /* ... */ fn table_id(&sel
 
 impl TableUpdate for BeginShardMigrationOutLog { fn table_id(&self) -> TableId { self.table_id } fn table_name(&self) -> Arc<str> { Arc::clone(&self.table_name) } fn update_table<'a>(&self, mut table: Cow<'a, TableDefinition>) -> Result<Cow<'a, TableDefinition>> { let mut_table = table.to_mut(); let shard_to_update_arc = mut_table.shards.get_by_id(&self.shard_id).ok_or_else(|| CatalogError::ShardNotFound { shard_id: self.shard_id, table_id: self.table_id })?; let mut updated_shard_def = Arc::try_unwrap(shard_to_update_arc).unwrap_or_else(|arc| (*arc).clone()); updated_shard_def.migration_status = Some(ShardMigrationStatus::MigratingOutTo(self.target_node_ids.clone())); mut_table.shards.update(self.shard_id, Arc::new(updated_shard_def))?; Ok(table) }}
 impl TableUpdate for CommitShardMigrationOnTargetLog { fn table_id(&self) -> TableId { self.table_id } fn table_name(&self) -> Arc<str> { Arc::clone(&self.table_name) } fn update_table<'a>(&self, mut table: Cow<'a, TableDefinition>) -> Result<Cow<'a, TableDefinition>> { let mut_table = table.to_mut(); let shard_to_update_arc = mut_table.shards.get_by_id(&self.shard_id).ok_or_else(|| CatalogError::ShardNotFound { shard_id: self.shard_id, table_id: self.table_id })?; let mut updated_shard_def = Arc::try_unwrap(shard_to_update_arc).unwrap_or_else(|arc| (*arc).clone()); if !updated_shard_def.node_ids.contains(&self.target_node_id) { updated_shard_def.node_ids.push(self.target_node_id); } mut_table.shards.update(self.shard_id, Arc::new(updated_shard_def))?; Ok(table) }}
-impl TableUpdate for FinalizeShardMigrationOnSourceLog { fn table_id(&self) -> TableId { self.table_id } fn table_name(&self) -> Arc<str> { Arc::clone(&self.table_name) } fn update_table<'a>(&self, mut table: Cow<'a, TableDefinition>) -> Result<Cow<'a, TableDefinition>> { let mut_table = table.to_mut(); let shard_to_update_arc = mut_table.shards.get_by_id(&self.shard_id).ok_or_else(|| CatalogError::ShardNotFound { shard_id: self.shard_id, table_id: self.table_id })?; let mut updated_shard_def = Arc::try_unwrap(shard_to_update_arc).unwrap_or_else(|arc| (*arc).clone()); updated_shard_def.node_ids.retain(|id| *id == self.migrated_to_node_id); if !updated_shard_def.node_ids.contains(&self.migrated_to_node_id) { updated_shard_def.node_ids.push(self.migrated_to_node_id); } updated_shard_def.migration_status = Some(ShardMigrationStatus::Stable); mut_table.shards.update(self.shard_id, Arc::new(updated_shard_def))?; Ok(table) }}
+impl TableUpdate for FinalizeShardMigrationOnSourceLog {
+    fn table_id(&self) -> TableId { self.table_id }
+    fn table_name(&self) -> Arc<str> { Arc::clone(&self.table_name) }
+    fn update_table<'a>(&self, mut table: Cow<'a, TableDefinition>) -> Result<Cow<'a, TableDefinition>> {
+        let mut_table = table.to_mut();
+        let shard_to_update_arc = mut_table.shards.get_by_id(&self.shard_id)
+            .ok_or_else(|| CatalogError::ShardNotFound { shard_id: self.shard_id, table_id: self.table_id })?;
+
+        let mut updated_shard_def = Arc::try_unwrap(shard_to_update_arc)
+            .unwrap_or_else(|arc| (*arc).clone());
+
+        // Remove the source_node_id_to_remove from the list of active nodes for the shard.
+        updated_shard_def.node_ids.retain(|&id| id != self.source_node_id_to_remove);
+
+        // Add the migrated_to_node_id (new owner) if it's not already listed.
+        // This handles cases where CommitShardMigrationOnTarget might have already added it,
+        // or if the shard was directly assigned in some recovery scenario.
+        if !updated_shard_def.node_ids.contains(&self.migrated_to_node_id) {
+            updated_shard_def.node_ids.push(self.migrated_to_node_id);
+        }
+
+        // After successful finalization, the shard is stable on its new set of nodes.
+        updated_shard_def.migration_status = Some(ShardMigrationStatus::Stable);
+
+        mut_table.shards.update(self.shard_id, Arc::new(updated_shard_def))?;
+        Ok(table)
+    }
+}
 impl TableUpdate for UpdateShardMigrationStatusLog { fn table_id(&self) -> TableId { self.table_id } fn table_name(&self) -> Arc<str> { Arc::clone(&self.table_name) } fn update_table<'a>(&self, mut table: Cow<'a, TableDefinition>) -> Result<Cow<'a, TableDefinition>> { let mut_table = table.to_mut(); let shard_to_update_arc = mut_table.shards.get_by_id(&self.shard_id).ok_or_else(|| CatalogError::ShardNotFound { shard_id: self.shard_id, table_id: self.table_id })?; let mut updated_shard_def = Arc::try_unwrap(shard_to_update_arc).unwrap_or_else(|arc| (*arc).clone()); updated_shard_def.migration_status = Some(self.new_status.clone()); mut_table.shards.update(self.shard_id, Arc::new(updated_shard_def))?; Ok(table) }}
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -505,7 +544,9 @@ mod tests { /* ... all existing tests ... */
         // The current FinalizeShardMigrationOnSourceLog logic is a bit too simple (sets node_ids to only migrated_to_node_id).
         // A more robust logic would involve removing only the source node from the list if multiple target nodes were involved.
         // For a single target (node2), this simplified logic works.
-        let finalize_res = catalog.finalize_shard_migration_on_source(db_name, table_name, &shard_id, node2).await;
+        // Update: Logic for FinalizeShardMigrationOnSourceLog's TableUpdate is now corrected.
+        // The source node (node1) is being removed, and the shard is migrated to node2.
+        let finalize_res = catalog.finalize_shard_migration_on_source(db_name, table_name, &shard_id, node1, node2).await;
         assert!(finalize_res.is_ok(), "Finalize migration failed: {:?}", finalize_res.err());
 
         let db_schema = catalog.db_schema(db_name).unwrap();
@@ -523,3 +564,5 @@ mod tests { /* ... all existing tests ... */
         assert_eq!(s_def.migration_status, Some(ShardMigrationStatus::MigratingInFrom(node3)));
     }
 }
+
+[end of influxdb3_catalog/src/catalog.rs]
