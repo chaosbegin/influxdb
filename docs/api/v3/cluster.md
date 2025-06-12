@@ -101,7 +101,7 @@ This document describes the V3 APIs for managing an InfluxDB 3 cluster.
     ```
 -   **Responses:**
     -   `200 OK`: Table sharding configuration successfully updated. Returns `{"status": "table sharding configuration updated"}`.
-    -   `400 BAD_REQUEST`: Invalid payload (e.g., `num_hash_partitions` is 0).
+    -   `400 BAD_REQUEST`: Invalid payload (e.g., `num_hash_partitions` is 0). `num_hash_partitions = 1` is the default and means that hash-based sharding by key is effectively disabled; data within a time-slice shard will not be further partitioned by hash.
     -   `404 NOT FOUND`: Specified database or table not found in the catalog.
     -   `500 INTERNAL_SERVER_ERROR`: Internal catalog error (e.g., `InvalidConfiguration` if catalog rules are violated).
 

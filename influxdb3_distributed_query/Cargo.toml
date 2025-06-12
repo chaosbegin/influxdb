@@ -9,11 +9,14 @@ async-trait = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 influxdb3_id = { path = "../influxdb3_id" } # For NodeId if used
-influxdb3_proto = { path = "../influxdb3_proto" } # For future gRPC messages
+influxdb3_proto = { path = "../influxdb3_proto" }
 parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] } # Added for QueryFragment serde
+serde_json = { workspace = true } # Added for serialization helpers
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] } # sync for Mutex, etc.
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true, package = "observability_deps" }
+bytes = { workspace = true } # Added for QueryFragment::SerializedLogicalPlan(Vec<u8>) -> Bytes for proto
 
 
 [dev-dependencies]

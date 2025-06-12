@@ -1,5 +1,7 @@
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
+mod cluster_sharding_api_tests;
+
 use arrow_array::RecordBatch;
 use data_types::NamespaceName;
 use datafusion::assert_batches_sorted_eq;

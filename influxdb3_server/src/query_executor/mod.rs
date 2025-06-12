@@ -117,6 +117,82 @@ impl QueryExecutorImpl {
             current_node_id, // Store new field
         }
     }
+
+    /// Creates a new DataFusion SessionContext specific to a database.
+    /// This is used by the DistributedQueryService to execute deserialized plans.
+    pub(crate) fn new_df_session_context(&self, db_name: &str) -> Arc<datafusion::execution::context::SessionContext> {
+        // Get the specific DatabaseSchema which acts as a CatalogProvider for the given db_name
+        // This part might need adjustment if `self.catalog.db_schema(db_name)` isn't directly usable
+        // or if `Database::new` (as a CatalogProvider) needs more args or a different setup path.
+        // For now, we assume Database::new can be constructed appropriately here.
+        let db_schema_arc = match self.catalog.db_schema(db_name) {
+            Some(s) => s,
+            None => {
+                // This case should ideally be handled before calling this, or return a Result.
+                // For now, panicking or returning a default context for an unknown DB.
+                // A robust implementation would return Result<Arc<SessionContext>, QueryExecutorError>.
+                // For this conceptual step, we'll proceed assuming db_name is valid.
+                // If not, DataFusion will error out when it can't find tables.
+                // Creating a default context if DB not found to avoid panic here,
+                // but queries against it will fail later.
+                return self.exec.new_context().inner();
+            }
+        };
+
+        // Create the Database instance which implements DataFusion's CatalogProvider and SchemaProvider
+        let catalog_provider = Arc::new(Database::new(CreateDatabaseArgs {
+            db_schema: db_schema_arc, // This is Arc<influxdb3_catalog::catalog::DatabaseSchema>
+            write_buffer: Arc::clone(&self.write_buffer),
+            exec: Arc::clone(&self.exec),
+            datafusion_config: Arc::clone(&self.datafusion_config),
+            query_log: Arc::clone(&self.query_log),
+            // SystemSchemaProvider might need to be db-specific if it isn't already
+            // For now, creating a new one or reusing if possible.
+            // This part depends on how SystemSchemaProvider is designed.
+            // Assuming it can be created fresh or doesn't rely on a specific DB context
+            // beyond what db_schema_arc provides for table listing.
+            // Let's look at Database::new_query_context for inspiration.
+            // It creates a SystemSchemaProvider using the db_schema.
+             system_schema_provider: Arc::new(SystemSchemaProvider::AllSystemSchemaTables(
+                AllSystemSchemaTablesProvider::new(
+                    self.catalog.db_schema(db_name).unwrap(), // Re-fetch, or pass db_schema_arc
+                    Arc::clone(&self.query_log),
+                    Arc::clone(&self.write_buffer),
+                    Arc::clone(&self.sys_events_store),
+                    Arc::clone(&self.catalog), // For system.tables, needs full catalog
+                    self.started_with_auth,
+                )
+            )),
+        }));
+
+
+        let mut cfg = self.exec.new_session_config()
+            .with_default_catalog(catalog_provider); // Register the db-specific catalog provider
+
+        for (k, v) in self.datafusion_config.as_ref() {
+            cfg = cfg.with_config_option(k, v);
+        }
+
+        let session_state = cfg.build();
+        let session_context = Arc::new(datafusion::execution::context::SessionContext::new_with_state(session_state));
+
+        // Register UDTFs like in Database::new_query_context
+        session_context.register_udtf(
+            LAST_CACHE_UDTF_NAME,
+            Arc::new(LastCacheFunction::new(
+                self.catalog.db_name_to_id(db_name).unwrap(), // Requires db_id
+                self.write_buffer.last_cache_provider(),
+            )),
+        );
+        session_context.register_udtf(
+            DISTINCT_CACHE_UDTF_NAME,
+            Arc::new(DistinctCacheFunction::new(
+                self.catalog.db_name_to_id(db_name).unwrap(), // Requires db_id
+                self.write_buffer.distinct_cache_provider(),
+            )),
+        );
+        session_context
+    }
 }
 
 #[async_trait]

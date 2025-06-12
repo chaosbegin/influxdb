@@ -20,20 +20,34 @@ use influxdb3_proto::influxdb3::internal::distributed_query::v1::{
 use arrow::ipc::reader::StreamReader; // For deserializing RecordBatch
 use std::io::Cursor; // To read bytes as a stream
 use bytes::Bytes; // For request bytes
+use datafusion::logical_expr::LogicalPlan; // For helper function signatures
 
 // Conceptual representation of what might be sent to a remote node for execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum QueryFragment {
     /// A serialized representation of a query plan segment.
     /// This could be, for example, a Substrait plan or a DataFusion LogicalPlan/PhysicalPlan
     /// serialized into bytes using a format like prost or serde_json.
-    SerializedPlan(Vec<u8>),
+    SerializedLogicalPlan(Vec<u8>), // Renamed for clarity
 
-    /// A raw SQL query string specific to the data held by the target shard/node.
-    RawSql(String),
+    // RawSql(String), // Commented out to focus on SerializedLogicalPlan for now
     // Potentially other variants like a specific list of filters or projections if the remote
     // node has a more structured API than just executing opaque plans/SQL.
 }
+
+// --- Serialization Helpers ---
+
+/// Serializes a DataFusion LogicalPlan into a byte vector using JSON.
+pub fn serialize_logical_plan(plan: &LogicalPlan) -> DFResult<Vec<u8>> {
+    serde_json::to_vec(plan).map_err(|e| DataFusionError::Execution(format!("Failed to serialize LogicalPlan: {}", e)))
+}
+
+/// Deserializes a DataFusion LogicalPlan from a byte slice (JSON).
+pub fn deserialize_logical_plan(bytes: &[u8]) -> DFResult<LogicalPlan> {
+    serde_json::from_slice(bytes).map_err(|e| DataFusionError::Execution(format!("Failed to deserialize LogicalPlan: {}", e)))
+}
+
+// --- Execution Plan ---
 
 /// `RemoteScanExec` is a conceptual physical operator responsible for executing a
 /// query fragment on a remote InfluxDB 3 node and streaming the results back.
@@ -276,9 +290,11 @@ impl RecordBatchStream for EmptyRecordBatchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema}; // Aliased to avoid clash with struct Schema from catalog
     use std::sync::Arc;
-    use datafusion::execution::context::SessionContext; // For creating TaskContext
+    use datafusion::execution::context::SessionContext;
+    use datafusion::logical_expr::{col, sum, LogicalPlanBuilder, table_scan}; // For building test LogicalPlan
+    use datafusion::prelude::SessionConfig;
 
     fn create_test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -439,5 +455,45 @@ mod tests {
         assert!(stats.num_rows.is_none());
         assert!(stats.total_byte_size.is_none());
         assert!(stats.column_statistics.is_none());
+    }
+
+    #[test]
+    fn test_logical_plan_serialization_deserialization() {
+        // 1. Create a simple LogicalPlan
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("c1", DataType::Utf8, false),
+            Field::new("c2", DataType::Int32, false),
+        ]));
+        let plan = LogicalPlanBuilder::scan("test_table", schema, None).unwrap()
+            .project(vec![col("c1"), col("c2")]).unwrap()
+            // .filter(col("c2").gt(lit(10))).unwrap() // Example filter
+            .build().unwrap();
+
+        // 2. Serialize it
+        let serialized_bytes = serialize_logical_plan(&plan).expect("Failed to serialize plan");
+        assert!(!serialized_bytes.is_empty());
+
+        // 3. Deserialize it
+        let deserialized_plan = deserialize_logical_plan(&serialized_bytes).expect("Failed to deserialize plan");
+
+        // 4. Assert equality (DataFusion's LogicalPlan implements PartialEq)
+        // Note: Direct equality might fail due to subtle differences if not careful with types or context.
+        // For robust comparison, often string representations or specific properties are checked.
+        // However, for serde-derived equality, it should work if all components are serde-aware.
+        assert_eq!(plan, deserialized_plan, "Original and deserialized plans do not match.");
+
+        // Verify some properties to be sure
+        match deserialized_plan {
+            LogicalPlan::Projection(p) => {
+                assert_eq!(p.expr.len(), 2);
+                match p.input.as_ref() {
+                    LogicalPlan::TableScan(ts) => {
+                        assert_eq!(ts.table_name.table(), "test_table");
+                    }
+                    _ => panic!("Expected TableScan as input to projection"),
+                }
+            }
+            _ => panic!("Expected Projection plan"),
+        }
     }
 }

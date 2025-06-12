@@ -166,27 +166,31 @@ impl Planner {
                                     if let Some(node_info) = self.catalog.get_cluster_node(target_node_id) {
                                         let target_rpc_address = node_info.rpc_address.clone();
 
-                                        // Conceptual: Create a query fragment.
-                                        // For this example, use a simple SQL string.
-                                        // A real implementation might serialize parts of the logical plan or use Substrait.
-                                        // Projection should be taken from scan_node.projection
-                                        let projection_cols = scan_node.projection.as_ref().map(|indices| {
-                                            indices.iter().map(|i| scan_node.source.schema().field(*i).name().as_str()).collect::<Vec<&str>>().join(", ")
-                                        }).unwrap_or_else(|| "*".to_string());
+                                        // 1. Create a LogicalPlan for the remote shard.
+                                        //    Simplified: Use the original TableScan node. Filters/projections are assumed
+                                        //    to be part of this scan_node already due to DataFusion's planning.
+                                        //    A more advanced version might prune this plan further or add shard-specific filters.
+                                        let remote_logical_plan = LogicalPlan::TableScan(scan_node.clone());
 
-                                        let query_fragment_sql = format!(
-                                            "SELECT {} FROM \"{}\" /* CONCEPTUAL_SHARD_FILTER shard_id={} */",
-                                            projection_cols,
-                                            scan_node.table_name.table(), // Use only table part of TableReference
-                                            shard_def.id.get()
-                                        );
-                                        let query_fragment = QueryFragment::RawSql(query_fragment_sql);
+                                        // 2. Serialize this LogicalPlan.
+                                        let serialized_plan_bytes = influxdb3_distributed_query::exec::serialize_logical_plan(&remote_logical_plan)
+                                            .map_err(|e| {
+                                                tracing::error!("Failed to serialize logical plan for remote shard: {}", e);
+                                                DataFusionError::Plan(format!("Serialization error for remote plan: {}", e))
+                                            })?;
 
+                                        // 3. Construct QueryFragment.
+                                        let query_fragment = QueryFragment::SerializedLogicalPlan(serialized_plan_bytes);
+
+                                        // 4. Create RemoteScanExec.
+                                        //    db_name is required by RemoteScanExec::new.
+                                        //    The table_name is implicitly part of the serialized LogicalPlan (TableScan).
                                         let remote_exec = RemoteScanExec::new(
+                                            default_db_name.clone(), // Pass db_name
                                             target_node_id,
                                             target_rpc_address,
                                             query_fragment,
-                                            scan_node.schema().clone(), // Output schema is the projected schema of the scan
+                                            scan_node.schema().clone(),
                                         );
                                         sub_plans.push(Arc::new(remote_exec));
                                     } else {
@@ -268,6 +272,159 @@ impl Planner {
 // ... (impl DisplayAs for SchemaExec) ...
 // Ensure this is correctly defined as in the original. For brevity, I'll assume it's present.
 // It was used by influxql method.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::{LogicalPlanBuilder, col, lit, table_scan};
+    use datafusion::datasource::provider::empty::EmptyTable;
+    use datafusion::prelude::SessionContext;
+    use influxdb3_catalog::catalog::CatalogArgs;
+    use influxdb3_catalog::shard::{ShardDefinition, ShardTimeRange};
+    use influxdb3_id::NodeId;
+    use iox_time::MockProvider;
+    use object_store::memory::InMemory;
+    use std::collections::HashMap;
+    use influxdb3_catalog::log::FieldDataType; // For creating tables in tests
+    use influxdb3_distributed_query::exec::deserialize_logical_plan;
+
+
+    async fn setup_planner_for_tests(current_node_id_str: &str) -> (Planner, Arc<Catalog>, Arc<IOxSessionContext>) {
+        let time_provider = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+        let metrics = Arc::new(metric::Registry::new());
+        let object_store = Arc::new(InMemory::new());
+
+        let catalog = Arc::new(
+            Catalog::new_with_args(
+                "test_planner_node",
+                object_store,
+                Arc::clone(&time_provider),
+                metrics,
+                CatalogArgs::default(),
+                Default::default(), // CatalogLimits
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Register some nodes for remote shard assignment
+        let node1_def = influxdb3_catalog::ClusterNodeDefinition {
+            id: NodeId::new(1), rpc_address: "node1:8082".to_string(), http_address: "".to_string(),
+            status: "active".to_string(), created_at: 0, updated_at: 0
+        };
+        let node2_def = influxdb3_catalog::ClusterNodeDefinition {
+            id: NodeId::new(2), rpc_address: "node2:8082".to_string(), http_address: "".to_string(),
+            status: "active".to_string(), created_at: 0, updated_at: 0
+        };
+        catalog.add_cluster_node(node1_def).await.unwrap();
+        catalog.add_cluster_node(node2_def).await.unwrap();
+
+
+        let session_config = datafusion::execution::context::SessionConfig::new()
+            .with_default_catalog_and_schema("public", "public"); // DataFusion default
+        let session_state = datafusion::execution::session_state::SessionState::new_with_config_rt(
+            session_config,
+            Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()),
+        );
+
+        // Create a basic IOxSessionContext
+        // The default catalog in IOxSessionContext usually points to a specific database.
+        // For these tests, we'll set a default DB name.
+        let default_db_name = "test_db_planner";
+        session_state.config().options_mut().catalog.default_catalog = default_db_name.to_string();
+
+
+        let iox_session_ctx = Arc::new(IOxSessionContext::with_state(session_state, None));
+
+        let planner = Planner::new(&iox_session_ctx, Arc::clone(&catalog), Arc::from(current_node_id_str));
+        (planner, catalog, iox_session_ctx)
+    }
+
+    #[tokio::test]
+    async fn test_planner_creates_serialized_logical_plan_fragment() {
+        let current_node_id_str = "1"; // Current node is NodeId(1)
+        let (planner, catalog, session_ctx) = setup_planner_for_tests(current_node_id_str).await;
+
+        let db_name = session_ctx.default_database_name(); // "test_db_planner"
+        let table_name = "sharded_table";
+
+        // Setup catalog: DB, Table, Shards (one local, one remote)
+        catalog.create_database(&db_name).await.unwrap();
+        catalog.create_table(&db_name, table_name, &["tagA"], &[(String::from("field1"), FieldDataType::Integer)]).await.unwrap();
+
+        let table_def_arc = catalog.db_schema(&db_name).unwrap().table_definition(table_name).unwrap();
+
+        let local_node_id = NodeId::new(1);
+        let remote_node_id = NodeId::new(2);
+
+        let shard_local = ShardDefinition::new(
+            influxdb3_id::ShardId::new(10),
+            ShardTimeRange { start_time: 0, end_time: 1000 },
+            vec![local_node_id], // Assigned to current node
+        );
+        let shard_remote = ShardDefinition::new(
+            influxdb3_id::ShardId::new(20),
+            ShardTimeRange { start_time: 1000, end_time: 2000 },
+            vec![remote_node_id], // Assigned to remote node
+        );
+        catalog.create_shard(&db_name, table_name, shard_local).await.unwrap();
+        catalog.create_shard(&db_name, table_name, shard_remote).await.unwrap();
+
+        // Create a simple LogicalPlan: SELECT field1 FROM sharded_table WHERE tagA = 'value'
+        // This requires the table to be registered in the session context's catalog provider.
+        // For simplicity, we construct a TableScan directly.
+        // The schema must match what the catalog would provide for "sharded_table".
+        let arrow_schema = table_def_arc.schema.as_arrow(); // Get schema from catalog's TableDefinition
+
+        let logical_plan = LogicalPlanBuilder::scan(table_name, Arc::clone(&arrow_schema) , None).unwrap()
+            .project(vec![col("field1")]).unwrap()
+            // .filter(col("tagA").eq(lit("some_value"))).unwrap() // Example filter
+            .build().unwrap();
+
+        // Execute planner
+        let physical_plan = planner.create_physical_plan_considering_distribution(Arc::new(logical_plan), &session_ctx).await.unwrap();
+
+        // Expect a UnionExec because we have one local and one remote shard (conceptual)
+        assert_eq!(physical_plan.name(), "UnionExec");
+        let union_exec = physical_plan.as_any().downcast_ref::<UnionExec>().unwrap();
+        assert_eq!(union_exec.children().len(), 2); // One local, one remote
+
+        let mut remote_scan_found = false;
+        for child_plan in union_exec.children() {
+            if child_plan.name() == "RemoteScanExec" {
+                remote_scan_found = true;
+                let remote_scan = child_plan.as_any().downcast_ref::<RemoteScanExec>().unwrap();
+                assert_eq!(remote_scan.target_node_id(), remote_node_id);
+                assert_eq!(remote_scan.db_name(), db_name);
+
+                match remote_scan.query_fragment().as_ref() {
+                    QueryFragment::SerializedLogicalPlan(bytes) => {
+                        let deserialized_lp = deserialize_logical_plan(bytes).unwrap();
+                        // Verify it's a TableScan for the correct table, with the projection
+                        match deserialized_lp {
+                            LogicalPlan::Projection(p) => {
+                                assert_eq!(p.expr.len(), 1); // field1
+                                if let LogicalPlan::TableScan(ts) = p.input.as_ref() {
+                                     assert_eq!(ts.table_name.table(), table_name);
+                                } else {
+                                    panic!("Expected TableScan input for projection in deserialized plan");
+                                }
+                            }
+                            _ => panic!("Expected Projection as top of deserialized plan for remote scan, got {:?}", deserialized_lp),
+                        }
+                    }
+                    // _ => panic!("Expected QueryFragment::SerializedLogicalPlan"), // RawSql is now commented out
+                }
+            } else {
+                // Could assert that other child is ParquetExec or similar local scan
+                assert!(child_plan.name().contains("ParquetExec") || child_plan.name().contains("EmptyExec") || child_plan.name() == "RecordBatchProjectExec", "Expected local scan, got {}", child_plan.name());
+
+            }
+        }
+        assert!(remote_scan_found, "RemoteScanExec not found in the plan for sharded table");
+    }
+}
+
 
 /// A physical operator that overrides the `schema` API,
 /// to return an amended version owned by `SchemaExec`. The
