@@ -1,0 +1,27 @@
+[package]
+name = "influxdb3_distributed_query"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { workspace = true, features = ["prettyprint"] } # prettyprint for DisplayAs tests if needed
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+influxdb3_id = { path = "../influxdb3_id" } # For NodeId if used
+influxdb3_proto = { path = "../influxdb3_proto" } # For future gRPC messages
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] } # sync for Mutex, etc.
+tracing = { workspace = true, package = "observability_deps" }
+
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] } # For tests
+# Add other dev-dependencies as needed for tests, e.g., more DataFusion test utils
+datafusion-common = { workspace = true, package = "datafusion" } # For DFResult in tests if needed
+datafusion-physical-plan = { workspace = true, package = "datafusion"} # For test stream construction
+arrow-schema = { workspace = true } # For SchemaRef in tests
+arrow-array = { workspace = true } # For RecordBatch in tests
+test-log = { workspace = true }
+pretty_assertions = { workspace = true }

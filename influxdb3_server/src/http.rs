@@ -1845,7 +1845,7 @@ pub(crate) async fn route_request(
     let response = match (method.clone(), path) {
         // Cluster Management APIs
         (Method::GET, all_paths::API_V3_CLUSTER_NODES) => cluster::handle_list_cluster_nodes(State(Arc::clone(&http_server))).await.into_response(),
-        (Method::POST, all_paths::API_V3_CLUSTER_NODES) => cluster::handle_add_cluster_node(State(Arc::clone(&http_server)), axum::Json(http_server.read_body_json(req).await?)).await.into_response(),
+        (Method::POST, all_paths::API_V3_CLUSTER_NODES) => cluster::handle_add_cluster_node(State(Arc::clone(&http_server)), http_server.read_body_json(req).await?).await.into_response(),
         (Method::DELETE, path) if path.starts_with(all_paths::API_V3_CLUSTER_NODES_BY_ID_PREFIX) => {
             // Expects path like /api/v3/cluster/nodes/{node_id}
             // Need to extract {node_id} part for the handler
@@ -1867,9 +1867,9 @@ pub(crate) async fn route_request(
             let prefix_len = all_paths::API_V3_CLUSTER_NODES_BY_ID_PREFIX.len();
             let suffix_len = "/status".len();
             let node_id_str = path[prefix_len..path.len()-suffix_len].to_string();
-            cluster::handle_update_node_status(State(Arc::clone(&http_server)), Path(node_id_str), axum::Json(http_server.read_body_json(req).await?)).await.into_response()
+            cluster::handle_update_node_status(State(Arc::clone(&http_server)), Path(node_id_str), http_server.read_body_json(req).await?).await.into_response()
         },
-        (Method::POST, all_paths::API_V3_CLUSTER_SHARDS_MOVE) => cluster::handle_initiate_shard_move(State(Arc::clone(&http_server)), axum::Json(http_server.read_body_json(req).await?)).await.into_response(),
+        (Method::POST, all_paths::API_V3_CLUSTER_SHARDS_MOVE) => cluster::handle_initiate_shard_move(State(Arc::clone(&http_server)), http_server.read_body_json(req).await?).await.into_response(),
 
 
         (Method::DELETE, all_paths::API_V3_CONFIGURE_TOKEN) => http_server.delete_token(req).await,

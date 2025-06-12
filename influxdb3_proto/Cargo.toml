@@ -1,0 +1,14 @@
+[package]
+name = "influxdb3_proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+# Required by generated code for Bytes
+bytes = { workspace = true }
+
+
+[build-dependencies]
+tonic-build = { workspace = true }

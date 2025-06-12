@@ -176,9 +176,11 @@ pub struct WriteBufferImpl {
     current_node_id: Arc<str>, // Added for node identification in replication
     /// The number of files we will accept for a query
     query_file_limit: usize,
-    mock_replication_client: crate::replication_client::MockReplicationClient, // Added field
+    // mock_replication_client is now test-only
     #[cfg(test)]
-    last_replicate_wal_op_request_for_test: std::sync::Mutex<Option<crate::ReplicateWalOpRequest>>, // Test only
+    mock_replication_client: crate::replication_client::mock::MockReplicationClient, // Uses mock module
+    #[cfg(test)]
+    last_replicate_wal_op_request_for_test: std::sync::Mutex<Option<influxdb3_proto::influxdb3::internal::replication::v1::ReplicateWalOpRequest>>, // Updated type
 }
 
 /// The maximum number of snapshots to load on start
@@ -201,7 +203,6 @@ pub struct WriteBufferImplArgs {
     pub wal_replay_concurrency_limit: Option<usize>,
     pub current_node_id: Arc<str>, // Added for node identification
     pub max_snapshots_to_load_on_start: Option<usize>,
-    // parquet_row_group_write_size is NOT needed here, Persister is pre-configured
 }
 
 impl WriteBufferImpl {
@@ -326,17 +327,18 @@ impl WriteBufferImpl {
             persisted_files,
             buffer: queryable_buffer,
             metrics: WriteMetrics::new(&metric_registry),
-            current_node_id, // Store new field
+            current_node_id,
             query_file_limit: query_file_limit.unwrap_or(432),
-            mock_replication_client: crate::replication_client::MockReplicationClient::new(), // Instantiate
             #[cfg(test)]
-            last_replicate_wal_op_request_for_test: std.sync::Mutex::new(None), // Test only
+            mock_replication_client: crate::replication_client::mock::MockReplicationClient::default(),
+            #[cfg(test)]
+            last_replicate_wal_op_request_for_test: std::sync::Mutex::new(None),
         });
         Ok(result)
     }
 
     #[cfg(test)]
-    pub(crate) fn take_last_replicate_wal_op_request_for_test(&self) -> Option<crate::ReplicateWalOpRequest> {
+    pub(crate) fn take_last_replicate_wal_op_request_for_test(&self) -> Option<influxdb3_proto::influxdb3::internal::replication::v1::ReplicateWalOpRequest> { // Updated type
         self.last_replicate_wal_op_request_for_test.lock().unwrap().take()
     }
 
@@ -472,10 +474,11 @@ impl WriteBufferImpl {
                                             }
                                         };
 
-                                        let own_node_id = self.current_node_id.as_ref().to_string();
-                                        let request = crate::ReplicateWalOpRequest {
-                                            serialized_wal_op: serialized_op,
-                                            originating_node_id: own_node_id,
+                                        let own_node_id_str = self.current_node_id.as_ref().to_string();
+                                        // Construct the protobuf ReplicateWalOpRequest
+                                        let proto_request = influxdb3_proto::influxdb3::internal::replication::v1::ReplicateWalOpRequest {
+                                            wal_op_bytes: serialized_op.into(), // Convert Vec<u8> to bytes::Bytes
+                                            originating_node_id: own_node_id_str,
                                             shard_id: determined_shard_id.map(|sid| sid.get()),
                                             database_name: database.as_str().to_string(),
                                             table_name: table_name_str_ref.clone(),
@@ -483,26 +486,59 @@ impl WriteBufferImpl {
 
                                         #[cfg(test)]
                                         {
-                                            *self.last_replicate_wal_op_request_for_test.lock().unwrap() = Some(request.clone());
-                                        }
-
-                                        let mut successful_replications = 0;
-                                        for node_addr in &conceptual_replica_nodes {
-                                            // In real code, replace with actual gRPC client call
-                                            match self.mock_replication_client.replicate_wal_op(node_addr, &request).await {
-                                                Ok(response) if response.success => {
-                                                    successful_replications += 1;
-                                                }
-                                                Ok(response) => {
-                                                    warn!("Replica {} failed for table {}.{}: {:?}", node_addr, database.as_str(), table_name_str_ref, response.error_message);
-                                                }
-                                                Err(e) => {
-                                                    warn!("RPC error to replica {} for table {}.{}: {:?}", node_addr, database.as_str(), table_name_str_ref, e);
+                                            // For tests, use the mock client
+                                            *self.last_replicate_wal_op_request_for_test.lock().unwrap() = Some(proto_request.clone());
+                                            let mut successful_remote_replications_mock = 0;
+                                            for node_addr_mock in &conceptual_replica_nodes {
+                                                // Assuming MockReplicationClient is updated to handle proto_request or we adapt here
+                                                match self.mock_replication_client.replicate_wal_op(node_addr_mock, &proto_request).await {
+                                                    Ok(response_mock) if response_mock.success => {
+                                                        successful_remote_replications_mock += 1;
+                                                    }
+                                                    Ok(response_mock) => {
+                                                        warn!("Mock Replica {} failed for table {}.{}: {:?}", node_addr_mock, database.as_str(), table_name_str_ref, response_mock.error_message);
+                                                    }
+                                                    Err(e_mock) => {
+                                                        warn!("Mock RPC error to replica {} for table {}.{}: {:?}", node_addr_mock, database.as_str(), table_name_str_ref, e_mock);
+                                                    }
                                                 }
                                             }
+                                            successful_replications = successful_remote_replications_mock; // Use this for quorum check in test mode
                                         }
 
-                                        // Quorum is N/2 + 1 for the *writes* (local write is one, so N-1 replicas)
+                                        #[cfg(not(test))]
+                                        {
+                                            // Production path: Use GrpcReplicationClient
+                                            use crate::replication_client::GrpcReplicationClient; // Ensure this is imported
+                                            let mut successful_remote_replications_grpc = 0;
+                                            for replica_address in &conceptual_replica_nodes {
+                                                debug!("Attempting to replicate WalOp to replica: {}", replica_address);
+                                                match GrpcReplicationClient::new(replica_address.clone()).await {
+                                                    Ok(mut client) => {
+                                                        match client.replicate_wal_op(proto_request.clone()).await {
+                                                            Ok(response_wrapper) => {
+                                                                let response = response_wrapper.into_inner();
+                                                                if response.success {
+                                                                    successful_remote_replications_grpc += 1;
+                                                                } else {
+                                                                    error!("Replication to {} failed: {:?}", replica_address, response.error_message.unwrap_or_default());
+                                                                }
+                                                            }
+                                                            Err(status) => {
+                                                                error!("Replication RPC to {} failed: {}", replica_address, status);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e_client) => {
+                                                        error!("Failed to create replication client for {}: {:?}", replica_address, e_client);
+                                                        // Treat as a replication failure for this replica
+                                                    }
+                                                }
+                                            }
+                                            successful_replications = successful_remote_replications_grpc;
+                                        }
+
+                                        // Quorum logic (remains the same)
                                         // So, for factor F, we need (F/2 + 1) total successes.
                                         // Local write is one success. So, we need (F/2 + 1) - 1 successful remote replications.
                                         // Or, more simply, total successes (local + remote) must be >= quorum.
