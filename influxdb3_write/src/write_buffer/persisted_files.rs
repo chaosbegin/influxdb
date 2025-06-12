@@ -68,6 +68,13 @@ impl PersistedFiles {
             .unwrap_or_default()
             .into_iter()
             .filter(|file| filter.test_time_stamp_min_max(file.min_time, file.max_time))
+            .filter(|file| { // Added filter for shard_id
+                if let Some(target_shard_id) = filter.shard_id_filter {
+                    file.shard_id.map_or(false, |file_shard_id| file_shard_id == target_shard_id)
+                } else {
+                    true // If no shard_id_filter is set, keep all files (that passed time filter)
+                }
+            })
             .collect::<Vec<_>>();
 
         files.sort_by(|a, b| b.min_time.cmp(&a.min_time));

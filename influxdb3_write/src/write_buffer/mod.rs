@@ -6,6 +6,8 @@ pub mod queryable_buffer;
 mod table_buffer;
 use influxdb3_shutdown::ShutdownToken;
 use tokio::sync::{oneshot, watch::Receiver};
+
+const MAX_REPLICATION_RETRIES: u32 = 3; // Example: 1 initial attempt + 2 retries
 use trace::span::{MetaValue, SpanRecorder};
 pub mod validator;
 
@@ -177,7 +179,28 @@ pub struct WriteBufferImpl {
     /// The number of files we will accept for a query
     query_file_limit: usize,
     #[cfg(test)]
-    last_replicate_wal_op_request_for_test: std::sync::Mutex<Option<crate::ReplicateWalOpRequest>>, // Test only
+    last_replicate_wal_op_request_for_test: std::sync::Mutex<Option<crate::ReplicateWalOpRequest>>,
+    #[cfg(test)]
+    simulated_replica_responses: std::sync::Mutex<std::collections::HashMap<String, Vec<Result<(), String>>>>,
+}
+
+impl WriteBufferImpl {
+    #[cfg(test)]
+    fn set_simulated_replica_responses(&self, responses: std::collections::HashMap<String, Vec<Result<(), String>>>) {
+        let mut guard = self.simulated_replica_responses.lock().unwrap();
+        *guard = responses;
+    }
+
+    #[cfg(test)]
+    fn get_simulated_replica_response(&self, node_id: &str) -> Result<(), String> {
+        let mut guard = self.simulated_replica_responses.lock().unwrap();
+        if let Some(queue) = guard.get_mut(node_id) {
+            if !queue.is_empty() {
+                return queue.remove(0); // FIFO
+            }
+        }
+        Ok(()) // Default to success if node not found or queue empty
+    }
 }
 
 /// The maximum number of snapshots to load on start
@@ -515,39 +538,39 @@ impl WriteBufferImpl {
         wal_op: &WalOp,
         determined_shard_id: Option<influxdb3_catalog::shard::ShardId>,
         db_name: &NamespaceName<'static>,
-        table_name: &str, // Assuming table_name is known for this WalOp
-        replica_node_ids: Vec<String>, // In future, these would be more structured, e.g., with addresses
+        table_name: &str,
+        replica_node_ids: Vec<String>, // These are the *other* nodes to replicate to.
+        replication_factor: usize, // Total number of replicas for the shard (primary + secondaries)
     ) -> Result<(), Error> {
         if replica_node_ids.is_empty() {
-            // No replicas to send to, or this node is the only one responsible (RF=1).
-            // Log if RF > 1 but no replica_node_ids were found by config.
-            if let Some(db_schema) = self.catalog.db_schema(db_name.as_str()) {
-                if let Some(table_def) = db_schema.table_definition(table_name) {
-                    if let Some(rep_info) = &table_def.replication_info {
-                        if rep_info.replication_factor.get() > 1 {
-                             warn!("Replication factor for {}.{} is > 1, but no replica node IDs were provided for replication.", db_name.as_str(), table_name);
-                        }
-                    }
-                }
+            if replication_factor > 1 {
+                // This implies self is the only node but RF > 1. This could be a misconfiguration
+                // or a state where other replicas are not yet known/registered for this shard.
+                // For now, we proceed, but log a warning.
+                warn!(
+                    "Replication factor for {}.{} is {}, but no other replica node IDs were provided for replication. Proceeding with local write only.",
+                    db_name.as_str(), table_name, replication_factor
+                );
             }
-            return Ok(());
+            return Ok(()); // No remote replication needed.
         }
 
         debug!(
-            "Executing replication for WalOp on table '{}.{}', shard {:?}, to nodes: {:?}",
-            db_name.as_str(), table_name, determined_shard_id, replica_node_ids
+            "Executing replication for WalOp on table '{}.{}', shard {:?}, to nodes: {:?}. Total RF: {}",
+            db_name.as_str(), table_name, determined_shard_id, replica_node_ids, replication_factor
         );
 
         let serialized_op = match bitcode::serialize(wal_op) {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!("Failed to serialize WalOp for replication: {}", e);
+                // Serialization failure is critical and should likely prevent the write.
                 return Err(Error::ReplicationError(format!("Failed to serialize WalOp: {}", e)));
             }
         };
 
         let own_node_id = self.current_node_id.as_ref().to_string();
-        let request_to_send = crate::ReplicateWalOpRequest {
+        let _request_to_send = crate::ReplicateWalOpRequest { // Renamed as it's cloned per call
             serialized_wal_op,
             originating_node_id: own_node_id,
             shard_id: determined_shard_id.map(|sid| sid.get()),
@@ -555,66 +578,73 @@ impl WriteBufferImpl {
             table_name: table_name.to_string(),
         };
 
-        let mut successful_replications = 0;
-        // Quorum: N/2 + 1. For RF=2, quorum=2. For RF=3, quorum=2.
-        // This counts the local write + successful remote writes.
-        // If the local write is already done, we need (RF/2 + 1) - 1 remote successes.
-        // Or, more simply, total successful writes (local + remote) must be >= RF/2 + 1.
-        // Let's assume the local write is one success, so we need (RF/2) more remote successes.
-        // The number of nodes to replicate to is replica_node_ids.len(), which should be RF-1.
-        // A simpler quorum might just be a majority of the intended replicas.
-        let required_replications_for_quorum = (replica_node_ids.len() / 2) + 1; // strict majority of *remote* replicas
+        let mut successful_remote_replications = 0;
+        // Quorum: N/2 + 1 total successes (including primary).
+        // So, we need (RF/2 + 1) - 1 (for self/primary) successful *remote* replications.
+        let required_total_successes_for_quorum = (replication_factor / 2) + 1;
+        // If primary write is assumed successful, then remote successes needed:
+        let required_remote_successes_for_quorum = if required_total_successes_for_quorum > 0 {
+            required_total_successes_for_quorum.saturating_sub(1)
+        } else {
+            0 // Should not happen if RF >= 1
+        };
 
-        for node_id in &replica_node_ids {
-            const MAX_RETRIES: u32 = 2; // e.g., 1 initial attempt + 2 retries
-            let mut attempt = 0;
-            loop {
-                attempt += 1;
-                debug!("Attempt {} to replicate WalOp to node {}", attempt, node_id);
 
-                // --- Placeholder for actual RPC client call ---
-                // let client = self.get_replication_rpc_client_for_node(node_id).await?;
-                // match client.replicate_wal_op(request_to_send.clone()).await { // Clone if request is consumed
-                //     Ok(response) if response.into_inner().success => {
-                //         successful_replications += 1;
-                //         break; // Success for this node
-                //     }
-                //     Ok(response) => { // Replica reported failure
-                //         warn!("Replication failed on node {}: {:?}", node_id, response.into_inner().error_message);
-                //         if attempt > MAX_RETRIES { break; } // Exhausted retries for this node
-                //     }
-                //     Err(e) => { // RPC transport error
-                //         warn!("RPC error replicating to node {}: {:?}", node_id, e);
-                //         if attempt > MAX_RETRIES { break; } // Exhausted retries for this node
-                //     }
-                // }
-                // --- End Placeholder ---
+        for node_id_str in &replica_node_ids {
+            let mut node_succeeded = false;
+            for attempt in 0..=MAX_REPLICATION_RETRIES { // 0 is the first attempt, up to MAX_REPLICATION_RETRIES retries
+                debug!("Attempt {}/{} to replicate WalOp to node {}", attempt + 1, MAX_REPLICATION_RETRIES + 1, node_id_str);
 
-                // Simulated success for now for most nodes, to test quorum logic
-                // To test quorum failure, one might make some nodes "fail" based on their ID.
-                if cfg!(test) && node_id.starts_with("fail_node_") { // Test hook for failure
-                    warn!("Simulated RPC failure for node {}", node_id);
-                     if attempt > MAX_RETRIES { break; }
-                } else {
-                    debug!("Simulated RPC success for node {}", node_id);
-                    successful_replications += 1;
-                    break;
-                }
+                #[allow(unused_variables)] // request_to_send is used in commented out real RPC call
+                let rpc_result = {
+                    #[cfg(test)]
+                    {
+                        self.get_simulated_replica_response(node_id_str)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        // In real code, this would be an actual RPC call:
+                        // let client = self.get_rpc_client_for_node(node_id_str).await?;
+                        // client.replicate_wal_op(request_to_send.clone()).await ... map to Result<(), String>
+                        // For now, outside of test, assume success.
+                        info!("Simulating successful RPC call to {} (attempt {}) in non-test mode.", node_id_str, attempt + 1);
+                        Ok(())
+                    }
+                };
 
-                if attempt <= MAX_RETRIES {
-                    // Conceptual: tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
-                    debug!("Will retry replication to node {} after delay.", node_id);
+                match rpc_result {
+                    Ok(_) => {
+                        successful_remote_replications += 1;
+                        node_succeeded = true;
+                        debug!("Successfully replicated WalOp to node {} on attempt {}", node_id_str, attempt + 1);
+                        break; // Success for this node
+                    }
+                    Err(e) => {
+                        warn!("Replication attempt {} to node {} failed: {}", attempt + 1, node_id_str, e);
+                        if attempt == MAX_REPLICATION_RETRIES {
+                            error!("All {} replication attempts to node {} failed. Last error: {}", MAX_REPLICATION_RETRIES + 1, node_id_str, e);
+                            // This node has definitively failed.
+                            break;
+                        }
+                        // Conceptual: Add delay before retry if this were real async
+                        // tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
+                    }
                 }
             }
+            // If this node failed all retries, it's already logged.
+            // We continue to try other replicas to see if quorum can still be met.
         }
 
-        if successful_replications >= required_replications_for_quorum {
-            debug!("Replication quorum met: {}/{} successful remote replications.", successful_replications, required_replications_for_quorum);
+        if successful_remote_replications >= required_remote_successes_for_quorum {
+            debug!(
+                "Remote replication quorum met: {}/{} successful remote replications. (Total RF: {}, Quorum needed: {})",
+                successful_remote_replications, required_remote_successes_for_quorum, replication_factor, required_total_successes_for_quorum
+            );
             Ok(())
         } else {
             let err_msg = format!(
-                "Replication quorum not met for table '{}.{}'. Needed {} remote successes, got {}. Replicas targeted: {:?}",
-                db_name.as_str(), table_name, required_replications_for_quorum, successful_replications, replica_node_ids
+                "Replication quorum not met for table '{}.{}'. Total RF: {}. Required total successes: {}. Primary success (assumed): 1. Remote successes needed: {}. Actual remote successes: {}. Replicas targeted: {:?}",
+                db_name.as_str(), table_name, replication_factor, required_total_successes_for_quorum, required_remote_successes_for_quorum, successful_remote_replications, replica_node_ids
             );
             error!("{}", err_msg);
             Err(Error::ReplicationError(err_msg))
@@ -1182,6 +1212,188 @@ async fn check_mem_and_force_snapshot(
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use std::num::NonZeroUsize;
+    use crate::write_buffer::table_buffer::TableBuffer; // For direct TableBuffer tests if needed
+    use datafusion::datasource::DefaultTableSource; // For TableProvider
+    use influxdb3_catalog::catalog::CatalogLimits; // For TestCatalog
+    use influxdb3_catalog::catalog::CatalogArgs; // For TestCatalog
+    use influxdb3_catalog::shard::ShardTimeRange; // For ShardDefinition
+    use influxdb3_id::NodeId as ComputeNodeIdTest; // Alias for clarity in tests
+    use influxdb3_wal::{Row, Field, FieldData}; // For direct data construction
+
+    #[tokio::test]
+    async fn test_get_table_chunks_with_shard_filter_in_memory() {
+        let db_name_str = "db_shard_filter_mem";
+        let table_name_str = "table_shard_filter_mem";
+        let current_node_id_str = "this_node";
+        let shard_id_1 = ShardId::new(1);
+        let shard_id_2 = ShardId::new(2);
+
+        // Catalog setup (simplified, no actual replication factor needed for this test)
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let catalog = Arc::new(
+            Catalog::new_with_args(
+                "test_catalog_for_shard_filter",
+                Arc::new(InMemory::new()),
+                Arc::clone(&time_provider),
+                Arc::new(Registry::new()),
+                CatalogArgs::default(),
+                CatalogLimits::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        catalog.create_database(db_name_str).await.unwrap();
+        catalog.create_table(db_name_str, table_name_str, &["tag"], &[("value", FieldDataType::Integer)]).await.unwrap();
+
+        // Create shard definitions in catalog (even if not strictly enforced by buffer alone, good for consistency)
+        let shard_def1 = ShardDefinition::new(shard_id_1, ShardTimeRange::new(0, 1000), vec![ComputeNodeIdTest::new(1)]);
+        let shard_def2 = ShardDefinition::new(shard_id_2, ShardTimeRange::new(0, 1000), vec![ComputeNodeIdTest::new(1)]); // Same node for simplicity
+        catalog.create_shard(db_name_str, table_name_str, shard_def1).await.unwrap();
+        catalog.create_shard(db_name_str, table_name_str, shard_def2).await.unwrap();
+
+        let db_schema = catalog.db_schema(db_name_str).unwrap();
+        let table_def = db_schema.table_definition(table_name_str).unwrap();
+        let table_id_for_writes = table_def.table_id; // Get TableId for direct WriteBatch construction
+
+        // Setup WriteBufferImpl
+        let (buf, ctx, _tp, _metrics) = setup_inner_with_catalog( // Using a modified setup helper
+            Time::from_timestamp_nanos(0),
+            Arc::new(InMemory::new()), // Fresh object store for this test
+            WalConfig::test_config(),
+            false, // use_cache = false
+            Arc::clone(&catalog),
+            Some("node_for_shard_filter_test".to_string()),
+            Arc::from(current_node_id_str),
+            Some(0), // max_snapshots_to_load_on_start
+            Some(crate::persister::DEFAULT_ROW_GROUP_WRITE_SIZE)
+        ).await;
+
+
+        // Manually construct WriteBatches for specific shards and add to QueryableBuffer
+        // This bypasses WAL processing for more direct control over buffer state in this unit test.
+        let mut wb1_table_chunks = SerdeVecMap::new();
+        let mut chunk_map1 = HashMap::new();
+        chunk_map1.insert(0i64, influxdb3_wal::TableChunk { rows: vec![
+            Row { time: 10, fields: vec![Field::new(ColumnId::new(1), FieldData::Integer(101))] } // Assuming ColumnId 1 is "value"
+        ]});
+        wb1_table_chunks.insert(table_id_for_writes, influxdb3_wal::TableChunks { min_time: 10, max_time: 10, chunk_time_to_chunk: chunk_map1 });
+        let write_batch1 = WriteBatch {
+            catalog_sequence: CatalogSequenceNumber::new(1), database_id: db_schema.id, database_name: Arc::from(db_name_str),
+            table_chunks: wb1_table_chunks, min_time_ns: 10, max_time_ns: 10, shard_id: Some(shard_id_1)
+        };
+
+        let mut wb2_table_chunks = SerdeVecMap::new();
+        let mut chunk_map2 = HashMap::new();
+        chunk_map2.insert(0i64, influxdb3_wal::TableChunk { rows: vec![
+            Row { time: 20, fields: vec![Field::new(ColumnId::new(1), FieldData::Integer(202))] }
+        ]});
+        wb2_table_chunks.insert(table_id_for_writes, influxdb3_wal::TableChunks { min_time: 20, max_time: 20, chunk_time_to_chunk: chunk_map2 });
+        let write_batch2 = WriteBatch {
+            catalog_sequence: CatalogSequenceNumber::new(2), database_id: db_schema.id, database_name: Arc::from(db_name_str),
+            table_chunks: wb2_table_chunks, min_time_ns: 20, max_time_ns: 20, shard_id: Some(shard_id_2)
+        };
+
+        // Directly buffer these into the QueryableBuffer's internal state
+        buf.buffer.write().add_write_batch(&write_batch1);
+        buf.buffer.write().add_write_batch(&write_batch2);
+
+        // Test filtering for shard_id_1
+        let filter_s1 = ChunkFilter::new(&table_def, &[]).unwrap().with_shard_id_filter(Some(shard_id_1));
+        let chunks_s1 = buf.get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &filter_s1, None, &ctx.inner().state()).unwrap();
+        assert_eq!(chunks_s1.len(), 1, "Should only get chunks for shard_id_1");
+        // Further inspect batch content if necessary
+
+        // Test filtering for shard_id_2
+        let filter_s2 = ChunkFilter::new(&table_def, &[]).unwrap().with_shard_id_filter(Some(shard_id_2));
+        let chunks_s2 = buf.get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &filter_s2, None, &ctx.inner().state()).unwrap();
+        assert_eq!(chunks_s2.len(), 1, "Should only get chunks for shard_id_2");
+
+        // Test with no shard_id filter (should get both if they match other criteria, e.g. time)
+        let filter_none = ChunkFilter::new(&table_def, &[]).unwrap().with_shard_id_filter(None);
+        let chunks_none = buf.get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &filter_none, None, &ctx.inner().state()).unwrap();
+        assert_eq!(chunks_none.len(), 2, "Should get chunks from both shards");
+
+        // Test filtering for a non-existent shard_id
+        let filter_s3 = ChunkFilter::new(&table_def, &[]).unwrap().with_shard_id_filter(Some(ShardId::new(3)));
+        let chunks_s3 = buf.get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &filter_s3, None, &ctx.inner().state()).unwrap();
+        assert_eq!(chunks_s3.len(), 0, "Should get no chunks for non-existent shard_id_3");
+    }
+
+    // Helper similar to setup_inner but allows passing an existing catalog
+    async fn setup_inner_with_catalog(
+        start: Time,
+        object_store: Arc<dyn ObjectStore>,
+        wal_config: WalConfig,
+        use_cache: bool,
+        catalog: Arc<Catalog>, // Accept catalog
+        node_id_prefix_override: Option<String>,
+        current_node_id_override: Arc<str>,
+        max_snapshots_to_load_on_start_override: Option<usize>,
+        parquet_row_group_write_size_override: Option<usize>,
+    ) -> (
+        Arc<WriteBufferImpl>,
+        IOxSessionContext,
+        Arc<dyn TimeProvider>,
+        Arc<Registry>,
+    ) {
+        let time_provider: Arc<dyn TimeProvider> = Arc::new(MockProvider::new(start));
+        let metric_registry = Arc::new(Registry::new());
+        let (object_store_for_cache, parquet_cache) = if use_cache {
+            let (os, pc) = test_cached_obj_store_and_oracle(
+                Arc::clone(&object_store), // Use the passed object_store for the cache
+                Arc::clone(&time_provider),
+                Arc::clone(&metric_registry),
+            );
+            (os, Some(pc))
+        } else {
+            (Arc::clone(&object_store), None)
+        };
+
+        let node_identifier_prefix = node_id_prefix_override.unwrap_or_else(|| "test_host_setup_inner".to_string());
+
+        let persister = Arc::new(Persister::new(
+            Arc::clone(&object_store), // Use the main object_store for persister
+            node_identifier_prefix,
+            Arc::clone(&time_provider) as _,
+            parquet_row_group_write_size_override.unwrap_or(crate::persister::DEFAULT_ROW_GROUP_WRITE_SIZE),
+        ));
+
+        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog) as _)
+            .await
+            .unwrap();
+        let distinct_cache = DistinctCacheProvider::new_from_catalog(
+            Arc::clone(&time_provider),
+            Arc::clone(&catalog),
+        )
+        .await
+        .unwrap();
+
+        let wbuf_args = WriteBufferImplArgs {
+            persister,
+            catalog: Arc::clone(&catalog), // Use passed catalog
+            last_cache,
+            distinct_cache,
+            time_provider: Arc::clone(&time_provider),
+            executor: make_exec(), // Assuming make_exec is available and appropriate
+            wal_config,
+            parquet_cache,
+            metric_registry: Arc::clone(&metric_registry),
+            snapshotted_wal_files_to_keep: 10,
+            query_file_limit: None,
+            shutdown: ShutdownManager::new_testing().register(),
+            wal_replay_concurrency_limit: None,
+            current_node_id: current_node_id_override,
+            max_snapshots_to_load_on_start: max_snapshots_to_load_on_start_override,
+        };
+
+        let wbuf = WriteBufferImpl::new(wbuf_args).await.unwrap();
+
+        let ctx = IOxSessionContext::with_testing();
+        let runtime_env = ctx.inner().runtime_env();
+        register_iox_object_store(runtime_env, "influxdb3", Arc::clone(&object_store_for_cache)); // Use the potentially cache-wrapped store
+        (wbuf, ctx, time_provider, metric_registry)
+    }
+}
 
     use super::*;
     use crate::PersistedSnapshot;
@@ -4492,5 +4704,248 @@ mod tests {
             },
             DedicatedExecutor::new_testing(),
         ))
+    }
+
+    // --- Replication Tests ---
+
+    // Helper to set up WriteBufferImpl with specific replication settings in the Catalog
+    async fn setup_buffer_with_replication_config(
+        db_name_str: &str,
+        table_name_str: &str,
+        replication_factor_val: u8,
+        // Defines which nodes own which shards. Vec<(ShardId, Vec<NodeId>)>
+        // For simplicity, we'll assume a single shard for the table in these tests.
+        shard_id_val: influxdb3_catalog::shard::ShardId,
+        shard_node_ids: Vec<influxdb3_id::NodeId>, // ComputeNodeId
+        // This represents the node ID of the WriteBufferImpl instance being tested.
+        current_node_id_str: &str,
+    ) -> (Arc<WriteBufferImpl>, Arc<Catalog>) {
+        let object_store = Arc::new(InMemory::new());
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+
+        let catalog = Arc::new(
+            Catalog::new_with_args(
+                "test_host_repl", // node_identifier_prefix for catalog object store paths
+                Arc::clone(&object_store),
+                Arc::clone(&time_provider),
+                Arc::new(Registry::new()),
+                Default::default(), // CatalogArgs
+                Default::default(), // CatalogLimits
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Setup database, table, shard, and replication factor in the catalog
+        catalog.create_database(db_name_str).await.unwrap();
+        catalog.create_table(db_name_str, table_name_str, &["tagA"], &[("fieldA", FieldDataType::Integer)])
+            .await
+            .unwrap();
+
+        let shard_def = ShardDefinition::new(
+            shard_id_val,
+            ShardTimeRange { start_time: 0, end_time: i64::MAX }, // Covers all time for simplicity
+            shard_node_ids,
+        );
+        catalog.create_shard(db_name_str, table_name_str, shard_def).await.unwrap();
+
+        if replication_factor_val > 0 {
+            let rep_info = ReplicationInfo::new(ReplicationFactor::new(replication_factor_val).unwrap());
+            catalog.set_replication(db_name_str, table_name_str, rep_info).await.unwrap();
+        }
+
+        let persister = Arc::new(Persister::new(
+            Arc::clone(&object_store),
+            "test_host_repl_persister", // Persister's own prefix
+            Arc::clone(&time_provider),
+        ));
+        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog) as _)
+            .await
+            .unwrap();
+        let distinct_cache = DistinctCacheProvider::new_from_catalog(
+            Arc::clone(&time_provider),
+            Arc::clone(&catalog),
+        )
+        .await
+        .unwrap();
+
+        let write_buffer_args = WriteBufferImplArgs {
+            persister,
+            catalog: Arc::clone(&catalog),
+            last_cache,
+            distinct_cache,
+            time_provider,
+            executor: make_exec(), // Uses the existing helper from other tests
+            wal_config: WalConfig::test_config(),
+            parquet_cache: None, // No parquet cache needed for these specific tests
+            metric_registry: Arc::new(Registry::new()),
+            snapshotted_wal_files_to_keep: 10,
+            query_file_limit: None,
+            shutdown: ShutdownManager::new_testing().register(),
+            wal_replay_concurrency_limit: Some(1),
+            current_node_id: Arc::from(current_node_id_str),
+            max_snapshots_to_load_on_start: Some(0),
+        };
+
+        (WriteBufferImpl::new(write_buffer_args).await.unwrap(), catalog)
+    }
+
+    #[tokio::test]
+    async fn test_replication_quorum_success_all_replicas_succeed() {
+        let db_name = "rep_db_all_ok";
+        let table_name = "rep_table_all_ok";
+        let current_node_id = "node0"; // Primary node
+        let shard_id = ShardId::new(1);
+        // RF = 3, implies 2 other replicas + primary
+        let replica_node_ids_for_shard = vec![ComputeNodeId::new(0), ComputeNodeId::new(1), ComputeNodeId::new(2)]; // node0, node1, node2
+        let (buf, _catalog) = setup_buffer_with_replication_config(
+            db_name, table_name, 3, shard_id, replica_node_ids_for_shard.clone(), current_node_id
+        ).await;
+
+        // Node IDs for other replicas (excluding current_node_id)
+        let other_replica_node_strings: Vec<String> = replica_node_ids_for_shard.iter()
+            .map(|id| format!("node{}", id.get()))
+            .filter(|id_str| id_str != current_node_id)
+            .collect();
+
+        // All replicas succeed
+        let mut simulated_responses = std::collections::HashMap::new();
+        for node_str in &other_replica_node_strings {
+            simulated_responses.insert(node_str.clone(), vec![Ok(())]);
+        }
+        buf.set_simulated_replica_responses(simulated_responses);
+
+        let wal_op = WalOp::Noop(123); // Simple WalOp for testing replication logic
+        let result = buf.execute_replication_to_nodes(
+            &wal_op, Some(shard_id), &NamespaceName::new(db_name).unwrap(), table_name, other_replica_node_strings, 3
+        ).await;
+        assert!(result.is_ok(), "Replication should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_replication_quorum_success_minimal_quorum_met() {
+        let db_name = "rep_db_min_quorum";
+        let table_name = "rep_table_min_quorum";
+        let current_node_id = "nodeA";
+        let shard_id = ShardId::new(1);
+        // RF = 3. Quorum = (3/2)+1 = 2. Primary + 1 remote success.
+        // Remote replicas: nodeB, nodeC. Need 1 of them to succeed.
+        let shard_nodes = vec![ComputeNodeId::new_test_id(current_node_id), ComputeNodeId::new_test_id("nodeB"), ComputeNodeId::new_test_id("nodeC")];
+        let (buf, _catalog) = setup_buffer_with_replication_config(
+            db_name, table_name, 3, shard_id, shard_nodes, current_node_id
+        ).await;
+
+        let mut simulated_responses = std::collections::HashMap::new();
+        simulated_responses.insert("nodeB".to_string(), vec![Ok(())]); // nodeB succeeds
+        simulated_responses.insert("nodeC".to_string(), vec![Err("failed".to_string()), Err("failed".to_string()), Err("failed".to_string()), Err("failed".to_string())]); // nodeC fails all retries
+        buf.set_simulated_replica_responses(simulated_responses);
+
+        let wal_op = WalOp::Noop(124);
+        let result = buf.execute_replication_to_nodes(
+            &wal_op, Some(shard_id), &NamespaceName::new(db_name).unwrap(), table_name, vec!["nodeB".to_string(), "nodeC".to_string()], 3
+        ).await;
+        assert!(result.is_ok(), "Replication should succeed with minimal quorum: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_replication_quorum_failure_not_enough_successes() {
+        let db_name = "rep_db_quorum_fail";
+        let table_name = "rep_table_quorum_fail";
+        let current_node_id = "nodeX";
+        let shard_id = ShardId::new(1);
+        // RF = 3. Quorum = 2. Primary + 1 remote. Need 1 remote success.
+        // Remote replicas: nodeY, nodeZ. If both fail, quorum fails.
+        let shard_nodes = vec![ComputeNodeId::new_test_id(current_node_id), ComputeNodeId::new_test_id("nodeY"), ComputeNodeId::new_test_id("nodeZ")];
+        let (buf, _catalog) = setup_buffer_with_replication_config(
+            db_name, table_name, 3, shard_id, shard_nodes, current_node_id
+        ).await;
+
+        let mut simulated_responses = std::collections::HashMap::new();
+        simulated_responses.insert("nodeY".to_string(), vec![Err("failed".to_string()); (MAX_REPLICATION_RETRIES + 1) as usize]);
+        simulated_responses.insert("nodeZ".to_string(), vec![Err("failed".to_string()); (MAX_REPLICATION_RETRIES + 1) as usize]);
+        buf.set_simulated_replica_responses(simulated_responses);
+
+        let wal_op = WalOp::Noop(125);
+        let result = buf.execute_replication_to_nodes(
+            &wal_op, Some(shard_id), &NamespaceName::new(db_name).unwrap(), table_name, vec!["nodeY".to_string(), "nodeZ".to_string()], 3
+        ).await;
+        assert!(matches!(result, Err(Error::ReplicationError(_))), "Expected ReplicationError for quorum failure");
+        if let Err(Error::ReplicationError(msg)) = result {
+            assert!(msg.contains("Replication quorum not met"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replication_retry_logic_node_succeeds_on_retry() {
+        let db_name = "rep_db_retry_ok";
+        let table_name = "rep_table_retry_ok";
+        let current_node_id = "nodeP";
+        let shard_id = ShardId::new(1);
+        // RF = 2. Quorum = 2. Primary + 1 remote. Remote: nodeQ. nodeQ must succeed.
+        let shard_nodes = vec![ComputeNodeId::new_test_id(current_node_id), ComputeNodeId::new_test_id("nodeQ")];
+        let (buf, _catalog) = setup_buffer_with_replication_config(
+            db_name, table_name, 2, shard_id, shard_nodes, current_node_id
+        ).await;
+
+        let mut simulated_responses = std::collections::HashMap::new();
+        simulated_responses.insert("nodeQ".to_string(), vec![
+            Err("fail attempt 1".to_string()),
+            Err("fail attempt 2".to_string()),
+            Ok(()), // Succeeds on 3rd attempt (0-indexed retry means attempt #2)
+        ]);
+        buf.set_simulated_replica_responses(simulated_responses);
+
+        let wal_op = WalOp::Noop(126);
+        let result = buf.execute_replication_to_nodes(
+            &wal_op, Some(shard_id), &NamespaceName::new(db_name).unwrap(), table_name, vec!["nodeQ".to_string()], 2
+        ).await;
+        // To verify retries happened, we'd ideally check logs or internal counters.
+        // For this test, success implies retries worked if MAX_REPLICATION_RETRIES >= 2.
+        assert!(result.is_ok(), "Replication should succeed after retries: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_replication_node_fails_all_retries() {
+        let db_name = "rep_db_all_fail";
+        let table_name = "rep_table_all_fail";
+        let current_node_id = "nodeM";
+        let shard_id = ShardId::new(1);
+        // RF = 2. Quorum = 2. Remote: nodeN. If nodeN fails, quorum fails.
+        let shard_nodes = vec![ComputeNodeId::new_test_id(current_node_id), ComputeNodeId::new_test_id("nodeN")];
+        let (buf, _catalog) = setup_buffer_with_replication_config(
+            db_name, table_name, 2, shard_id, shard_nodes, current_node_id
+        ).await;
+
+        let mut simulated_responses = std::collections::HashMap::new();
+        simulated_responses.insert("nodeN".to_string(), vec![Err("failed".to_string()); (MAX_REPLICATION_RETRIES + 1) as usize]);
+        buf.set_simulated_replica_responses(simulated_responses);
+
+        let wal_op = WalOp::Noop(127);
+        let result = buf.execute_replication_to_nodes(
+            &wal_op, Some(shard_id), &NamespaceName::new(db_name).unwrap(), table_name, vec!["nodeN".to_string()], 2
+        ).await;
+        assert!(matches!(result, Err(Error::ReplicationError(_))), "Expected ReplicationError as node fails all retries");
+         if let Err(Error::ReplicationError(msg)) = result {
+            assert!(msg.contains("Replication quorum not met"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replication_no_configured_replicas_is_ok() {
+        let db_name = "rep_db_no_replicas";
+        let table_name = "rep_table_no_replicas";
+        let current_node_id = "node_single";
+        let shard_id = ShardId::new(1);
+        // RF = 1 (or 0, meaning no replication)
+        let shard_nodes = vec![ComputeNodeId::new_test_id(current_node_id)]; // Only self
+        let (buf, _catalog) = setup_buffer_with_replication_config(
+            db_name, table_name, 1, shard_id, shard_nodes, current_node_id
+        ).await;
+
+        let wal_op = WalOp::Noop(128);
+        let result = buf.execute_replication_to_nodes(
+            &wal_op, Some(shard_id), &NamespaceName::new(db_name).unwrap(), table_name, vec![], 1 // Empty remote replica_node_ids
+        ).await;
+        assert!(result.is_ok(), "Should be Ok if no remote replicas are configured/expected: {:?}", result.err());
     }
 }

@@ -1,6 +1,6 @@
 //! module for query executor
 use crate::system_tables::{SYSTEM_SCHEMA_NAME, SystemSchemaProvider};
-use crate::{query_planner::Planner, system_tables::AllSystemSchemaTablesProvider};
+use crate::{query_planner::Planner, system_tables::AllSystemSchemaTablesProvider, distributed_query_service::DistributedQueryServerImpl}; // Added
 use arrow::array::{ArrayRef, Int64Builder, StringBuilder, StructArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -26,6 +26,8 @@ use influxdb3_internal_api::query_executor::{QueryExecutor, QueryExecutorError};
 use influxdb3_sys_events::SysEventStore;
 use influxdb3_telemetry::store::TelemetryStore;
 use influxdb3_write::{ChunkFilter, WriteBuffer};
+use influxdb3_id::ShardId; // Added for ShardIdFilterExtension
+use crate::distributed_query_service::ShardIdFilterExtension; // Added for ShardIdFilterExtension
 use iox_query::QueryDatabase;
 use iox_query::exec::{Executor, IOxSessionContext, QueryConfig};
 use iox_query::provider::ProviderBuilder;
@@ -79,6 +81,22 @@ pub struct CreateQueryExecutorArgs {
     pub sys_events_store: Arc<SysEventStore>,
     pub started_with_auth: bool,
     pub current_node_id: Arc<str>, // Added for node identification
+    pub dist_query_service: Arc<DistributedQueryServerImpl>, // Added
+}
+
+#[derive(Debug, Clone)] // QueryExecutorImpl needs to be Clone for upcast
+pub struct QueryExecutorImpl {
+    catalog: Arc<Catalog>,
+    write_buffer: Arc<dyn WriteBuffer>,
+    exec: Arc<Executor>,
+    datafusion_config: Arc<HashMap<String, String>>,
+    query_execution_semaphore: Arc<InstrumentedAsyncSemaphore>,
+    query_log: Arc<QueryLog>,
+    telemetry_store: Arc<TelemetryStore>,
+    sys_events_store: Arc<SysEventStore>,
+    started_with_auth: bool,
+    current_node_id: Arc<str>,
+    dist_query_service: Arc<DistributedQueryServerImpl>, // Added
 }
 
 impl QueryExecutorImpl {
@@ -94,7 +112,8 @@ impl QueryExecutorImpl {
             sys_events_store,
             started_with_auth,
             time_provider,
-            current_node_id, // Destructure new field
+            current_node_id,
+            dist_query_service, // Destructure new field
         }: CreateQueryExecutorArgs,
     ) -> Self {
         let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
@@ -114,7 +133,8 @@ impl QueryExecutorImpl {
             telemetry_store,
             sys_events_store,
             started_with_auth,
-            current_node_id, // Store new field
+            current_node_id,
+            dist_query_service, // Store new field
         }
     }
 }
@@ -146,6 +166,7 @@ impl QueryExecutor for QueryExecutorImpl {
             Arc::clone(&self.telemetry_store),
             Arc::clone(&self.catalog),
             Arc::clone(&self.current_node_id),
+            Arc::clone(&self.dist_query_service), // Pass service
         )
         .await
     }
@@ -171,6 +192,7 @@ impl QueryExecutor for QueryExecutorImpl {
             Arc::clone(&self.telemetry_store),
             Arc::clone(&self.catalog),
             Arc::clone(&self.current_node_id),
+            Arc::clone(&self.dist_query_service), // Pass service
         )
         .await
     }
@@ -271,8 +293,9 @@ async fn query_database_sql(
     span_ctx: Option<SpanContext>,
     external_span_ctx: Option<RequestLogContext>,
     telemetry_store: Arc<TelemetryStore>,
-    catalog: Arc<Catalog>, // Added
-    current_node_id: Arc<str>, // Added
+    catalog: Arc<Catalog>,
+    current_node_id: Arc<str>,
+    dist_query_service: Arc<DistributedQueryServerImpl>, // Added
 ) -> Result<SendableRecordBatchStream, QueryExecutorError> {
     let params = params.unwrap_or_default();
 
@@ -287,7 +310,7 @@ async fn query_database_sql(
 
     // NOTE - we use the default query configuration on the IOxSessionContext here:
     let ctx = db.new_query_context(span_ctx, Default::default());
-    let planner = Planner::new(&ctx, catalog, current_node_id); // Pass to Planner
+    let planner = Planner::new(&ctx, catalog, current_node_id, dist_query_service); // Pass service to Planner
     let query = query.to_string();
 
     // Perform query planning on a separate threadpool than the IO runtime that is servicing
@@ -330,8 +353,9 @@ async fn query_database_influxql(
     span_ctx: Option<SpanContext>,
     external_span_ctx: Option<RequestLogContext>,
     telemetry_store: Arc<TelemetryStore>,
-    catalog: Arc<Catalog>, // Added
-    current_node_id: Arc<str>, // Added
+    catalog: Arc<Catalog>,
+    current_node_id: Arc<str>,
+    dist_query_service: Arc<DistributedQueryServerImpl>, // Added
 ) -> Result<SendableRecordBatchStream, QueryExecutorError> {
     let params = params.unwrap_or_default();
     let token = db.record_query(
@@ -344,7 +368,7 @@ async fn query_database_influxql(
     );
 
     let ctx = db.new_query_context(span_ctx, Default::default());
-    let planner = Planner::new(&ctx, catalog, current_node_id); // Pass to Planner
+    let planner = Planner::new(&ctx, catalog, current_node_id, dist_query_service); // Pass service to Planner
     let plan = ctx
         .run(async move { planner.influxql(statement, params).await })
         .await;
@@ -694,8 +718,21 @@ impl QueryTable {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
+        let shard_id_filter_opt = ctx
+            .session_state()
+            .config_options()
+            .extensions
+            .get::<ShardIdFilterExtension>()
+            .map(|ext| ext.0)
+            .flatten();
+
+        if shard_id_filter_opt.is_some() {
+            debug!(shard_id = ?shard_id_filter_opt, "QueryTable::scan applying shard_id_filter");
+        }
+
         let mut buffer_filter = ChunkFilter::new(&self.table_def, filters)
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
+            .with_shard_id_filter(shard_id_filter_opt);
 
         let catalog = self.write_buffer.catalog();
         let retention_period_cutoff = match self

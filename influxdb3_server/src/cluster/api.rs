@@ -9,9 +9,7 @@ use influxdb3_id::NodeId as ComputeNodeId; // For target_node_id in move_shard_m
 use thiserror::Error;
 use observability_deps::tracing::info; // For logging
 
-// ShardMigrator might be needed if functions directly interact with it,
-// but for now, the conceptual `move_shard_manually` only interacts with Catalog.
-// use crate::cluster::migration::ShardMigrator;
+use crate::cluster::migration::{ShardMigrator, MigrationProgress}; // Added ShardMigrator and MigrationProgress
 
 #[derive(Debug, Error)]
 pub enum ManagementApiError {
@@ -81,26 +79,63 @@ pub async fn list_cluster_nodes(
 
 pub async fn get_cluster_status(
     cluster_manager: Arc<dyn ClusterManager>,
-    _catalog: Arc<Catalog>, // Catalog might be used for more detailed status later
+    catalog: Arc<Catalog>,
 ) -> Result<String> {
+    info!("Cluster status requested.");
     let nodes = cluster_manager.list_nodes().await?;
-    let status_report = if nodes.is_empty() {
-        "Cluster status: No nodes registered.".to_string()
+    let mut report = if nodes.is_empty() {
+        "Cluster status: No nodes registered.\n".to_string()
     } else {
-        let mut report = format!("Cluster status: {} nodes registered.\n", nodes.len());
+        let mut r = format!("Cluster status: {} nodes registered.\n", nodes.len());
         for node in nodes {
-            report.push_str(&format!(
+            r.push_str(&format!(
                 "  - Node ID: {}, Address: {}, Status: {:?}, Last Heartbeat: {}\n",
                 node.id,
                 node.rpc_address,
-                node.status, // This is crate::cluster::manager::NodeStatus
+                node.status,
                 node.last_heartbeat.map_or_else(|| "N/A".to_string(), |ts| ts.to_string())
             ));
         }
-        report
+        r
     };
-    info!("Cluster status requested.");
-    Ok(status_report)
+
+    report.push_str("\nShard Distribution:\n");
+    let db_schemas = catalog.list_db_schema();
+    if db_schemas.is_empty() {
+        report.push_str("  No databases found.\n");
+    } else {
+        for db_schema in db_schemas {
+            if db_schema.name().as_ref() == "_internal" { continue; } // Skip internal db for user-facing status
+            report.push_str(&format!("  Database: {}\n", db_schema.name()));
+            let tables = db_schema.tables();
+            let table_vec: Vec<_> = tables.collect();
+
+            if table_vec.is_empty() {
+                report.push_str("    No tables found in this database.\n");
+            } else {
+                for table_def in table_vec {
+                    report.push_str(&format!("    Table: {}\n", table_def.table_name));
+                    if table_def.shards.is_empty() {
+                        report.push_str("      No shards defined for this table.\n");
+                    } else {
+                        for shard_def_arc in table_def.shards.resource_iter() {
+                            let node_ids_str: Vec<String> = shard_def_arc.node_ids.iter().map(|id| id.get().to_string()).collect();
+                            report.push_str(&format!(
+                                "      - Shard ID: {}, Nodes: [{}], Version: {}, Status: {:?}, Target: {:?}, Source: {:?}\n",
+                                shard_def_arc.id.get(),
+                                node_ids_str.join(", "),
+                                shard_def_arc.version,
+                                shard_def_arc.migration_status.as_ref().unwrap_or(&ShardMigrationStatus::Stable),
+                                shard_def_arc.migration_target_node_ids.as_ref().map(|ids| ids.iter().map(|id| id.get().to_string()).collect::<Vec<_>>().join(", ")).unwrap_or_else(|| "N/A".to_string()),
+                                shard_def_arc.migration_source_node_ids.as_ref().map(|ids| ids.iter().map(|id| id.get().to_string()).collect::<Vec<_>>().join(", ")).unwrap_or_else(|| "N/A".to_string())
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(report)
 }
 
 // --- Rebalancing (Conceptual) ---
@@ -113,19 +148,34 @@ pub async fn trigger_manual_rebalance(
     Ok(())
 }
 
-// --- Shard Management (Conceptual) ---
+// --- Shard Management ---
 
 pub async fn move_shard_manually(
-    catalog: Arc<Catalog>,
-    shard_id: ShardId,
+    shard_migrator: Arc<dyn ShardMigrator>,
+    catalog: Arc<Catalog>, // Keep catalog for initial validation if needed, or remove if ShardMigrator handles all
     db_name: String,
     table_name: String,
-    target_compute_node_id: ComputeNodeId, // Expecting ComputeNodeId for target
+    shard_id: ShardId,
+    source_node_id: String,
+    target_node_id: String,
 ) -> Result<()> {
-    info!("API request to move shard {} of table {}.{} to compute node {}.",
-        shard_id.get(), db_name, table_name, target_compute_node_id.get());
+    info!("API request to move shard {} of table {}.{} from source {} to target node {}.",
+        shard_id.get(), db_name, table_name, source_node_id, target_node_id);
 
-    // Check if shard exists (optional, update_shard_migration_state will also check)
+    if source_node_id == target_node_id {
+        return Err(ManagementApiError::InvalidArgument("Source and target node IDs cannot be the same.".to_string()));
+    }
+
+    // Optional: Validate nodes exist via catalog or cluster_manager (if passed)
+    // This check might also be done within ShardMigrator::prepare_migration
+    if catalog.get_cluster_node_meta(&source_node_id).is_none() {
+        return Err(ManagementApiError::NodeNotFound(source_node_id));
+    }
+    if catalog.get_cluster_node_meta(&target_node_id).is_none() {
+        return Err(ManagementApiError::NodeNotFound(target_node_id));
+    }
+
+    // Check if shard exists (ShardMigrator might also do this)
     let db_schema = catalog.db_schema(&db_name)
         .ok_or_else(|| ManagementApiError::Catalog(influxdb3_catalog::CatalogError::DatabaseNotFound(db_name.clone())))?;
     let table_def = db_schema.table_definition(&table_name)
@@ -133,23 +183,46 @@ pub async fn move_shard_manually(
     let _shard_def = table_def.shards.get_by_id(&shard_id)
         .ok_or_else(|| ManagementApiError::ShardNotFound{ shard_id, db_name: db_name.clone(), table_name: table_name.clone() })?;
 
-    // Update shard migration status in catalog
-    // Note: The catalog's update_shard_migration_state expects Vec<ComputeNodeId> for target_nodes.
-    // The current function signature takes a single String for target_node_id, which is ambiguous.
-    // Assuming target_node_id refers to a Compute Node's ID (u64) as per ShardDefinition.
-    catalog.update_shard_migration_state(
-        &db_name,
-        &table_name,
-        shard_id,
-        Some(ShardMigrationStatus::Preparing),
-        Some(vec![target_compute_node_id]), // Pass as Vec<ComputeNodeId>
-        None, // source_nodes - not specified in this conceptual API call, could be derived later
-    ).await?;
 
-    info!("Shard {} migration status updated to Preparing, target compute node: {}.", shard_id.get(), target_compute_node_id.get());
+    shard_migrator.prepare_migration(&db_name, &table_name, shard_id, &source_node_id, &target_node_id).await?;
 
-    // As this is conceptual, the actual migration process isn't triggered here.
-    Err(ManagementApiError::NotImplemented(
-        "Conceptual shard move initiated; actual data migration process not implemented by this API call.".to_string()
-    ))
+    info!("Shard {} migration preparation initiated from source {} to target {}.", shard_id.get(), source_node_id, target_node_id);
+    Ok(())
+}
+
+pub async fn advance_shard_migration_step(
+    shard_migrator: Arc<dyn ShardMigrator>,
+    shard_id: ShardId,
+) -> Result<MigrationProgress, ManagementApiError> {
+    info!("API request to advance migration step for shard {}.", shard_id.get());
+    Ok(shard_migrator.transfer_data_step(shard_id).await?)
+}
+
+pub async fn finalize_shard_migration_api(
+    shard_migrator: Arc<dyn ShardMigrator>,
+    db_name: String,
+    table_name: String,
+    shard_id: ShardId,
+) -> Result<(), ManagementApiError> {
+    info!("API request to finalize migration for shard {} of table {}.{}.", shard_id.get(), db_name, table_name);
+    Ok(shard_migrator.finalize_migration(&db_name, &table_name, shard_id).await?)
+}
+
+pub async fn rollback_shard_migration_api(
+    shard_migrator: Arc<dyn ShardMigrator>,
+    db_name: String,
+    table_name: String,
+    shard_id: ShardId,
+    reason: String,
+) -> Result<(), ManagementApiError> {
+    info!("API request to rollback migration for shard {} of table {}.{} due to: {}", shard_id.get(), db_name, table_name, reason);
+    Ok(shard_migrator.rollback_migration(&db_name, &table_name, shard_id, &reason).await?)
+}
+
+pub async fn get_shard_migration_status_api(
+    shard_migrator: Arc<dyn ShardMigrator>,
+    shard_id: ShardId,
+) -> Result<Option<MigrationProgress>, ManagementApiError> {
+    info!("API request to get migration status for shard {}.", shard_id.get());
+    Ok(shard_migrator.get_migration_status(shard_id).await?)
 }

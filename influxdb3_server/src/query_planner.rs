@@ -13,7 +13,8 @@ use datafusion::{
 use datafusion::logical_expr::LogicalPlan; // For plan inspection
 use influxdb_influxql_parser::statement::Statement;
 use iox_query::{exec::IOxSessionContext, frontend::sql::SqlQueryPlanner};
-use crate::distributed_planning::RemoteScanExec; // Import RemoteScanExec
+use crate::distributed_planning::RemoteScanExec;
+use crate::distributed_query_service::DistributedQueryServerImpl; // Added
 use observability_deps::tracing::debug;
 use iox_query_influxql::frontend::planner::InfluxQLQueryPlanner;
 use iox_query_params::StatementParams;
@@ -30,8 +31,9 @@ use influxdb3_catalog::catalog::Catalog; // Added for Catalog access
 /// [ref]: https://github.com/influxdata/influxdb3_core/blob/6fcbb004232738d55655f32f4ad2385523d10696/service_grpc_flight/src/planner.rs#L24-L33
 pub(crate) struct Planner {
     ctx: IOxSessionContext,
-    catalog: Arc<Catalog>,        // Added for sharding info
-    current_node_id: Arc<str>, // Added for local/remote distinction
+    catalog: Arc<Catalog>,
+    current_node_id: Arc<str>,
+    dist_query_service: Arc<DistributedQueryServerImpl>, // Added
 }
 
 impl Planner {
@@ -40,11 +42,13 @@ impl Planner {
         ctx: &IOxSessionContext,
         catalog: Arc<Catalog>,
         current_node_id: Arc<str>,
+        dist_query_service: Arc<DistributedQueryServerImpl>, // Added
     ) -> Self {
         Self {
             ctx: ctx.child_ctx("rest_api_query_planner"),
             catalog,
             current_node_id,
+            dist_query_service, // Stored
         }
     }
 
@@ -153,6 +157,7 @@ impl Planner {
                                         shard_def_arc.id,
                                         table_projection.clone(),
                                         &table_filters,
+                                        Arc::clone(&self.dist_query_service), // Pass service
                                     ));
                                     plans_for_union.push(remote_scan);
                                 }

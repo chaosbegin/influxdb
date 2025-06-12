@@ -112,7 +112,7 @@ pub trait ChunkContainer: Debug + Send + Sync + 'static {
         &self,
         db_schema: Arc<DatabaseSchema>,
         table_def: Arc<TableDefinition>,
-        filter: &ChunkFilter<'_>,
+        filter: &ChunkFilter<'_>, // ChunkFilter already updated to include shard_id_filter
         projection: Option<&Vec<usize>>,
         ctx: &dyn Session,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError>;
@@ -352,10 +352,13 @@ pub(crate) fn guess_precision(timestamp: i64) -> Precision {
 }
 
 /// A derived set of filters that are used to prune data in the buffer when serving queries
+use influxdb3_id::ShardId; // Added for ChunkFilter
+
 #[derive(Debug, Default)]
 pub struct ChunkFilter<'a> {
     pub time_lower_bound_ns: Option<i64>,
     pub time_upper_bound_ns: Option<i64>,
+    pub shard_id_filter: Option<ShardId>, // Added field
     filters: &'a [Expr],
 }
 
@@ -366,7 +369,7 @@ impl<'a> ChunkFilter<'a> {
     /// This method analyzes the incoming `exprs` to determine if there are any
     /// filters on the `time` column and attempts to derive the boundaries on
     /// `time` from the query.
-    pub fn new(table_def: &Arc<TableDefinition>, exprs: &'a [Expr]) -> Result<Self> {
+    pub fn new(table_def: &Arc<TableDefinition>, exprs: &'a [Expr]) -> Result<Self> { // Keep Result<Self>
         debug!(input = ?exprs, "creating chunk filter");
         let mut time_interval: Option<Interval> = None;
         let arrow_schema = table_def.schema.as_arrow();
@@ -448,8 +451,15 @@ impl<'a> ChunkFilter<'a> {
         Ok(Self {
             time_lower_bound_ns,
             time_upper_bound_ns,
+            shard_id_filter: None, // Initialize new field
             filters: exprs,
         })
+    }
+
+    /// Sets the shard ID filter for this chunk filter.
+    pub fn with_shard_id_filter(mut self, shard_id: Option<ShardId>) -> Self {
+        self.shard_id_filter = shard_id;
+        self
     }
 
     /// Test a `min` and `max` time against this filter to check if the range they define overlaps

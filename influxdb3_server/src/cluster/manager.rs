@@ -81,6 +81,43 @@ impl InMemoryClusterManager {
             time_provider,
         }
     }
+
+    pub fn check_heartbeats(&self, timeout_duration: Duration) -> Result<Vec<String>, ClusterManagerError> {
+        let mut nodes_guard = self.nodes.lock().map_err(|e| ClusterManagerError::Internal(format!("Failed to lock nodes map: {}", e)))?;
+        let now = self.time_provider.now();
+        let mut affected_node_ids = Vec::new();
+
+        for (node_id, node_info) in nodes_guard.iter_mut() {
+            if node_info.status == NodeStatus::Active {
+                if let Some(last_heartbeat_ns) = node_info.last_heartbeat {
+                    let last_heartbeat_time = iox_time::Time::from_timestamp_nanos(last_heartbeat_ns);
+                    if now > last_heartbeat_time + timeout_duration {
+                        observability_deps::tracing::warn!(
+                            node_id = %node_info.id,
+                            last_heartbeat = ?last_heartbeat_time,
+                            timeout = ?timeout_duration,
+                            "Node heartbeat timed out. Marking as Down."
+                        );
+                        node_info.status = NodeStatus::Down;
+                        affected_node_ids.push(node_id.clone());
+                    }
+                } else {
+                    // Node is Active but has no last_heartbeat timestamp, which is unusual.
+                    // Consider it timed out if it's been active longer than the timeout without a heartbeat.
+                    // This might depend on how nodes become Active (e.g., if registration sets a heartbeat).
+                    // For now, let's assume if it's Active and last_heartbeat is None, it's an issue.
+                    // A more robust check might involve node registration time.
+                    observability_deps::tracing::warn!(
+                        node_id = %node_info.id,
+                        "Node is Active but has no last_heartbeat recorded. Marking as Down due to timeout check."
+                    );
+                    node_info.status = NodeStatus::Down;
+                    affected_node_ids.push(node_id.clone());
+                }
+            }
+        }
+        Ok(affected_node_ids)
+    }
 }
 
 #[async_trait]
@@ -161,11 +198,25 @@ impl ClusterManager for InMemoryClusterManager {
     }
 
     async fn initiate_rebalance(&self) -> Result<(), ClusterManagerError> {
-        observability_deps::tracing::info!("(InMemoryClusterManager) Placeholder: Initiate rebalance called.");
-        // In a real implementation, this would trigger complex logic:
-        // 1. Analyze current shard distribution and node load.
-        // 2. Determine optimal shard movements.
-        // 3. Call ShardMigrator methods for each identified movement.
+        let nodes_guard = self.nodes.lock().map_err(|e| ClusterManagerError::Internal(format!("Failed to lock nodes map: {}", e)))?;
+        let active_nodes: Vec<NodeInfo> = nodes_guard.values().filter(|n| n.status == NodeStatus::Active).cloned().collect();
+
+        observability_deps::tracing::info!(
+            num_active_nodes = active_nodes.len(),
+            "Initiating rebalance. Conceptual plan: Identify overloaded/underloaded active nodes and plan shard movements."
+        );
+        if active_nodes.is_empty() {
+            observability_deps::tracing::info!("No active nodes available to perform rebalance.");
+            return Ok(());
+        }
+        // Conceptual:
+        // 1. Fetch shard distribution from Catalog (not available here directly).
+        // 2. For each active_node, determine its current load (e.g., number of primary shards).
+        //    Example: active_nodes.iter().map(|n| (n.id.clone(), /* hypothetical_shard_count_from_catalog */ 0)).collect();
+        // 3. Log this conceptual information.
+        let node_load_info: Vec<_> = active_nodes.iter().map(|n| format!("Node[{} Status:{:?}]", n.id, n.status)).collect();
+        observability_deps::tracing::info!("Current active nodes: {:?}", node_load_info);
+        observability_deps::tracing::info!("(InMemoryClusterManager) Placeholder: Actual rebalancing logic not implemented. This would involve shard migration planning.");
         Ok(())
     }
 }
@@ -275,5 +326,82 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert!(nodes.iter().any(|n| n.id == "nodeA"));
         assert!(nodes.iter().any(|n| n.id == "nodeB"));
+    }
+
+    #[tokio::test]
+    async fn test_check_heartbeats() {
+        let time_provider = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+        let manager = InMemoryClusterManager::new(Arc::clone(&time_provider));
+
+        // Node 1: Will be active and recent
+        manager.register_node("node1", "addr1").await.unwrap();
+        manager.heartbeat("node1", "addr1").await.unwrap(); // Becomes Active, hb at 0
+
+        // Node 2: Will be active and stale
+        manager.register_node("node2", "addr2").await.unwrap();
+        manager.heartbeat("node2", "addr2").await.unwrap(); // Becomes Active, hb at 0
+
+        // Node 3: Will be Joining, should not be affected by heartbeat check
+        manager.register_node("node3", "addr3").await.unwrap();
+
+        // Node 4: Active but no heartbeat (edge case)
+        manager.register_node("node4", "addr4").await.unwrap();
+        {
+            let mut nodes_guard = manager.nodes.lock().unwrap();
+            let node4_info = nodes_guard.get_mut("node4").unwrap();
+            node4_info.status = NodeStatus::Active;
+            node4_info.last_heartbeat = None; // Explicitly None
+        }
+
+
+        // Advance time: node1 will send a new heartbeat, node2 will become stale
+        time_provider.set(iox_time::Time::from_timestamp_nanos(0).add(Duration::from_secs(30)));
+        manager.heartbeat("node1", "addr1").await.unwrap(); // node1 hb at 30s
+
+        // Check heartbeats with a timeout of 15 seconds
+        // - node1: hb at 30s, now is 30s. 30s is not > 30s-15s (15s). Stays Active.
+        // - node2: hb at 0s, now is 30s. 0s is older than 30s-15s (15s). Becomes Down.
+        // - node3: Is Joining. Unchanged.
+        // - node4: Is Active, no heartbeat. Becomes Down.
+        let timeout_duration = Duration::from_secs(15);
+        let affected_nodes = manager.check_heartbeats(timeout_duration).unwrap();
+
+        assert_eq!(affected_nodes.len(), 2, "Two nodes should have been marked Down");
+        assert!(affected_nodes.contains(&"node2".to_string()));
+        assert!(affected_nodes.contains(&"node4".to_string()));
+
+        let node1_info = manager.get_node("node1").await.unwrap().unwrap();
+        assert_eq!(node1_info.status, NodeStatus::Active);
+        assert_eq!(node1_info.last_heartbeat, Some(30_000_000_000));
+
+        let node2_info = manager.get_node("node2").await.unwrap().unwrap();
+        assert_eq!(node2_info.status, NodeStatus::Down);
+        assert_eq!(node2_info.last_heartbeat, Some(0)); // Last known heartbeat
+
+        let node3_info = manager.get_node("node3").await.unwrap().unwrap();
+        assert_eq!(node3_info.status, NodeStatus::Joining); // Unchanged
+
+        let node4_info = manager.get_node("node4").await.unwrap().unwrap();
+        assert_eq!(node4_info.status, NodeStatus::Down); // Marked down
+    }
+
+    #[tokio::test]
+    async fn test_initiate_rebalance_logging() {
+        let time_provider = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+        let manager = InMemoryClusterManager::new(Arc::clone(&time_provider));
+
+        manager.register_node("nodeA", "addrA").await.unwrap();
+        manager.heartbeat("nodeA", "addrA").await.unwrap(); // Active
+        manager.register_node("nodeB", "addrB").await.unwrap(); // Joining
+
+        // Call should succeed and log (actual log verification is tricky here)
+        let result = manager.initiate_rebalance().await;
+        assert!(result.is_ok());
+
+        // Test with no active nodes
+        let manager_empty = InMemoryClusterManager::new(Arc::clone(&time_provider));
+        manager_empty.register_node("nodeC", "addrC").await.unwrap(); // Stays Joining
+        let result_empty = manager_empty.initiate_rebalance().await;
+        assert!(result_empty.is_ok()); // Should still be ok, just logs no active nodes
     }
 }

@@ -99,16 +99,27 @@ impl TableBuffer {
 
         // Process chunk_time_to_chunks
         for (chunk_time, shard_map) in &self.chunk_time_to_chunks {
-            for (_shard_id, mutable_chunk) in shard_map { // Iterate over shards
+            for (current_shard_id, mutable_chunk) in shard_map { // Iterate over shards
+                // Apply shard_id_filter
+                if let Some(target_shard_id) = filter.shard_id_filter {
+                    if current_shard_id.map_or(false, |csid| csid != target_shard_id) { // If current_shard_id is None, it won't match a Some target. If Some, check equality.
+                        continue; // Skip this shard if it doesn't match the filter
+                    }
+                     // Special case: if filter is Some(X) but current_shard_id is None, we skip.
+                    if current_shard_id.is_none() && filter.shard_id_filter.is_some() {
+                        continue;
+                    }
+                }
+
                 if !filter.test_time_stamp_min_max(mutable_chunk.timestamp_min, mutable_chunk.timestamp_max) {
                     continue;
                 }
                 let ts_min_max = TimestampMinMax::new(mutable_chunk.timestamp_min, mutable_chunk.timestamp_max);
                 let (ts_agg, batch_vec) = batches_by_chunk_time
                     .entry(*chunk_time)
-                    .or_insert_with(|| (ts_min_max, Vec::new())); // ts_min_max for this specific chunk
+                    .or_insert_with(|| (ts_min_max, Vec::new()));
 
-                *ts_agg = ts_agg.union(&ts_min_max); // Aggregate TimestampMinMax for the whole chunk_time
+                *ts_agg = ts_agg.union(&ts_min_max);
                 batch_vec.push(mutable_chunk.record_batch(Arc::clone(&table_def))?);
             }
         }

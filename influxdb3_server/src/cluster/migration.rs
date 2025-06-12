@@ -57,9 +57,11 @@ pub trait ShardMigrator: Debug + Send + Sync {
     /// - Updating the shard's status in the Catalog to `Preparing` or `StreamingData`.
     async fn prepare_migration(
         &self,
+        db_name: &str,
+        table_name: &str,
         shard_id: ShardId,
         source_node_id: &str,
-        target_node_id: &str,
+        target_node_id: &str, // Assuming target_node_id is a ComputeNodeId compatible string or needs conversion
     ) -> Result<(), ShardMigrationError>;
 
     /// Performs a step of the data transfer process.
@@ -76,11 +78,11 @@ pub trait ShardMigrator: Debug + Send + Sync {
     /// - Performing the final WAL sync and cutover.
     /// - Updating the shard's ownership and status in the Catalog to `Stable` (on the target).
     /// - Potentially instructing the source node to clean up.
-    async fn finalize_migration(&self, shard_id: ShardId) -> Result<(), ShardMigrationError>;
+    async fn finalize_migration(&self, db_name: &str, table_name: &str, shard_id: ShardId) -> Result<(), ShardMigrationError>;
 
     /// Rolls back a failed or aborted migration.
     /// Attempts to revert catalog changes and clean up any partial state on the target node.
-    async fn rollback_migration(&self, shard_id: ShardId, reason: &str) -> Result<(), ShardMigrationError>;
+    async fn rollback_migration(&self, db_name: &str, table_name: &str, shard_id: ShardId, reason: &str) -> Result<(), ShardMigrationError>;
 
     /// Retrieves the current status and progress of a shard migration.
     async fn get_migration_status(
@@ -105,18 +107,49 @@ impl NoOpShardMigrator {
 impl ShardMigrator for NoOpShardMigrator {
     async fn prepare_migration(
         &self,
+        db_name: &str,
+        table_name: &str,
         shard_id: ShardId,
         source_node_id: &str,
-        target_node_id: &str,
+        target_node_id_str: &str, // Assuming this is a string representation of ComputeNodeId
     ) -> Result<(), ShardMigrationError> {
         observability_deps::tracing::info!(
             shard_id = shard_id.get(),
-            source_node_id,
-            target_node_id,
+            %db_name,
+            %table_name,
+            %source_node_id,
+            target_node_id = %target_node_id_str,
             "(NoOpShardMigrator) Prepare migration called."
         );
-        // Conceptual: Here you might check catalog if shard exists, if nodes exist etc.
-        // For NoOp, we just succeed.
+
+        // Attempt to parse target_node_id_str to ComputeNodeId (u64)
+        // This is a simplification; in a real system, node IDs might be strings (NodeIdentifier)
+        // or already u64 (ComputeNodeId). The API layer and this migrator need to agree.
+        // For now, assume target_node_id_str can be parsed or looked up to a ComputeNodeId.
+        // If your NodeId type used in ShardDefinition is String, then no parse is needed.
+        // Based on previous steps, ShardDefinition.node_ids are Vec<ComputeNodeId (u64)>.
+        // The API layer's `move_shard_manually` takes `target_compute_node_id: ComputeNodeId`.
+        // So, the trait should probably take ComputeNodeId directly.
+        // Let's assume for now that the API layer would pass compatible IDs.
+        // For this NoOp, we'll assume target_node_id_str can be used if the catalog expects string,
+        // or if it expects ComputeNodeId, this NoOp won't be able to provide it without parsing/lookup.
+        // The API call `catalog.update_shard_migration_state` takes `Option<Vec<ComputeNodeId>>`.
+        // So, `target_node_id_str` must be convertible to `ComputeNodeId`.
+        // This is a placeholder for robust ID handling.
+        let target_node_compute_id = influxdb3_id::NodeId::new_from_str(target_node_id_str)
+            .map_err(|e| ShardMigrationError::Internal(shard_id, format!("Invalid target_node_id format: {} - {}", target_node_id_str, e)))?;
+        let source_node_compute_id = influxdb3_id::NodeId::new_from_str(source_node_id)
+            .map_err(|e| ShardMigrationError::Internal(shard_id, format!("Invalid source_node_id format: {} - {}", source_node_id, e)))?;
+
+
+        self.catalog.update_shard_migration_state(
+            db_name,
+            table_name,
+            shard_id,
+            Some(ShardMigrationStatus::Preparing),
+            Some(vec![target_node_compute_id]),
+            Some(vec![source_node_compute_id]),
+        ).await.map_err(|e| ShardMigrationError::CatalogUpdateError(shard_id, e.to_string()))?;
         Ok(())
     }
 
@@ -138,19 +171,43 @@ impl ShardMigrator for NoOpShardMigrator {
     async fn finalize_migration(&self, shard_id: ShardId) -> Result<(), ShardMigrationError> {
         observability_deps::tracing::info!(
             shard_id = shard_id.get(),
+            %db_name,
+            %table_name,
             "(NoOpShardMigrator) Finalize migration called."
         );
         // Conceptual: Update catalog shard status to Stable and new owner.
+        // Also, ShardDefinition.node_ids should be updated to target_node_id.
+        // `update_shard_migration_state` currently only handles migration status fields.
+        // For NoOp, setting to Stable and clearing migration fields is sufficient for now.
+        self.catalog.update_shard_migration_state(
+            db_name,
+            table_name,
+            shard_id,
+            Some(ShardMigrationStatus::Stable),
+            None, // Clear target nodes
+            None, // Clear source nodes
+        ).await.map_err(|e| ShardMigrationError::CatalogUpdateError(shard_id, e.to_string()))?;
         Ok(())
     }
 
-    async fn rollback_migration(&self, shard_id: ShardId, reason: &str) -> Result<(), ShardMigrationError> {
+    async fn rollback_migration(&self, db_name: &str, table_name: &str, shard_id: ShardId, reason: &str) -> Result<(), ShardMigrationError> {
         observability_deps::tracing::info!(
             shard_id = shard_id.get(),
-            reason,
+            %db_name,
+            %table_name,
+            %reason,
             "(NoOpShardMigrator) Rollback migration called."
         );
         // Conceptual: Revert catalog changes, clean up target node.
+        // Set status to Failed or back to Stable on original source.
+        self.catalog.update_shard_migration_state(
+            db_name,
+            table_name,
+            shard_id,
+            Some(ShardMigrationStatus::Failed), // Or Stable, depending on rollback strategy
+            None, // Clear target nodes
+            None, // Clear source nodes
+        ).await.map_err(|e| ShardMigrationError::CatalogUpdateError(shard_id, e.to_string()))?;
         Ok(())
     }
 
@@ -202,9 +259,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_shard_migrator_prepare_migration() {
-        let (migrator, _catalog) = setup_noop_migrator().await;
-        let res = migrator.prepare_migration(ShardId::new(1), "nodeA", "nodeB").await;
-        assert!(res.is_ok());
+        let (migrator, catalog) = setup_noop_migrator().await;
+        let db_name = "test_db_prep";
+        let table_name = "test_table_prep";
+        let shard_id = ShardId::new(1);
+        let source_node = "nodeA"; // String, will be parsed to ComputeNodeId
+        let target_node = "nodeB"; // String, will be parsed to ComputeNodeId
+
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tag"], &[("field", influxdb3_catalog::log::FieldDataType::Integer)]).await.unwrap();
+        // Create a dummy shard so update_shard_migration_state can find it
+        let initial_shard_def = influxdb3_catalog::shard::ShardDefinition::new(
+            shard_id,
+            influxdb3_catalog::shard::ShardTimeRange::new(0, i64::MAX),
+            vec![influxdb3_id::NodeId::new_from_str(source_node).unwrap()]
+        );
+        catalog.create_shard(db_name, table_name, initial_shard_def).await.unwrap();
+
+
+        let res = migrator.prepare_migration(db_name, table_name, shard_id, source_node, target_node).await;
+        assert!(res.is_ok(), "prepare_migration failed: {:?}", res.err());
+
+        let db_schema = catalog.db_schema(db_name).unwrap();
+        let table_def = db_schema.table_definition(table_name).unwrap();
+        let shard_info = table_def.shards.get_by_id(&shard_id).unwrap();
+
+        assert_eq!(shard_info.migration_status, Some(ShardMigrationStatus::Preparing));
+        assert_eq!(shard_info.migration_target_node_ids, Some(vec![influxdb3_id::NodeId::new_from_str(target_node).unwrap()]));
+        assert_eq!(shard_info.migration_source_node_ids, Some(vec![influxdb3_id::NodeId::new_from_str(source_node).unwrap()]));
     }
 
     #[tokio::test]
@@ -219,16 +301,92 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_shard_migrator_finalize_migration() {
-        let (migrator, _catalog) = setup_noop_migrator().await;
-        let res = migrator.finalize_migration(ShardId::new(1)).await;
-        assert!(res.is_ok());
+        let (migrator, catalog) = setup_noop_migrator().await;
+        let db_name = "test_db_finalize";
+        let table_name = "test_table_finalize";
+        let shard_id = ShardId::new(1);
+        let source_node = "nodeA";
+        let target_node = "nodeB";
+
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tag"], &[("field", influxdb3_catalog::log::FieldDataType::Integer)]).await.unwrap();
+        let initial_shard_def = influxdb3_catalog::shard::ShardDefinition {
+            shard_id,
+            time_range: influxdb3_catalog::shard::ShardTimeRange::new(0, i64::MAX),
+            node_ids: vec![influxdb3_id::NodeId::new_from_str(source_node).unwrap()], // Initially on source
+            table_name: Arc::from(table_name),
+            db_name: Arc::from(db_name),
+            migration_status: Some(ShardMigrationStatus::AwaitingCutover), // Pre-condition for finalize
+            migration_target_node_ids: Some(vec![influxdb3_id::NodeId::new_from_str(target_node).unwrap()]),
+            migration_source_node_ids: Some(vec![influxdb3_id::NodeId::new_from_str(source_node).unwrap()]),
+            version: 1,
+        };
+        // Directly insert or update shard to this state, create_shard might reset some fields.
+        // For simplicity, we'll use create_shard then update_shard_migration_state if needed,
+        // but ideally the test setup would directly place the shard in the AwaitingCutover state.
+        // Here, create_shard and then an update_shard_migration_state to set it up.
+        let base_shard_def = influxdb3_catalog::shard::ShardDefinition::new(
+            shard_id,
+            influxdb3_catalog::shard::ShardTimeRange::new(0, i64::MAX),
+            vec![influxdb3_id::NodeId::new_from_str(source_node).unwrap()]
+        );
+        catalog.create_shard(db_name, table_name, base_shard_def).await.unwrap();
+        catalog.update_shard_migration_state(
+            db_name, table_name, shard_id,
+            Some(ShardMigrationStatus::AwaitingCutover),
+            Some(vec![influxdb3_id::NodeId::new_from_str(target_node).unwrap()]),
+            Some(vec![influxdb3_id::NodeId::new_from_str(source_node).unwrap()])
+        ).await.unwrap();
+
+
+        let res = migrator.finalize_migration(db_name, table_name, shard_id).await;
+        assert!(res.is_ok(), "finalize_migration failed: {:?}", res.err());
+
+        let db_schema = catalog.db_schema(db_name).unwrap();
+        let table_def = db_schema.table_definition(table_name).unwrap();
+        let shard_info = table_def.shards.get_by_id(&shard_id).unwrap();
+
+        assert_eq!(shard_info.migration_status, Some(ShardMigrationStatus::Stable));
+        assert!(shard_info.migration_target_node_ids.is_none());
+        assert!(shard_info.migration_source_node_ids.is_none());
+        // Note: This NoOp finalize doesn't change ShardDefinition.node_ids itself.
     }
 
     #[tokio::test]
     async fn test_noop_shard_migrator_rollback_migration() {
-        let (migrator, _catalog) = setup_noop_migrator().await;
-        let res = migrator.rollback_migration(ShardId::new(1), "test rollback").await;
-        assert!(res.is_ok());
+        let (migrator, catalog) = setup_noop_migrator().await;
+        let db_name = "test_db_rollback";
+        let table_name = "test_table_rollback";
+        let shard_id = ShardId::new(1);
+        let source_node = "nodeA";
+        let target_node = "nodeB";
+
+        catalog.create_database(db_name).await.unwrap();
+        catalog.create_table(db_name, table_name, &["tag"], &[("field", influxdb3_catalog::log::FieldDataType::Integer)]).await.unwrap();
+        let initial_shard_def = influxdb3_catalog::shard::ShardDefinition::new(
+            shard_id,
+            influxdb3_catalog::shard::ShardTimeRange::new(0, i64::MAX),
+            vec![influxdb3_id::NodeId::new_from_str(source_node).unwrap()]
+        );
+        catalog.create_shard(db_name, table_name, initial_shard_def).await.unwrap();
+        // Simulate it was in a migrating state
+         catalog.update_shard_migration_state(
+            db_name, table_name, shard_id,
+            Some(ShardMigrationStatus::StreamingData),
+            Some(vec![influxdb3_id::NodeId::new_from_str(target_node).unwrap()]),
+            Some(vec![influxdb3_id::NodeId::new_from_str(source_node).unwrap()])
+        ).await.unwrap();
+
+        let res = migrator.rollback_migration(db_name, table_name, shard_id, "test rollback reason").await;
+        assert!(res.is_ok(), "rollback_migration failed: {:?}", res.err());
+
+        let db_schema = catalog.db_schema(db_name).unwrap();
+        let table_def = db_schema.table_definition(table_name).unwrap();
+        let shard_info = table_def.shards.get_by_id(&shard_id).unwrap();
+
+        assert_eq!(shard_info.migration_status, Some(ShardMigrationStatus::Failed));
+        assert!(shard_info.migration_target_node_ids.is_none());
+        assert!(shard_info.migration_source_node_ids.is_none());
     }
 
     #[tokio::test]
